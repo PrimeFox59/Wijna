@@ -7,6 +7,278 @@ import base64
 import pandas as pd
 import uuid
 import json
+import io
+from typing import Dict, Any, List, Optional
+
+# Google APIs
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+except Exception:
+    gspread = None
+    Credentials = None
+    build = None
+    MediaIoBaseUpload = None
+
+# ------------------------------------------------------------------
+# Google Sheets / Drive Adapter (non-breaking, mirrors SQLite <-> Sheets)
+# ------------------------------------------------------------------
+
+# Configuration from Streamlit Secrets
+_secrets = st.secrets if hasattr(st, "secrets") else {}
+_conn_secrets = _secrets.get("connections", {}).get("gsheets", {}) if isinstance(_secrets, dict) else {}
+GSHEETS_SPREADSHEET_URL = _conn_secrets.get("spreadsheet")
+# Folder ID provided by user; can be overridden in secrets as gdrive_folder_id
+DRIVE_FOLDER_ID = _secrets.get("gdrive_folder_id", "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1")
+
+def _google_creds():
+    if Credentials is None:
+        return None
+    info = dict(_conn_secrets)
+    # streamlit stores private_key with \n escapes; google lib needs actual newlines
+    if info.get("private_key"):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+    try:
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    except Exception:
+        return None
+
+@st.cache_resource(show_spinner=False)
+def _gs_client_and_sheet():
+    """Return (gspread_client, spreadsheet) or (None, None) if not configured."""
+    if not GSHEETS_SPREADSHEET_URL or gspread is None:
+        return None, None
+    creds = _google_creds()
+    if not creds:
+        return None, None
+    gc = gspread.authorize(creds)
+    try:
+        sh = gc.open_by_url(GSHEETS_SPREADSHEET_URL)
+    except Exception:
+        try:
+            # If spreadsheet doesn't exist or access denied, try create (requires Drive permission)
+            sh = gc.create("WIJNA Backend")
+        except Exception:
+            return gc, None
+    return gc, sh
+
+@st.cache_resource(show_spinner=False)
+def _drive_service():
+    if build is None:
+        return None
+    creds = _google_creds()
+    if not creds:
+        return None
+    try:
+        return build("drive", "v3", credentials=creds)
+    except Exception:
+        return None
+
+def _ensure_worksheet(name: str, columns: List[str]) -> Optional[Any]:
+    """Ensure a worksheet exists with at least provided columns as header."""
+    gc, sh = _gs_client_and_sheet()
+    if not sh:
+        return None
+    try:
+        try:
+            ws = sh.worksheet(name)
+        except Exception:
+            ws = sh.add_worksheet(title=name, rows=1000, cols=max(10, len(columns)))
+        # Ensure headers
+        existing = ws.row_values(1)
+        if not existing:
+            ws.update("1:1", [columns])
+        else:
+            # Merge columns, preserve order of existing then add missing at end
+            merged = existing[:]
+            for c in columns:
+                if c not in merged:
+                    merged.append(c)
+            if merged != existing:
+                ws.update("1:1", [merged])
+        return ws
+    except Exception:
+        return None
+
+def _ws_headers(ws) -> List[str]:
+    try:
+        return ws.row_values(1)
+    except Exception:
+        return []
+
+def _serialize_row_for_sheet(row: Dict[str, Any]) -> Dict[str, str]:
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, (bytes, bytearray)):
+            out[k] = ""  # don't store blobs in sheet
+        elif v is None:
+            out[k] = ""
+        elif isinstance(v, (dict, list)):
+            out[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[k] = str(v)
+    return out
+
+def _sheet_upsert(table: str, row: Dict[str, Any], key: str = "id"):
+    ws = _ensure_worksheet(table, list(row.keys()))
+    if not ws:
+        return
+    headers = _ws_headers(ws)
+    key_idx = headers.index(key) + 1 if key in headers else None
+    if not key_idx:
+        # add key to header
+        headers.append(key)
+        ws.update("1:1", [headers])
+        key_idx = len(headers)
+    row_s = _serialize_row_for_sheet(row)
+    # Ensure all header keys exist
+    for h in headers:
+        if h not in row_s:
+            row_s[h] = ""
+    try:
+        # Find existing row by key
+        col_vals = ws.col_values(key_idx)
+        try:
+            found = col_vals.index(str(row.get(key))) + 1  # 1-based
+        except ValueError:
+            found = None
+        values = [row_s.get(h, "") for h in headers]
+        if found and found != 1:
+            ws.update(f"{found}:{found}", [values])
+        else:
+            ws.append_row(values, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+def _sheet_delete(table: str, key_val: str, key: str = "id"):
+    ws = _ensure_worksheet(table, [key])
+    if not ws:
+        return
+    headers = _ws_headers(ws)
+    if key not in headers:
+        return
+    key_idx = headers.index(key) + 1
+    try:
+        col_vals = ws.col_values(key_idx)
+        idx = col_vals.index(str(key_val)) + 1
+        if idx > 1:
+            ws.delete_rows(idx)
+    except Exception:
+        pass
+
+def _sync_sqlite_row_to_sheet(table: str, row_id: Optional[str]):
+    if not row_id:
+        return
+    try:
+        # Read full row from SQLite and push to Sheets
+        st.session_state["__audit_disabled"] = True
+        conn = sqlite3.connect(DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        cur.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,))
+        r = cur.fetchone()
+        if not r:
+            return
+        row_dict = {c: r[c] for c in cols if c in r.keys()}
+        # Mirror: don't store blobs
+        for c in list(row_dict.keys()):
+            if isinstance(row_dict[c], (bytes, bytearray)):
+                row_dict[c] = ""
+        _sheet_upsert(table, row_dict, key="id")
+    except Exception:
+        pass
+    finally:
+        st.session_state["__audit_disabled"] = False
+
+def _drive_upload(file_bytes: bytes, filename: str) -> Dict[str, str]:
+    svc = _drive_service()
+    res = {"file_id": "", "webViewLink": "", "webContentLink": ""}
+    if not svc:
+        return res
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="application/octet-stream", resumable=False)
+    meta = {"name": filename}
+    if DRIVE_FOLDER_ID:
+        meta["parents"] = [DRIVE_FOLDER_ID]
+    try:
+        f = svc.files().create(body=meta, media_body=media, fields="id, name, webViewLink, webContentLink").execute()
+        file_id = f.get("id")
+        # Make it readable by anyone with link
+        try:
+            svc.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+        except Exception:
+            pass
+        # Re-fetch to get links
+        f2 = svc.files().get(fileId=file_id, fields="id, webViewLink, webContentLink").execute()
+        res = {
+            "file_id": file_id or "",
+            "webViewLink": f2.get("webViewLink", ""),
+            "webContentLink": f2.get("webContentLink", f"https://drive.google.com/uc?id={file_id}&export=download") if file_id else "",
+        }
+        return res
+    except Exception:
+        return res
+
+def _drive_find_file_by_name(filename: str) -> Dict[str, str]:
+    svc = _drive_service()
+    if not svc or not filename:
+        return {}
+    try:
+        # Search in folder if provided; newest first
+        safe_name = filename.replace("'", "\'")
+        q_parts = [f"name = '{safe_name}'", "trashed = false"]
+        if DRIVE_FOLDER_ID:
+            q_parts.append(f"'{DRIVE_FOLDER_ID}' in parents")
+        q = " and ".join(q_parts)
+        resp = svc.files().list(q=q, fields="files(id, name, webViewLink, webContentLink)", orderBy="modifiedTime desc", pageSize=1).execute()
+        files = resp.get("files", [])
+        if not files:
+            return {}
+        f = files[0]
+        fid = f.get("id")
+        # Ensure public readable
+        try:
+            svc.permissions().create(fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
+        except Exception:
+            pass
+        return {
+            "file_id": fid,
+            "webViewLink": f.get("webViewLink", ""),
+            "webContentLink": f.get("webContentLink", f"https://drive.google.com/uc?id={fid}&export=download") if fid else "",
+        }
+    except Exception:
+        return {}
+
+def ensure_gsheets_backend():
+    """Prepare worksheets with minimal columns used by the app so syncing doesn't fail."""
+    table_columns: Dict[str, List[str]] = {
+        "users": ["id","email","full_name","role","password_hash","status","created_at","last_login"],
+        "sop": ["id","judul","file_name","file_id","file_url","tanggal_upload","tanggal_terbit","director_approved","memo","board_note"],
+        "notulen": ["id","judul","file_name","file_id","file_url","tanggal_upload","uploaded_by","deadline","director_note","director_approved","tanggal_rapat"],
+        "surat_masuk": ["id","indeks","nomor","pengirim","tanggal","perihal","file_name","file_id","file_url","status","follow_up","rekap","director_approved"],
+        "surat_keluar": ["id","indeks","nomor","tanggal","ditujukan","perihal","lampiran_name","lampiran_id","lampiran_url","draft_name","draft_id","draft_url","status","follow_up","pengirim","director_note","director_approved","final_name","final_id","final_url"],
+        "mou": ["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","file_name","file_id","file_url","board_note","board_approved","director_note","director_approved","final_name","final_id","final_url"],
+        "cash_advance": ["id","divisi","items_json","totals","tanggal","finance_note","finance_approved","director_note","director_approved"],
+        "pmr": ["id","nama","file1_name","file1_id","file1_url","file2_name","file2_id","file2_url","bulan","finance_note","finance_approved","director_note","director_approved","tanggal_submit"],
+        "cuti": ["id","nama","tgl_mulai","tgl_selesai","durasi","kuota_tahunan","cuti_terpakai","sisa_kuota","status","finance_note","finance_approved","director_note","director_approved"],
+        "flex": ["id","nama","tanggal","jam_mulai","jam_selesai","alasan","catatan_finance","approval_finance","catatan_director","approval_director","finance_note","finance_approved","director_note","director_approved"],
+        "delegasi": ["id","judul","deskripsi","pic","tgl_mulai","tgl_selesai","file_name","file_id","file_url","status","tanggal_update"],
+        "mobil": ["id","nama_pengguna","divisi","tgl_mulai","tgl_selesai","tujuan","kendaraan","driver","status","finance_note"],
+        "calendar": ["id","jenis","judul","nama_divisi","tgl_mulai","tgl_selesai","deskripsi","file_name","file_id","file_url","is_holiday","sumber","ditetapkan_oleh","tanggal_penetapan"],
+        "public_holidays": ["tahun","tanggal","nama","keterangan","ditetapkan_oleh","tanggal_penetapan"],
+        "inventory": ["id","nama_barang","kode_barang","qty","harga","updated_at","finance_approved","director_approved","divisi"]
+    }
+    for t, cols in table_columns.items():
+        _ensure_worksheet(t, cols)
+
 def sop_module():
     user = require_login()
     st.header("📚 Kebijakan & SOP")
@@ -34,8 +306,16 @@ def sop_module():
                 else:
                     sid = gen_id("sop")
                     blob, fname, _ = upload_file_and_store(f)
-                    cols = ["id", "judul", "file_blob", "file_name"]
-                    vals = [sid, judul, blob, fname]
+                    meta = get_last_upload_meta()
+                    cols = ["id", "judul", "file_name"]
+                    vals = [sid, judul, fname]
+                    # Store Drive metadata
+                    for k_sql, v in (("file_id", meta.get("file_id")), ("file_url", meta.get("file_url"))):
+                        try:
+                            cur.execute(f"ALTER TABLE sop ADD COLUMN {k_sql} TEXT")
+                        except Exception:
+                            pass
+                        cols.append(k_sql); vals.append(v)
                     if sop_date_col == "tanggal_terbit":
                         cols.append("tanggal_terbit"); vals.append(tgl.isoformat())
                     elif sop_date_col == "tanggal_upload":
@@ -107,9 +387,10 @@ def sop_module():
                     pilih = st.selectbox("Unduh file SOP", [""] + list(opsi.keys()))
                     if pilih:
                         sid = opsi[pilih]
-                        row = pd.read_sql_query("SELECT file_blob, file_name FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
-                        if row["file_blob"] is not None and row["file_name"]:
-                            st.download_button("⬇️ Download File", data=row["file_blob"], file_name=row["file_name"], mime="application/octet-stream")
+                        row = pd.read_sql_query("SELECT file_name, file_url FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
+                        url = row.get("file_url") if "file_url" in row.index else None
+                        if row["file_name"] and url:
+                            st.markdown(f"<a href='{url}' target='_blank'>⬇️ Download {row['file_name']}</a>", unsafe_allow_html=True)
         else:
             st.info("Belum ada SOP.")
 
@@ -509,6 +790,14 @@ class _AuditCursor:
         if op and table and table != "file_log":
             try:
                 audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
+            except Exception:
+                pass
+            # Sync to Google Sheets backend
+            try:
+                if op in ("create", "update"):
+                    _sync_sqlite_row_to_sheet(table, target_id)
+                elif op == "delete" and target_id:
+                    _sheet_delete(table, str(target_id))
             except Exception:
                 pass
 
@@ -967,12 +1256,19 @@ def superuser_panel():
 # Common helpers for modules
 # -------------------------
 def upload_file_and_store(file_uploader_obj):
+    """Upload to Google Drive and return (blob,name,size).
+    For Drive metadata, call get_last_upload_meta() after this.
+    Blob is empty to avoid DB bloat; use file_url for downloads.
+    """
     uploaded = file_uploader_obj
     if uploaded is None:
         return None, None, None
     raw = uploaded.read()
-    blob = to_blob(raw)
     name = uploaded.name
+    # Upload to Drive
+    drive_info = _drive_upload(raw, name)
+    file_id = drive_info.get("file_id")
+    file_url = drive_info.get("webContentLink") or drive_info.get("webViewLink")
     # Audit trail log upload
     try:
         user = get_current_user()
@@ -980,20 +1276,123 @@ def upload_file_and_store(file_uploader_obj):
         cur = conn.cursor()
         log_id = gen_id("log")
         now = datetime.utcnow().isoformat()
-        cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload) VALUES (?, ?, ?, ?, ?, ?)",
-            (log_id, "upload", name, 1, user["full_name"] if user else "-", now))
+        cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (log_id, "upload", name, 1, (user.get("full_name") if user else "-"), now, "upload"))
         conn.commit()
         conn.close()
     except Exception:
         pass
-    return blob, name, len(raw)
+    # Stash meta for caller retrieval
+    st.session_state["__last_upload_meta"] = {"file_id": file_id, "file_url": file_url}
+    # Return empty blob to avoid DB bloat; callers should store name + id/url
+    return b"", name, len(raw)
 
-def show_file_download(blob, filename):
-    data = from_blob(blob)
-    if data:
-        b64 = base64.b64encode(data).decode()
-        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">Download {filename}</a>'
-        st.markdown(href, unsafe_allow_html=True)
+def get_last_upload_meta() -> Dict[str, str]:
+    return st.session_state.get("__last_upload_meta", {})
+
+def show_file_download(blob, filename, file_url: str = ""):
+    # Prefer Drive link if available
+    if file_url:
+        st.markdown(f"<a href='{file_url}' target='_blank'>Download {filename}</a>", unsafe_allow_html=True)
+    else:
+        data = from_blob(blob)
+        if data:
+            b64 = base64.b64encode(data).decode()
+            href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">Download {filename}</a>'
+            st.markdown(href, unsafe_allow_html=True)
+        else:
+            # Try to find in Drive by filename
+            info = _drive_find_file_by_name(filename)
+            link = info.get("webContentLink") or info.get("webViewLink")
+            if link:
+                st.markdown(f"<a href='{link}' target='_blank'>Download {filename}</a>", unsafe_allow_html=True)
+
+def _initial_full_sync_to_sheets():
+    # Sync essential tables to Sheets if not synced yet
+    if st.session_state.get("__synced_once"):
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Enumerate tables we care about
+        tables = [
+            "users","sop","notulen","surat_masuk","surat_keluar","mou","cash_advance","pmr","cuti","flex","delegasi","mobil","calendar","public_holidays","inventory"
+        ]
+        for t in tables:
+            try:
+                df = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            cols = list(df.columns)
+            _ensure_worksheet(t, cols)
+            for _, r in df.iterrows():
+                row = {c: r[c] for c in cols}
+                for c in list(row.keys()):
+                    if isinstance(row[c], (bytes, bytearray)):
+                        row[c] = ""
+                _sheet_upsert(t, row, key="id" if "id" in cols else cols[0])
+        st.session_state["__synced_once"] = True
+    except Exception:
+        pass
+
+def _hydrate_sqlite_from_sheets():
+    gc, sh = _gs_client_and_sheet()
+    if not sh:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Worksheets present
+        try:
+            worksheets = sh.worksheets()
+        except Exception:
+            worksheets = []
+        for ws in worksheets:
+            table = ws.title
+            # Only attempt if table exists and is empty
+            try:
+                cur.execute(f"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+                if not cur.fetchone():
+                    continue
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                if cur.fetchone()[0] > 0:
+                    continue
+            except Exception:
+                continue
+            # Read rows
+            try:
+                values = ws.get_all_values()
+            except Exception:
+                continue
+            if not values:
+                continue
+            headers = [h.strip() for h in (values[0] if values else [])]
+            if not headers:
+                continue
+            # Existing DB columns
+            try:
+                cur.execute(f"PRAGMA table_info({table})")
+                db_cols = [r[1] for r in cur.fetchall()]
+            except Exception:
+                continue
+            common = [c for c in headers if c in db_cols]
+            if not common:
+                continue
+            placeholders = ",".join(["?" for _ in common])
+            sql = f"INSERT INTO {table} ({', '.join(common)}) VALUES ({placeholders})"
+            # iterate data rows
+            for row in values[1:]:
+                data = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+                params = [data.get(c, "") for c in common]
+                try:
+                    cur.execute(sql, params)
+                except Exception:
+                    pass
+        conn.commit()
+    except Exception:
+        pass
 
 # -------------------------
 # Modules Implementation (concise)
@@ -1478,11 +1877,22 @@ def surat_keluar_module():
                     st.error("Link draft surat wajib diisi.")
                 else:
                     sid = gen_id("sk")
+                    draft_file_id, draft_file_url = None, None
                     if draft_type == "Upload File":
                         draft_blob, draft_name, _ = upload_file_and_store(draft)
-                    cur.execute("""INSERT INTO surat_keluar (id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,draft_blob,draft_name,status,follow_up, draft_url)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (sid, '', nomor, tanggal.isoformat(), ditujukan, perihal, user['full_name'], draft_blob, draft_name, "Draft", follow_up, draft_url))
+                        meta = get_last_upload_meta(); draft_file_id = meta.get("file_id"); draft_file_url = meta.get("file_url")
+                    # Ensure columns for URLs/IDs exist
+                    try:
+                        cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_url TEXT")
+                    except Exception:
+                        pass
+                    cur.execute("""INSERT INTO surat_keluar (id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,draft_blob,draft_name,status,follow_up, draft_url, draft_id)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (sid, '', nomor, tanggal.isoformat(), ditujukan, perihal, user['full_name'], draft_blob, draft_name, "Draft", follow_up, draft_url or draft_file_url, draft_file_id))
                     conn.commit()
                     try:
                         det = f"draft_file={draft_name}" if draft_name else f"draft_url={draft_url}"
@@ -1495,7 +1905,7 @@ def surat_keluar_module():
     with tab2:
         st.markdown("### Approval Surat Keluar (Director)")
         if user["role"] in ["director","superuser"]:
-            df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_blob, draft_name, draft_url FROM surat_keluar ORDER BY tanggal DESC", conn)
+            df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_blob, draft_name, draft_url, final_blob, final_url FROM surat_keluar ORDER BY tanggal DESC", conn)
             for idx, row in df.iterrows():
                 with st.expander(f"{row['nomor']} | {row['perihal']} | {row['tanggal']} | Status: {row['status']}"):
                     st.write(f"Ditujukan: {row['ditujukan']}")
@@ -1504,7 +1914,7 @@ def surat_keluar_module():
                     # Preview/download draft
                     if row['draft_blob'] and row['draft_name']:
                         st.markdown(f"**Draft Surat (file):** {row['draft_name']}")
-                        show_file_download(row['draft_blob'], row['draft_name'])
+                        show_file_download(row['draft_blob'], row['draft_name'], row.get('draft_url',''))
                     elif row.get('draft_url'):
                         st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row['draft_url']})")
                     # Catatan dan upload final
@@ -1520,8 +1930,18 @@ def surat_keluar_module():
                             st.error("File final wajib diupload agar surat keluar tercatat resmi.")
                         else:
                             blob, fname, _ = upload_file_and_store(final)
-                            cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
-                                        (blob, fname, note, row['id']))
+                            meta = get_last_upload_meta(); fid = meta.get("file_id"); furl = meta.get("file_url")
+                            # Ensure columns
+                            try:
+                                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_id TEXT")
+                            except Exception:
+                                pass
+                            try:
+                                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_url TEXT")
+                            except Exception:
+                                pass
+                            cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, final_id=?, final_url=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
+                                        (blob, fname, fid, furl, note, row['id']))
                             conn.commit()
                             try:
                                 audit_log("surat_keluar", "director_approval", target=row['id'], details=f"final={fname}; note={note}")
@@ -1544,29 +1964,31 @@ def surat_keluar_module():
     # --- Tab 3: Daftar & Rekap Surat Keluar ---
     with tab3:
         st.markdown("### Daftar & Rekap Surat Keluar")
-        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_name, draft_url, final_blob FROM surat_keluar ORDER BY tanggal DESC", conn)
+        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_name, draft_url, final_blob, final_url FROM surat_keluar ORDER BY tanggal DESC", conn)
         # Indeks otomatis: urutan
         if not df.empty:
             df = df.copy()
             df['indeks'] = [f"SK-{i+1:04d}" for i in range(len(df))]
         # Kolom file final dapat diunduh
         def file_final_link(row):
-            if row['final_blob'] and row['final_name']:
+            if row.get('final_url'):
+                st.markdown(f"<a href='{row['final_url']}' target='_blank'>Download {row.get('final_name','')}</a>", unsafe_allow_html=True)
+            elif row['final_blob'] and row['final_name']:
                 show_file_download(row['final_blob'], row['final_name'])
         st.dataframe(df[["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"]], use_container_width=True, hide_index=True)
         st.markdown("#### Download File Final Surat Keluar")
         for idx, row in df.iterrows():
-            if row['final_blob'] and row['final_name']:
+            if row.get('final_url') or (row['final_blob'] and row['final_name']):
                 st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
-                show_file_download(row['final_blob'], row['final_name'])
+                show_file_download(row.get('final_blob'), row.get('final_name',''), row.get('final_url',''))
         # Rekap Bulanan
         st.markdown("#### 📊 Rekap Bulanan Surat Keluar")
         this_month = date.today().strftime("%Y-%m")
         df_month = pd.DataFrame()
         if not df.empty:
             df_month = df[df['tanggal'].str[:7] == this_month]
-        st.write(f"Total surat keluar bulan ini: **{len(df_month)}**")
-        if not df_month.empty:
+    st.write(f"Total surat keluar bulan ini: **{len(df_month)}**")
+    if not df_month.empty:
             approved = df_month[df_month['director_approved']==1]
             draft = df_month[df_month['status'].str.lower() == 'draft']
             percent_final = (len(approved)/len(df_month))*100 if len(df_month) > 0 else 0
@@ -3147,6 +3569,19 @@ def dashboard():
 # -------------------------
 def main():
     ensure_db()
+    # Prepare Google Sheets / Drive backend if configured
+    try:
+        ensure_gsheets_backend()
+    except Exception:
+        pass
+    try:
+        _hydrate_sqlite_from_sheets()
+    except Exception:
+        pass
+    try:
+        _initial_full_sync_to_sheets()
+    except Exception:
+        pass
     # --- Sidebar Logo ---
     user = get_current_user()
     if not user:
@@ -3210,6 +3645,11 @@ def main():
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     st.sidebar.image(logo_path, use_container_width=True)
+    # Backend status
+    if GSHEETS_SPREADSHEET_URL:
+        st.sidebar.caption("Backend: Google Sheets ✓")
+    if DRIVE_FOLDER_ID:
+        st.sidebar.caption(f"Files: Google Drive folder {DRIVE_FOLDER_ID}")
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
