@@ -1,7 +1,6 @@
 import streamlit as st
 import os
-import sqlite3
-from sqlite3 import Connection
+import re
 from datetime import datetime, date, timedelta
 import base64
 import pandas as pd
@@ -31,7 +30,15 @@ except Exception:
 # Configuration from Streamlit Secrets
 _secrets = st.secrets if hasattr(st, "secrets") else {}
 _conn_secrets = _secrets.get("connections", {}).get("gsheets", {}) if isinstance(_secrets, dict) else {}
-GSHEETS_SPREADSHEET_URL = _conn_secrets.get("spreadsheet")
+# Prefer connections.gsheets.spreadsheet, but support common fallbacks (top-level or env vars)
+GSHEETS_SPREADSHEET_URL = (
+    (_conn_secrets or {}).get("spreadsheet")
+    or (_secrets.get("spreadsheet") if isinstance(_secrets, dict) else None)
+    or (_secrets.get("gsheets_spreadsheet") if isinstance(_secrets, dict) else None)
+    or os.environ.get("GSHEETS_SPREADSHEET")
+    or os.environ.get("SPREADSHEET_URL")
+    or os.environ.get("SPREADSHEET_KEY")
+)
 # Folder ID provided by user; can be overridden in secrets as gdrive_folder_id
 DRIVE_FOLDER_ID = _secrets.get("gdrive_folder_id", "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1")
 
@@ -57,7 +64,12 @@ def _extract_spreadsheet_key(url_or_key: Optional[str]) -> Optional[str]:
 def _google_creds():
     if Credentials is None:
         return None
-    info = dict(_conn_secrets)
+    # Primary source: connections.gsheets (Streamlit Cloud pattern)
+    info = dict(_conn_secrets or {})
+    # Fallback: service account json at root of secrets
+    if not info or "client_email" not in info:
+        if isinstance(_secrets, dict) and _secrets.get("type") == "service_account" and _secrets.get("client_email"):
+            info = dict(_secrets)
     # streamlit stores private_key with \n escapes; google lib needs actual newlines
     if info.get("private_key"):
         info["private_key"] = info["private_key"].replace("\\n", "\n")
@@ -76,7 +88,7 @@ def _gs_client_and_sheet():
     """Return (gspread_client, spreadsheet) or (None, None) if not configured.
     Tries opening by key (preferred) or URL, and creates a new spreadsheet if not found.
     """
-    if not GSHEETS_SPREADSHEET_URL or gspread is None:
+    if gspread is None:
         return None, None
     creds = _google_creds()
     gc = None
@@ -88,30 +100,33 @@ def _gs_client_and_sheet():
             gc = None
     if gc is None:
         try:
-            gc = gspread.service_account_from_dict(_conn_secrets)
+            gc = gspread.service_account_from_dict(_conn_secrets or {})
         except Exception:
             return None, None
-    # Try by key first (works even if secrets contains a full URL)
-    sh = None
-    key = _extract_spreadsheet_key(GSHEETS_SPREADSHEET_URL)
-    try:
-        if key:
-            sh = gc.open_by_key(key)
-    except Exception:
+    # If a spreadsheet URL/key is configured, use THAT exact sheet only.
+    # If we cannot open it (e.g., not shared with the service account), return (gc, None)
+    if GSHEETS_SPREADSHEET_URL:
         sh = None
-    if sh is None:
+        key = _extract_spreadsheet_key(GSHEETS_SPREADSHEET_URL)
         try:
-            # Fallback: try by URL if a URL was provided
-            sh = gc.open_by_url(GSHEETS_SPREADSHEET_URL)
+            if key:
+                sh = gc.open_by_key(key)
         except Exception:
             sh = None
-    if sh is None:
-        # As a last resort, create a new spreadsheet (requires Drive scope)
-        try:
-            sh = gc.create("WIJNA Backend")
-        except Exception:
-            return gc, None
-    return gc, sh
+        if sh is None:
+            try:
+                sh = gc.open_by_url(GSHEETS_SPREADSHEET_URL)
+            except Exception:
+                sh = None
+        return gc, sh
+    # No spreadsheet configured: create or re-use a default one owned by the service account
+    try:
+        # Try to find an existing spreadsheet named WIJNA Backend
+        # Note: gspread has no direct search; we simply create if missing
+        sh = gc.create("WIJNA Backend")
+        return gc, sh
+    except Exception:
+        return gc, None
 
 @st.cache_resource(show_spinner=False)
 def _drive_service():
@@ -174,12 +189,71 @@ def get_worksheet(sheet_name: str):
         return None
 
 def check_and_create_worksheets():
-    """Ensure all required worksheets exist with required headers (idempotent)."""
-    # Reuse the same source of truth as ensure_gsheets_backend
+    """Checks for required worksheets and creates them with headers if they don't exist.
+    Meniru gaya referensi: definisikan dict sheet->headers, lalu pastikan tiap sheet ada beserta kolomnya.
+    """
+    # Validate config
+    if not GSHEETS_SPREADSHEET_URL:
+        st.info("Google Sheets belum dikonfigurasi. Set 'connections.gsheets.spreadsheet' di secrets, atau variabel GSHEETS_SPREADSHEET.")
+        return
+    # Try connection first to surface clear errors
+    gc, sh = _gs_client_and_sheet()
+    if not sh:
+        sa_email = None
+        try:
+            creds = _google_creds()
+            if creds and hasattr(creds, "service_account_email"):
+                sa_email = creds.service_account_email
+            elif isinstance(_conn_secrets, dict):
+                sa_email = _conn_secrets.get("client_email")
+        except Exception:
+            pass
+        msg = "Tidak bisa membuka Spreadsheet. Pastikan link/key benar dan di-share ke Service Account."
+        if sa_email:
+            msg += f" Share edit ke: {sa_email}"
+        st.error(msg)
+        return
+    # Definisikan worksheet yang dibutuhkan sesuai skema app
+    required_worksheets: Dict[str, List[str]] = {
+        "users": ["id","email","full_name","role","password_hash","status","created_at","last_login"],
+        "sop": ["id","judul","file_name","file_id","file_url","tanggal_upload","tanggal_terbit","director_approved","memo","board_note"],
+        "notulen": ["id","judul","file_name","file_id","file_url","tanggal_upload","uploaded_by","deadline","director_note","director_approved","tanggal_rapat"],
+        "surat_masuk": ["id","indeks","nomor","pengirim","tanggal","perihal","file_name","file_id","file_url","status","follow_up","rekap","director_approved"],
+        "surat_keluar": ["id","indeks","nomor","tanggal","ditujukan","perihal","lampiran_name","lampiran_id","lampiran_url","draft_name","draft_id","draft_url","status","follow_up","pengirim","director_note","director_approved","final_name","final_id","final_url"],
+        "mou": ["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","file_name","file_id","file_url","board_note","board_approved","director_note","director_approved","final_name","final_id","final_url"],
+        "cash_advance": ["id","divisi","items_json","totals","tanggal","finance_note","finance_approved","director_note","director_approved"],
+        "pmr": ["id","nama","file1_name","file1_id","file1_url","file2_name","file2_id","file2_url","bulan","finance_note","finance_approved","director_note","director_approved","tanggal_submit"],
+        "cuti": ["id","nama","tgl_mulai","tgl_selesai","durasi","kuota_tahunan","cuti_terpakai","sisa_kuota","status","finance_note","finance_approved","director_note","director_approved"],
+        "flex": ["id","nama","tanggal","jam_mulai","jam_selesai","alasan","catatan_finance","approval_finance","catatan_director","approval_director","finance_note","finance_approved","director_note","director_approved"],
+        "delegasi": ["id","judul","deskripsi","pic","tgl_mulai","tgl_selesai","file_name","file_id","file_url","status","tanggal_update"],
+        "mobil": ["id","nama_pengguna","divisi","tgl_mulai","tgl_selesai","tujuan","kendaraan","driver","status","finance_note"],
+        "calendar": ["id","jenis","judul","nama_divisi","tgl_mulai","tgl_selesai","deskripsi","file_name","file_id","file_url","is_holiday","sumber","ditetapkan_oleh","tanggal_penetapan"],
+        "public_holidays": ["tahun","tanggal","nama","keterangan","ditetapkan_oleh","tanggal_penetapan"],
+        "inventory": ["id","nama_barang","kode_barang","qty","harga","updated_at","finance_approved","director_approved","divisi"],
+    }
+    # Pastikan tiap worksheet ada dan header lengkap
+    for name, headers in required_worksheets.items():
+        _ensure_worksheet(name, headers)
+
+def ensure_default_superuser():
+    """Buat akun superuser default jika tabel users kosong atau belum ada superuser."""
     try:
-        ensure_gsheets_backend()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE role='superuser'")
+        has_su = cur.fetchone()[0] > 0
+        if total == 0 or not has_su:
+            now = datetime.utcnow().isoformat()
+            pw_hash = hash_password("superpassword")
+            # Insert minimal fields; id will auto-generate per table schema
+            cur.execute(
+                "INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("superuser@local", "Superuser", "superuser", pw_hash, "active", now),
+            )
+            conn.commit()
     except Exception:
-        # Silently ignore here; ensure_gsheets_backend already handles internal errors
         pass
 
 def _ws_headers(ws) -> List[str]:
@@ -254,8 +328,7 @@ def _sync_sqlite_row_to_sheet(table: str, row_id: Optional[str]):
     try:
         # Read full row from SQLite and push to Sheets
         st.session_state["__audit_disabled"] = True
-        conn = sqlite3.connect(DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH))
-        conn.row_factory = sqlite3.Row
+        conn = get_db()
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({table})")
         cols = [r[1] for r in cur.fetchall()]
@@ -748,7 +821,8 @@ def sop_module():
     conn.commit()
     conn.close()
 
-DB_PATH = "office_ops.db"
+# Use in-memory SQLite as a fast cache while Google Sheets is the source of truth
+DB_PATH = ":memory:"
 SALT = "office_ops_salt_v1"
 
 # --- Password hashing utility ---
@@ -758,7 +832,10 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(salted).hexdigest()
 
 icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
-st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
+if os.path.exists(icon_path):
+    st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
+else:
+    st.set_page_config(page_title="WIJNA Manajemen System", page_icon="📊", layout="wide")
 # --- Global CSS for modern look ---
 st.markdown(
     """
@@ -798,206 +875,321 @@ def format_datetime_wib(dtstr):
         return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
     except Exception:
         return dtstr
-class _AuditCursor:
-    def __init__(self, outer_conn, inner_cursor):
-        self._outer_conn = outer_conn
-        self._c = inner_cursor
-    def __getattr__(self, name):
-        return getattr(self._c, name)
-    def execute(self, sql, params=()):
-        result = self._c.execute(sql, params)
-        try:
-            self._maybe_log(sql, params)
-        except Exception:
-            pass
-        return result
+class _Row:
+    def __init__(self, cols: List[str], values: List[Any]):
+        self._cols = cols
+        self._vals = values
+        self._map = {c: (values[i] if i < len(values) else None) for i, c in enumerate(cols)}
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._map.get(key)
+    def keys(self):
+        return self._cols
+    def get(self, k, d=None):
+        return self._map.get(k, d)
+
+class SheetsDB:
+    def __init__(self):
+        self.gc, self.sh = _gs_client_and_sheet()
+    def worksheet(self, table: str):
+        return _ensure_worksheet(table, [])
+    def headers(self, table: str) -> List[str]:
+        ws = self.worksheet(table)
+        return ws.row_values(1) if ws else []
+    def all_records(self, table: str) -> List[Dict[str, Any]]:
+        ws = self.worksheet(table)
+        if not ws:
+            return []
+        values = ws.get_all_values()
+        if not values:
+            return []
+        headers = [h.strip() for h in (values[0] or [])]
+        recs = []
+        for row in values[1:]:
+            rec = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+            recs.append(rec)
+        return recs
+    def upsert(self, table: str, data: Dict[str, Any], key: str = "id"):
+        if key not in data or not data[key]:
+            data[key] = gen_id(table[:3] if len(table) >= 3 else table)
+        _sheet_upsert(table, data, key=key)
+        return data[key]
+    def delete(self, table: str, key_val: Any, key: str = "id"):
+        _sheet_delete(table, str(key_val), key=key)
+
+def _parse_simple_where(where: str, params: List[Any]):
+    tokens = re.split(r"\s+(and|or)\s+", where, flags=re.IGNORECASE)
+    clauses = []
+    ops = []
+    i = 0
+    for t in tokens:
+        tl = t.strip().lower()
+        if tl in ("and", "or"):
+            ops.append(tl)
+        elif tl:
+            clauses.append(t)
+    # Build evaluators
+    p_idx = 0
+    evals = []
+    for c in clauses:
+        cl = c.strip()
+        m = re.match(r"substr\((\w+),\s*1,\s*7\)\s*=\s*\?", cl, flags=re.IGNORECASE)
+        if m:
+            col = m.group(1)
+            val = str(params[p_idx]); p_idx += 1
+            evals.append(lambda row, col=col, val=val: str(row.get(col, ""))[:7] == val)
+            continue
+        m = re.match(r"(\w+)\s+like\s+\?", cl, flags=re.IGNORECASE)
+        if m:
+            col = m.group(1)
+            pat = str(params[p_idx]); p_idx += 1
+            needle = pat.replace('%','').lower()
+            evals.append(lambda row, col=col, needle=needle: needle in str(row.get(col, "")).lower())
+            continue
+        m = re.match(r"date\((\w+)\)\s*<=\s*date\('\s*now\s*','\+(\d+) day'\)", cl, flags=re.IGNORECASE)
+        if m:
+            col = m.group(1); days = int(m.group(2))
+            from datetime import datetime, timedelta
+            bound = datetime.utcnow() + timedelta(days=days)
+            evals.append(lambda row, col=col, bound=bound: pd.to_datetime(row.get(col), errors='coerce') <= bound)
+            continue
+        m = re.match(r"(\w+)\s*=\s*\?", cl)
+        if m:
+            col = m.group(1)
+            val = params[p_idx]; p_idx += 1
+            evals.append(lambda row, col=col, val=val: str(row.get(col, "")) == str(val))
+            continue
+        m = re.match(r"(\w+)\s*=\s*([0-9\-]+)", cl)
+        if m:
+            col = m.group(1); val = m.group(2)
+            evals.append(lambda row, col=col, val=val: str(row.get(col, "")) == val)
+            continue
+    def predicate(row):
+        if not evals:
+            return True
+        res = evals[0](row)
+        idx = 1
+        for op in ops:
+            if idx >= len(evals):
+                break
+            if op == 'and':
+                res = res and evals[idx](row)
+            else:
+                res = res or evals[idx](row)
+            idx += 1
+        return res
+    return predicate
+
+class SheetsCursor:
+    def __init__(self, sdb: SheetsDB):
+        self._sdb = sdb
+        self._results: List[_Row] = []
+        self.description = None
+    def execute(self, sql: str, params: Any = ()): 
+        sql = sql.strip()
+        low = sql.lower()
+        # DDL: ALTER ADD COLUMN
+        if low.startswith("alter table") and " add column " in low:
+            parts = low.split()
+            tbl = parts[2]
+            col = low.split(" add column ",1)[1].strip().split()[0].strip('`"[]')
+            _ensure_worksheet(tbl, [col])
+            self._results = []
+            return self
+        # DDL: CREATE TABLE IF NOT EXISTS tbl (...)
+        if low.startswith("create table") and " if not exists " in low:
+            after = low.split(" if not exists ",1)[1]
+            tbl = after.split("(",1)[0].strip().split()[0]
+            cols_part = sql[sql.index("(")+1: sql.rindex(")")]
+            cols = []
+            for seg in cols_part.split(","):
+                name = seg.strip().split()[0].strip('`"[]')
+                if name and name.upper() not in {"PRIMARY","FOREIGN","UNIQUE","CONSTRAINT"}:
+                    cols.append(name)
+            _ensure_worksheet(tbl, cols)
+            self._results = []
+            return self
+        # PRAGMA table_info(table)
+        if low.startswith("pragma table_info("):
+            tbl = low.split("pragma table_info(",1)[1].split(")",1)[0]
+            headers = self._sdb.headers(tbl)
+            # emulate sqlite schema rows
+            rows = []
+            for idx, h in enumerate(headers):
+                rows.append(_Row(["cid","name","type","notnull","dflt_value","pk"], [idx, h, "TEXT", 0, None, 0]))
+            self._results = rows
+            self.description = [("name",)]
+            return self
+        # SELECT ... FROM ... [WHERE ...] [ORDER BY ...]
+        if low.startswith("select"):
+            # COUNT(*) support
+            m = re.match(r"select\s+(.+?)\s+from\s+(\w+)(?:\s+where\s+(.+?))?(?:\s+order\s+by\s+(.+))?$", low)
+            if m:
+                cols_sel, table, where, order = m.groups()
+                recs = self._sdb.all_records(table)
+                if where:
+                    pred = _parse_simple_where(where, list(params) if isinstance(params, (list, tuple)) else [])
+                    recs = [r for r in recs if pred(r)]
+                if cols_sel.strip().startswith("count(*)"):
+                    alias = 'c' if ' as c' in cols_sel else 'count'
+                    self._results = [_Row([alias], [len(recs)])]
+                    self.description = [(alias,)]
+                    return self
+                # columns
+                cols = [c.strip() for c in cols_sel.split(',')]
+                if cols == ['*']:
+                    cols = list(recs[0].keys()) if recs else []
+                # order
+                if order:
+                    ord_tokens = order.strip().split()
+                    ord_col = ord_tokens[0]
+                    desc = any(t.upper()=="DESC" for t in ord_tokens[1:])
+                    recs.sort(key=lambda r: str(r.get(ord_col, "")), reverse=desc)
+                rows = [_Row(cols, [r.get(c, "") for c in cols]) for r in recs]
+                self._results = rows
+                self.description = [(c,) for c in cols]
+                return self
+        # INSERT INTO table (cols) VALUES (?,...)
+        if low.startswith("insert into"):
+            m = re.match(r"insert\s+into\s+(\w+)\s*\(([^)]+)\)\s*values\s*\(([^)]+)\)", low)
+            if m:
+                table = m.group(1)
+                cols = [c.strip().strip('`"') for c in m.group(2).split(',')]
+                vals = list(params) if isinstance(params, (list, tuple)) else []
+                data = {cols[i]: (vals[i] if i < len(vals) else "") for i in range(len(cols))}
+                new_id = self._sdb.upsert(table, data, key="id" if "id" in cols else cols[0])
+                self._results = []
+                return self
+        # UPDATE table SET col=?, ... WHERE id=?
+        if low.startswith("update"):
+            m = re.match(r"update\s+(\w+)\s+set\s+(.+?)\s+where\s+(.+)$", low)
+            if m:
+                table = m.group(1)
+                set_part = m.group(2)
+                where_part = m.group(3)
+                assigns = [p.strip() for p in set_part.split(',')]
+                cols = [a.split('=')[0].strip() for a in assigns]
+                vals = list(params)
+                # Assume last param is key for id=? style
+                key = 'id'
+                key_val = vals[-1] if vals else None
+                updates = {cols[i]: vals[i] for i in range(len(cols))}
+                # Read sheet rows and update
+                ws = self._sdb.worksheet(table)
+                headers = self._sdb.headers(table)
+                if key in headers:
+                    key_idx = headers.index(key) + 1
+                    col_vals = ws.col_values(key_idx)
+                    try:
+                        row_idx = col_vals.index(str(key_val)) + 1
+                    except ValueError:
+                        row_idx = None
+                    if row_idx and row_idx > 1:
+                        for c, v in updates.items():
+                            if c in headers:
+                                col_i = headers.index(c) + 1
+                                ws.update_cell(row_idx, col_i, str(v) if v is not None else "")
+                self._results = []
+                return self
+        # DELETE FROM table WHERE id=?
+        if low.startswith("delete from"):
+            m = re.match(r"delete\s+from\s+(\w+)\s+where\s+(.+)$", low)
+            if m:
+                table = m.group(1)
+                # assume id=?
+                key_val = params[-1] if isinstance(params, (list, tuple)) and params else None
+                self._sdb.delete(table, key_val, key='id')
+                self._results = []
+                return self
+        # Fallback: no-op
+        self._results = []
+        return self
     def executemany(self, sql, seq_of_params):
-        result = self._c.executemany(sql, seq_of_params)
+        for p in seq_of_params:
+            self.execute(sql, p)
+        return self
+    def fetchone(self):
+        return self._results[0] if self._results else None
+    def fetchall(self):
+        return self._results
+
+class SheetsConnection:
+    def __init__(self):
+        self._sdb = SheetsDB()
+    def cursor(self):
+        return SheetsCursor(self._sdb)
+    def commit(self):
+        return None
+    def close(self):
+        return None
+
+def get_db():
+    # Return a Sheets-backed connection shim compatible with existing code paths
+    return SheetsConnection()
+
+def _create_sqlite_table_from_headers(cur, table: str, headers: List[str]):
+    """Create a SQLite table with given headers if it does not exist."""
+    if not headers:
+        return
+    # Basic affinity: TEXT for all to keep it simple and compatible
+    cols_sql = ", ".join([f"{h} TEXT" for h in headers])
+    try:
+        # Ensure the worksheet with headers exists
+        _ensure_worksheet(table, headers)
+    except Exception:
+        pass
+def ensure_db():
+    """Bootstrap in-memory cache from Google Sheets and ensure worksheets/headers exist.
+    - Ensures required worksheets exist with headers
+    - Builds in-memory SQLite tables mirroring Sheets headers
+    - Hydrates data from Sheets into the in-memory cache
+    - Ensures a default superuser exists in both cache and Sheets
+    """
+    # Ensure Sheets are available and headers exist
+    check_and_create_worksheets()
+    # Build cache schema from available worksheets and hydrate
+    gc, sh = _gs_client_and_sheet()
+    conn = get_db()
+    cur = conn.cursor()
+    if sh:
         try:
-            for p in seq_of_params:
-                self._maybe_log(sql, p)
+            worksheets = sh.worksheets()
+        except Exception:
+            worksheets = []
+        for ws in worksheets:
+            try:
+                headers = [h.strip() for h in (ws.row_values(1) or []) if h and h.strip()]
+                if not headers:
+                    continue
+                _create_sqlite_table_from_headers(cur, ws.title, headers)
+                # Clear then insert current data
+                try:
+                    values = ws.get_all_values()
+                except Exception:
+                    values = []
+                if values and len(values) > 1:
+                    hdr = values[0]
+                    data_rows = values[1:]
+                    # Align to headers present in SQLite (which mirrors hdr)
+                    common = [c for c in hdr]
+                    placeholders = ",".join(["?" for _ in common])
+                    for row in data_rows:
+                        rec = {hdr[i]: (row[i] if i < len(row) else "") for i in range(len(hdr))}
+                        params = [str(rec.get(c, "")) for c in common]
+                        try:
+                            cur.execute(f"INSERT INTO {ws.title} ({', '.join(common)}) VALUES ({placeholders})", params)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        try:
+            conn.commit()
         except Exception:
             pass
-        return result
-    def _maybe_log(self, sql, params):
-        # Guard or non-DML: skip
-        if st.session_state.get("__audit_disabled"):
-            return
-        sql_l = (sql or "").strip().lower()
-        op = None
-        table = None
-        target_id = None
-        if sql_l.startswith("insert into"):
-            op = "create"
-            try:
-                # parse table and col list
-                after_into = sql_l.split("insert into",1)[1].strip()
-                table = after_into.split("(",1)[0].strip().split()[0]
-                if "(" in after_into:
-                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
-                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
-                    if "id" in cols:
-                        idx = cols.index("id")
-                        if isinstance(params, (list, tuple)) and len(params) > idx:
-                            target_id = params[idx]
-            except Exception:
-                pass
-        elif sql_l.startswith("update"):
-            op = "update"
-            try:
-                table = sql_l.split()[1]
-                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
-                    # assume last param is id
-                    if isinstance(params, (list, tuple)) and len(params) >= 1:
-                        target_id = params[-1]
-            except Exception:
-                pass
-        elif sql_l.startswith("delete from"):
-            op = "delete"
-            try:
-                table = sql_l.split()[2]
-                # assume last param is id
-                if isinstance(params, (list, tuple)) and len(params) >= 1:
-                    target_id = params[-1]
-            except Exception:
-                pass
-        # Only log DML and skip logging file_log table itself
-        if op and table and table != "file_log":
-            try:
-                audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
-            except Exception:
-                pass
-            # Sync to Google Sheets backend
-            try:
-                if op in ("create", "update"):
-                    _sync_sqlite_row_to_sheet(table, target_id)
-                elif op == "delete" and target_id:
-                    _sheet_delete(table, str(target_id))
-            except Exception:
-                pass
-
-class _AuditConnection:
-    def __init__(self, inner_conn: sqlite3.Connection):
-        self._conn = inner_conn
-        self.row_factory = inner_conn.row_factory
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-    def cursor(self, *args, **kwargs):
-        return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
-
-def get_db() -> sqlite3.Connection:
-    db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
-    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-    conn.row_factory = sqlite3.Row
-    # If audit is disabled (e.g., during migrations or within audit_log), return raw connection
-    if st.session_state.get("__audit_disabled"):
-        return conn
-    return _AuditConnection(conn)
-def ensure_db():
-    """Ensure minimum required tables/columns exist so modules load safely.
-    This lightweight bootstrap focuses on Users, Calendar, SOP, Notulen, and File Log.
-    """
+    # Ensure a default superuser exists (in cache and mirrored to Sheets via audit hook)
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        # Users
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-                email TEXT UNIQUE NOT NULL,
-                full_name TEXT,
-                role TEXT,
-                password_hash TEXT,
-                status TEXT,
-                created_at TEXT,
-                last_login TEXT
-            )
-            """
-        )
-        # Calendar tables
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS calendar (
-                id TEXT PRIMARY KEY,
-                jenis TEXT,
-                judul TEXT,
-                nama_divisi TEXT,
-                tgl_mulai TEXT,
-                tgl_selesai TEXT,
-                deskripsi TEXT,
-                file_blob BLOB,
-                file_name TEXT,
-                is_holiday INTEGER DEFAULT 0,
-                sumber TEXT,
-                ditetapkan_oleh TEXT,
-                tanggal_penetapan TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS public_holidays (
-                tahun INTEGER,
-                tanggal TEXT,
-                nama TEXT,
-                keterangan TEXT,
-                ditetapkan_oleh TEXT,
-                tanggal_penetapan TEXT
-            )
-            """
-        )
-        # SOP and Notulen (minimal compatible schemas)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sop (
-                id TEXT PRIMARY KEY,
-                judul TEXT,
-                file_blob BLOB,
-                file_name TEXT,
-                tanggal_upload TEXT,
-                director_approved INTEGER DEFAULT 0
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notulen (
-                id TEXT PRIMARY KEY,
-                judul TEXT,
-                file_blob BLOB,
-                file_name TEXT,
-                tanggal_upload TEXT,
-                uploaded_by TEXT,
-                deadline TEXT,
-                director_note TEXT,
-                director_approved INTEGER DEFAULT 0
-            )
-            """
-        )
-        # File Log for audit
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_log (
-                id TEXT PRIMARY KEY,
-                modul TEXT,
-                file_name TEXT,
-                versi INTEGER,
-                deleted_by TEXT,
-                tanggal_hapus TEXT,
-                alasan TEXT
-            )
-            """
-        )
-        cur.execute("PRAGMA table_info(file_log)")
-        fl_cols = {row[1] for row in cur.fetchall()}
-        if "uploaded_by" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
-        if "tanggal_upload" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
-        if "action" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
-        conn.commit()
+        ensure_default_superuser()
     except Exception:
         pass
 def log_file_delete(modul, file_name, deleted_by, alasan=None):
@@ -1020,8 +1212,8 @@ def audit_log(modul: str, action: str, target=None, details=None, actor=None):
     try:
         # prevent recursive logging
         st.session_state["__audit_disabled"] = True
-        db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
-        conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+        # Use the same shared connection (audit is disabled so get_db returns raw)
+        conn = get_db()
         cur = conn.cursor()
         now = datetime.utcnow().isoformat()
         # Resolve actor from session if not provided
@@ -1088,7 +1280,7 @@ def register_user(email, full_name, password):
                     (email, full_name, "staff", pw, "pending", now))
         conn.commit()
         return True, "Registered — menunggu approval superuser."
-    except sqlite3.IntegrityError:
+    except Exception:
         return False, "Email sudah terdaftar."
 
 def login_user(email, password):
@@ -1387,6 +1579,7 @@ def _initial_full_sync_to_sheets():
     if st.session_state.get("__synced_once"):
         return
     try:
+        # Use the shared in-memory connection
         conn = get_db()
         cur = conn.cursor()
         # Enumerate tables we care about
@@ -1426,41 +1619,28 @@ def _hydrate_sqlite_from_sheets():
             worksheets = []
         for ws in worksheets:
             table = ws.title
-            # Only attempt if table exists and is empty
+            # Create table if missing using headers
             try:
-                cur.execute(f"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
-                if not cur.fetchone():
-                    continue
+                values = ws.get_all_values()
+            except Exception:
+                values = []
+            headers = [h.strip() for h in (values[0] if values else [])]
+            if not headers:
+                continue
+            _create_sqlite_table_from_headers(cur, table, headers)
+            # Only insert if empty
+            try:
                 cur.execute(f"SELECT COUNT(*) FROM {table}")
                 if cur.fetchone()[0] > 0:
                     continue
             except Exception:
                 continue
-            # Read rows
-            try:
-                values = ws.get_all_values()
-            except Exception:
+            if not values or len(values) <= 1:
                 continue
-            if not values:
-                continue
-            headers = [h.strip() for h in (values[0] if values else [])]
-            if not headers:
-                continue
-            # Existing DB columns
-            try:
-                cur.execute(f"PRAGMA table_info({table})")
-                db_cols = [r[1] for r in cur.fetchall()]
-            except Exception:
-                continue
-            common = [c for c in headers if c in db_cols]
-            if not common:
-                continue
-            placeholders = ",".join(["?" for _ in common])
-            sql = f"INSERT INTO {table} ({', '.join(common)}) VALUES ({placeholders})"
-            # iterate data rows
+            placeholders = ",".join(["?" for _ in headers])
+            sql = f"INSERT INTO {table} ({', '.join(headers)}) VALUES ({placeholders})"
             for row in values[1:]:
-                data = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-                params = [data.get(c, "") for c in common]
+                params = [str(row[i]) if i < len(row) else "" for i in range(len(headers))]
                 try:
                     cur.execute(sql, params)
                 except Exception:
@@ -3728,6 +3908,11 @@ def dashboard():
 # -------------------------
 def main():
     ensure_db()
+    # Ensure a default superuser exists (once)
+    try:
+        ensure_default_superuser()
+    except Exception:
+        pass
     # Prepare Google Sheets / Drive backend if configured
     try:
         check_and_create_worksheets()
@@ -3769,7 +3954,9 @@ def main():
             </style>
         """, unsafe_allow_html=True)
         st.markdown('<div class="center-login">', unsafe_allow_html=True)
-        st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=160)
+        _login_logo = os.path.join(os.path.dirname(__file__), "logo.png")
+        if os.path.exists(_login_logo):
+            st.image(_login_logo, width=160)
         st.markdown("<h2>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
         tabs = st.tabs(["Login", "Register"])
         with tabs[0]:
@@ -3803,7 +3990,10 @@ def main():
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    st.sidebar.image(logo_path, use_container_width=True)
+    if os.path.exists(logo_path):
+        st.sidebar.image(logo_path, use_container_width=True)
+    else:
+        st.sidebar.markdown("## WIJNA")
     # Backend status
     if GSHEETS_SPREADSHEET_URL:
         st.sidebar.caption("Backend: Google Sheets ✓")
