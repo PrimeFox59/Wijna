@@ -3730,7 +3730,7 @@ def main():
     ensure_db()
     # Prepare Google Sheets / Drive backend if configured
     try:
-        ensure_gsheets_backend()
+        check_and_create_worksheets()
     except Exception:
         pass
     try:
