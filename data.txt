@@ -1,0 +1,15 @@
+[connections.gsheets]
+spreadsheet = "https://docs.google.com/spreadsheets/d/119ml8_UELdxCaJrf25Q9tr4DToheUUISewAo7Is9sXE/edit"
+
+type = "service_account"
+project_id = "web-apps-473906"
+private_key_id = "031b7070aaa8d199bcdca0f67e2e557ddf56fc45"
+private_key = """-----BEGIN PRIVATE KEY-----\nMIIEugIBADANBgkqhkiG9w0BAQEFAASCBKQwggSgAgEAAoIBAQCznX8uzKQ7qDVo\nDhiKtUm3+zwX6eq2eNTsCjsN8q1SvDzeHQXt1F09adsUwp2rwHFMFZAryxOm6Rfi\n7aPGYMCjmdPUFssZvPa0cpu2cWxvIObgy/cwZ1d8KIKUwVNFYhMBiimGYWIYhQPe\njFcnmX8L4nTODK1wepD7Dr+ZnbFeZ/nOFDCBWSd6jvk34ysnx5IHrf6bHjiGwEh4\nJLWvKDrzx9tlFyK3EVNecsUd6xj3kRxUTK6YuxYBTI4B2AKazf5YUDL4faRW0BhI\nxqWmk/l3Vtln9g6eTfrGGAaSHq4JHSLJuBPQySCpV13kKre6Qe8JZ5GKW/FMaTEA\nmWNLgaXjAgMBAAECgf9tc4wM+Kcbs2TYA77wx4gklPQJnoFosDkPnSxfU4JK6Gou\n74CtbLtksRzPiciK4Lopovo3tYhELcZggm9Kc6rwBs0OcNVS2dN8IlrA0l1BWstW\nMPRwiojFH+pyu1wC68CpL4geWzlrt6Kj+uEhQGgq1dRXu2H1KLswQcx/z5hF7g9z\n3wVMvdjK+CKh8Kwxm9ytpXU1gq9Qu8WDSZ4Zl11FgmhcA/xQzgu0U/JP04w99xlW\nvK3ZLyWCP/gK8Ar87bkJpAi0e8cHv4W5Luo2SpGeMjp4EcMQT6ctiYMp/YHKQv5s\nG8nyJi6FWcVgeCe6Glz8am2btSsujRz/nl/PBwECgYEA7rCl92NhL3eUUuSSkSY+\noM1phWOjnzhR+Fatxji1+otIMhIaqSCNZhGXP8tZCyFmHta/UyhpVf4Lg7phlADI\nHzpHCzrD7OfR7LUuW0c3XOiw+e7cut6IJ7WoCCYpF8X8hxsXOjgm5v9iRWdietDE\nz2pPQcWleFuA0tubcOAQ0YMCgYEAwKQbZSTsPbLe3sYQGclHNa3yMuPWq6S4BD1D\n2X5PBzKNUOyMUajpE9lfYCuPAJibqUyXLIeEoVZLvk/SMF1aCdbgAxI1pIoHHAiX\nPjyP18h4LSaPGhhEpfQ6WSsibzzxX3uWqEavJN880l7ZaoniuBdAqFguoiXhUcFU\nT0HBjCECgYBiQmAgRk4Ev2JU+XmIvUi847LT0Z/S9NlxtSUWW9Q2Ts4qpp9JDniH\nEyjDf0+psFcczOS4NAOg/dL5qGlxBx1bFZ+XdNqhFRGrMy7hLqEQ402vpfBCEUfV\nqQeCS0tRWRTK/ZEDS4hgQbPPxG6bBoRuqmH0PowOzwRqSTNlNShXRwKBgHejM3RM\nSv9CYBFgVk19aGEZB0q9nut4X+QaHFItlGz24za3walRSndOT2JNiwEmxb2N2HEK\nNL9x9ZZawkHRKALmVLbzjycBpcquNyequvabBK+du8/L9I5QMBCCrl8BLTJMcdNO\nGqW+kmpgB4yX15rWrgwev89p0RZSB8c1IjuhAoGAS9WhiaHAevaAcjXtp9hIjDiL\nuVSuXDVrdqE5MoqWrGx/gmt1Llo3w6+yaUXuBIgAdW9Fk7o8AOtC5+uojIjCP+/1\nWYP43IAzZwsDwu9OOl0xjaiwT+Od8byLPcMazEDieJB3ufkmNmW8W6VyUnrhanmz\nVN/ZcNKQmotcBw2ZroM=\n-----END PRIVATE KEY-----\n"""
+client_email = "wijna-894@web-apps-473906.iam.gserviceaccount.com"
+client_id = "117175963679194146259"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/wijna-894%40web-apps-473906.iam.gserviceaccount.com"
+universe_domain = "googleapis.com"
+

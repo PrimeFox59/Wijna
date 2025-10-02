@@ -1,0 +1,6 @@
+streamlit
+gspread
+streamlit_gsheets
+google-auth
+pandas
+PyDrive2
