@@ -13,3 +13,28 @@ auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/wijna-894%40web-apps-473906.iam.gserviceaccount.com"
 universe_domain = "googleapis.com"
 
+
+
+
+
+
+# --- GOOGLE SHEETS CONNECTION & SETUP ---
+def get_gsheet_connection():
+    try:
+        creds = st.secrets["connections"]["gsheets"]
+        gc = gspread.service_account_from_dict(creds)
+        sh = gc.open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"].split('/')[-2])
+        return sh
+    except Exception as e:
+        st.error(f"Gagal terhubung ke Google Sheets. Pastikan file secrets.toml sudah benar dan API Google Sheets/Drive telah diaktifkan: {e}")
+        st.stop()
+    return None
+
+sh = get_gsheet_connection()
+
+# --- UTILITY FUNCTIONS ---
+def get_worksheet(sheet_name):
+    try:
+        return sh.worksheet(sheet_name)
+    except WorksheetNotFound:
+        return None
