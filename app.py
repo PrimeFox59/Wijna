@@ -1126,9 +1126,6 @@ def surat_masuk_module():
     st.header("📥 Surat Masuk")
 
     # Helpers for Surat Masuk sheet
-    def _sm_ws():
-        return _get_ws(SURAT_MASUK_SHEET_NAME)
-
     def _sm_headers():
         return [
             "id", "nomor", "tanggal", "pengirim", "perihal",
@@ -1137,6 +1134,14 @@ def surat_masuk_module():
             "director_approved", "rekap",
             "created_at", "submitted_by"
         ]
+
+    def _sm_ws():
+        # Try to get the worksheet; if missing, create with headers
+        try:
+            return _get_ws(SURAT_MASUK_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            spreadsheet = get_spreadsheet()
+            return ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, _sm_headers())
 
     def _sm_read_df():
         ws = _sm_ws()
