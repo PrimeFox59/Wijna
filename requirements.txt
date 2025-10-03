@@ -1,5 +1,5 @@
 streamlit
-streamlit-gsheets-connection
+st-gsheets-connection
 gspread
 gspread-dataframe
 pandas
