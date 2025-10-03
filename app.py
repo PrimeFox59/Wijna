@@ -13,8 +13,9 @@ from email.mime.text import MIMEText
 # --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
 GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
-USERS_SHEET_NAME = "users" # <-- BARIS INI SUDAH DIPERBAIKI
+USERS_SHEET_NAME = "users"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
+ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
 
 
@@ -149,6 +150,12 @@ def show_login_page():
                 if not user_data.empty:
                     stored_hash = user_data.iloc[0]["password_hash"]
                     if verify_password(password, stored_hash):
+                        
+                        # Kirim notifikasi email saat LOGIN
+                        email_subject = "Notifikasi: User Login"
+                        email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
+                        send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
+                        
                         st.session_state.logged_in = True
                         st.session_state.username = username
                         st.rerun()
@@ -181,16 +188,21 @@ def show_login_page():
                     worksheet.append_row([new_username, hashed_pass])
                     st.success("Registrasi berhasil! Silakan login.")
 
-                    # Kirim notifikasi email ke admin
-                    admin_email = "gantidenganemailadmin@gmail.com"  # GANTI DENGAN EMAIL ADMIN ANDA
+                    # Kirim notifikasi email saat REGISTRASI
                     email_subject = "Notifikasi: User Baru Telah Mendaftar"
                     email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
-                    send_notification_email(admin_email, email_subject, email_body)
+                    send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
 
 def show_main_app():
     """Menampilkan aplikasi utama setelah user berhasil login."""
     st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
+        
+        # Kirim notifikasi email saat LOGOUT
+        email_subject = "Notifikasi: User Logout"
+        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
+        send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
+        
         st.session_state.logged_in = False
         st.session_state.username = ""
         st.rerun()
