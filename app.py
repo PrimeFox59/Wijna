@@ -1251,7 +1251,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"role": new_role, "active": 1 if new_active else 0})
                             audit_log("users", "admin_update", target=sel_user, details=f"role={new_role}; active={int(new_active)}")
                             st.success("Perubahan disimpan.")
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Gagal menyimpan: {e}")
             with colB:
@@ -1262,7 +1262,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"active": 0})
                             audit_log("users", "admin_deactivate", target=sel_user)
                             st.success("User dinonaktifkan.")
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Gagal: {e}")
             with colC:
@@ -1276,7 +1276,7 @@ def user_setting_module():
                                 _users_delete_row(ws, row_idx)
                                 audit_log("users", "admin_delete", target=sel_user)
                                 st.success("User dihapus.")
-                                st.experimental_rerun()
+                                st.rerun()
                         except Exception as e:
                             st.error(f"Gagal menghapus: {e}")
     else:
@@ -1668,3 +1668,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
