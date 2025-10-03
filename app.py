@@ -513,6 +513,10 @@ def show_main_app():
                         supportsAllDrives=True
                     ).execute()
                     st.success(f"✅ File '{uploaded_file.name}' berhasil diupload!")
+                    try:
+                        audit_log("drive", "upload", target=file.get('id', ''), details=f"name={uploaded_file.name}; type={uploaded_file.type}")
+                    except Exception:
+                        pass
                 except Exception as e:
                     st.error(f"Gagal mengupload file: {e}")
 
@@ -605,6 +609,11 @@ def logout():
             send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
         except Exception:
             pass
+        # Audit logout event
+        try:
+            audit_log("auth", "logout", target=user.get("email", ""))
+        except Exception:
+            pass
     st.session_state.user = None
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -650,6 +659,11 @@ def login_user(email: str, password: str):
         st.session_state.username = user_obj["email"]
         try:
             send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
+        except Exception:
+            pass
+        # Audit login event
+        try:
+            audit_log("auth", "login", target=user_obj.get("email", ""))
         except Exception:
             pass
         return True, "Login berhasil."
@@ -708,6 +722,11 @@ def register_user(email: str, full_name: str, password: str):
             send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
         except Exception:
             pass
+        # Audit register
+        try:
+            audit_log("users", "register", target=email)
+        except Exception:
+            pass
         return True, "Registrasi berhasil."
     except Exception as e:
         return False, f"Gagal registrasi: {e}"
@@ -716,7 +735,27 @@ def register_user(email: str, full_name: str, password: str):
 def auth_sidebar():
     user = get_current_user()
     if user:
-        st.sidebar.info(f"Masuk sebagai: {user.get('full_name') or user.get('email')} ({user.get('role')})")
+                full_name = (user.get('full_name') or '').strip()
+                email = (user.get('email') or '').strip()
+                role = str(user.get('role', 'user')).strip().lower() or 'user'
+                role_label = 'Superuser' if role == 'superuser' else role.title()
+
+                # Small profile card in the sidebar
+                st.sidebar.markdown(
+                        f"""
+                        <div style="background:#EEF2FF;border:1px solid #c7d2fe;border-radius:10px;padding:12px 12px;margin:8px 0 14px 0;">
+                            <div style="font-weight:700;color:#1f2937;display:flex;align-items:center;gap:8px;">
+                                <span>👤</span>
+                                <span>{full_name or email}</span>
+                            </div>
+                            {f'<div style="font-size:12px;color:#4b5563;margin-left:24px;">{email}</div>' if full_name and email else ''}
+                            <div style="margin-top:8px;margin-left:24px;">
+                                <span style="background:#e0e7ff;color:#3730a3;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;">{role_label}</span>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                )
 
 
 def _get_emails_by_role(role: str) -> list[str]:
@@ -975,6 +1014,11 @@ def inventory_module():
                 service.permissions().create(fileId=resp['id'], body={
                     'role': 'reader', 'type': 'anyone'
                 }, supportsAllDrives=True).execute()
+            except Exception:
+                pass
+            # Audit upload attachment
+            try:
+                audit_log("inventory", "upload_attachment", target=resp.get('id', ''), details=f"name={file.name}; type={file.type}")
             except Exception:
                 pass
             return resp.get('id', ''), file.name, resp.get('webViewLink', '')
@@ -1399,6 +1443,10 @@ def surat_masuk_module():
                 ).execute()
             except Exception:
                 pass
+            try:
+                audit_log("surat_masuk", "upload", target=resp.get("id", ""), details=f"name={file.name}; type={file.type}")
+            except Exception:
+                pass
             return resp.get("id", ""), file.name, resp.get("webViewLink", "")
         except Exception as e:
             st.warning(f"Gagal upload surat ke Drive: {e}")
@@ -1705,6 +1753,10 @@ def surat_keluar_module():
                 ).execute()
             except Exception:
                 pass
+            try:
+                audit_log("surat_keluar", "upload", target=resp.get("id", ""), details=f"name={file.name}; type={file.type}")
+            except Exception:
+                pass
             return resp.get("id", ""), file.name, resp.get("webViewLink", "")
         except Exception as e:
             st.warning(f"Gagal upload ke Drive: {e}")
@@ -1851,6 +1903,10 @@ def surat_keluar_module():
                         if not fid:
                             st.error("Gagal mengupload final ke Drive.")
                         else:
+                            try:
+                                audit_log("surat_keluar", "final_upload", target=fid, details=f"name={fname}")
+                            except Exception:
+                                pass
                             _sk_update_by_id(row.get("id"), {
                                 "final_file_id": fid,
                                 "final_name": fname,
@@ -2090,7 +2146,58 @@ def audit_trail_module():
             df = pd.DataFrame(ws.get_all_records(expected_headers=audit_headers))
         except Exception:
             df = pd.DataFrame(ws.get_all_records())
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        # Ensure columns
+        for h in audit_headers:
+            if h not in df.columns:
+                df[h] = ""
+        # Filters
+        st.markdown("### Filter")
+        use_date = st.checkbox("Filter berdasarkan tanggal")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            start_date = st.date_input("Dari tanggal", value=date.today()) if use_date else None
+        with c2:
+            end_date = st.date_input("Sampai tanggal", value=date.today()) if use_date else None
+        with c3:
+            actor = st.text_input("Aktor (email)")
+        c4, c5 = st.columns(2)
+        with c4:
+            module = st.selectbox("Module", options=["Semua"] + sorted([m for m in df["module"].astype(str).unique() if m]))
+        with c5:
+            action = st.selectbox("Action", options=["Semua"] + sorted([a for a in df["action"].astype(str).unique() if a]))
+        q = st.text_input("Cari (target / details)")
+
+        fdf = df.copy()
+        # Date filter expects ISO timestamps
+        if use_date and start_date:
+            fdf = fdf[pd.to_datetime(fdf["timestamp"], errors="coerce") >= pd.to_datetime(start_date)]
+        if use_date and end_date:
+            fdf = fdf[pd.to_datetime(fdf["timestamp"], errors="coerce") <= pd.to_datetime(end_date) + pd.Timedelta(days=1)]
+        if actor:
+            fdf = fdf[fdf["actor"].astype(str).str.contains(actor, case=False, na=False)]
+        if module and module != "Semua":
+            fdf = fdf[fdf["module"].astype(str) == module]
+        if action and action != "Semua":
+            fdf = fdf[fdf["action"].astype(str) == action]
+        if q:
+            mask = (
+                fdf["target"].astype(str).str.contains(q, case=False, na=False)
+                | fdf["details"].astype(str).str.contains(q, case=False, na=False)
+            )
+            fdf = fdf[mask]
+
+        # Sort latest first
+        try:
+            fdf = fdf.sort_values(by="timestamp", ascending=False)
+        except Exception:
+            pass
+
+        st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+        # Export filtered
+        if not fdf.empty:
+            csv_data = fdf.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download CSV (filtered)", csv_data, file_name="audit_filtered.csv", mime="text/csv")
     except Exception as e:
         st.error(f"Gagal memuat audit trail: {e}")
 
