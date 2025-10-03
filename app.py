@@ -1541,6 +1541,14 @@ def surat_keluar_module():
     # Tab 1: Input Draft
     with tab1:
         st.markdown("### Input Draft Surat Keluar (Staf)")
+        # Pilih jenis draft di luar form agar perubahan memicu rerun dan input muncul dinamis
+        st.session_state.setdefault("sk_draft_type", "Upload File")
+        st.radio(
+            "Jenis Draft Surat",
+            ["Upload File", "Link URL"],
+            horizontal=True,
+            key="sk_draft_type",
+        )
         with st.form("sk_add", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
@@ -1549,13 +1557,21 @@ def surat_keluar_module():
             with col2:
                 ditujukan = st.text_input("Ditujukan Kepada")
                 perihal = st.text_input("Perihal")
-            draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True)
+            # Gunakan pilihan dari radio di luar form agar dinamis
+            draft_type = st.session_state.get("sk_draft_type", "Upload File")
             draft_file = None
             draft_link = None
             if draft_type == "Upload File":
-                draft_file = st.file_uploader("Upload Draft Surat (PDF/DOC)")
+                draft_file = st.file_uploader(
+                    "Upload Draft Surat (PDF/DOC)",
+                    type=["pdf", "doc", "docx"],
+                    key="sk_draft_file",
+                )
             else:
-                draft_link = st.text_input("Link Draft Surat (Google Drive, dll)")
+                draft_link = st.text_input(
+                    "Link Draft Surat (Google Drive, dll)",
+                    key="sk_draft_link",
+                )
             follow_up = st.text_area("Tindak Lanjut (opsional)")
             submit = st.form_submit_button("💾 Simpan Draft Surat Keluar")
             if submit:
