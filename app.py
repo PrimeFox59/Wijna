@@ -12,6 +12,7 @@ from email.mime.text import MIMEText
 import os
 import uuid
 from datetime import datetime, date, timedelta
+import time
 
 # --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
@@ -54,6 +55,44 @@ def get_gdrive_service():
     creds = get_credentials()
     service = build('drive', 'v3', credentials=creds)
     return service
+
+
+@st.cache_resource
+def get_spreadsheet():
+    """Cache object Spreadsheet untuk menghindari open_by_url berulang."""
+    client = get_gsheets_client()
+    return client.open_by_url(SPREADSHEET_URL)
+
+
+@st.cache_data(ttl=60, show_spinner=False, max_entries=64)
+def _cached_get_all_records(sheet_name: str, expected_headers: list | None = None):
+    """Ambil seluruh records dari sebuah sheet dengan cache dan retry ringan.
+    - ttl 60s untuk mengurangi beban read
+    - expected_headers bila disediakan akan memaksa mapping kolom
+    """
+    ws = get_spreadsheet().worksheet(sheet_name)
+    # Retry ringan untuk 429/5xx
+    for i in range(3):
+        try:
+            if expected_headers is not None:
+                return ws.get_all_records(expected_headers=expected_headers)
+            return ws.get_all_records()
+        except gspread.exceptions.APIError as e:
+            msg = str(e)
+            if any(code in msg for code in ["429", "500", "503"]):
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise
+    # Fallback terakhir tanpa mapping
+    return ws.get_all_records()
+
+
+def _invalidate_data_cache():
+    """Invalidasi cache data sheet (dipanggil setelah operasi tulis)."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
 # --- 3. FUNGSI HELPER & UTILITAS ---
@@ -157,31 +196,32 @@ def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
 
 
 def ensure_core_sheets():
-    """Initialize required worksheets: users, cuti, audit_log, and fix duplicate headers if any."""
+    """Initialize required worksheets once; minimize reads to avoid quotas."""
+    if st.session_state.get("_core_sheets_ok"):
+        return
     try:
-        client = get_gsheets_client()
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
+        spreadsheet = get_spreadsheet()
 
-        # Users sheet: support both legacy (username/password_hash) and new schema
+        # Users sheet: create or validate headers only (no full read)
         users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
         users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
 
-        # Ensure at least an admin exists — use expected_headers to avoid duplicate header error during read
+        # Lightweight check for at least one data row; only read a tiny range
         try:
-            df_users = pd.DataFrame(users_ws.get_all_records(expected_headers=users_headers))
+            data_row2 = users_ws.row_values(2)
         except Exception:
-            # Fallback read without mapping
-            df_users = pd.DataFrame(users_ws.get_all_records())
-
-        if df_users.empty:
-            users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
-        else:
-            # If there is no superuser, ensure one exists
-            has_superuser = False
-            if "role" in df_users.columns:
-                has_superuser = (df_users["role"].astype(str).str.lower() == "superuser").any()
-            if not has_superuser:
-                users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
+            data_row2 = []
+        if not data_row2:
+            # Append a default superuser only if sheet is empty
+            for i in range(3):
+                try:
+                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.2 * (i + 1))
+                        continue
+                    raise
 
         # Cuti sheet
         cuti_headers = [
@@ -203,6 +243,8 @@ def ensure_core_sheets():
             "file_id", "file_name", "file_link"
         ]
         ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
+
+        st.session_state["_core_sheets_ok"] = True
     except Exception as e:
         st.error(f"Gagal memastikan sheet inti tersedia: {e}")
 
@@ -334,20 +376,36 @@ def show_main_app():
 
     st.header("📋 Daftar File di Drive")
     if st.button("Refresh Daftar File"):
+        # force cache clear
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
         st.rerun()
         
     try:
+        @st.cache_data(ttl=60, show_spinner=False)
+        def _list_drive_files(folder_id: str):
+            service = get_gdrive_service()
+            query = f"'{folder_id}' in parents and trashed=false"
+            for i in range(3):
+                try:
+                    results = service.files().list(
+                        q=query,
+                        pageSize=100,
+                        fields="nextPageToken, files(id, name)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True
+                    ).execute()
+                    return results.get('files', [])
+                except Exception as e:
+                    if any(code in str(e) for code in ["429", "500", "503"]):
+                        time.sleep(1.2 * (i + 1))
+                        continue
+                    raise
+            return []
         with st.spinner("Memuat daftar file dari Google Drive..."):
-            drive_service = get_gdrive_service()
-            query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false"
-            results = drive_service.files().list(
-                q=query,
-                pageSize=100,
-                fields="nextPageToken, files(id, name)",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True
-            ).execute()
-            items = results.get('files', [])
+            items = _list_drive_files(GDRIVE_FOLDER_ID)
 
         if not items:
             st.info("📂 Folder ini masih kosong atau ID salah/belum di-share.")
@@ -359,11 +417,20 @@ def show_main_app():
                     st.write(f"📄 **{item['name']}**")
                 with col2:
                     def download_file_from_drive(file_id):
-                        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                        fh = io.BytesIO()
-                        fh.write(request.execute())
-                        fh.seek(0)
-                        return fh.getvalue()
+                        service = get_gdrive_service()
+                        for i in range(3):
+                            try:
+                                request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                                fh = io.BytesIO()
+                                fh.write(request.execute())
+                                fh.seek(0)
+                                return fh.getvalue()
+                            except Exception as e:
+                                if any(code in str(e) for code in ["429", "500", "503"]):
+                                    time.sleep(1.0 * (i + 1))
+                                    continue
+                                raise
+                        return b""
 
                     file_data = download_file_from_drive(item['id'])
                     st.download_button(
@@ -402,14 +469,14 @@ def logout():
 
 
 def _load_users_df():
-    client = get_gsheets_client()
-    spreadsheet = client.open_by_url(SPREADSHEET_URL)
+    spreadsheet = get_spreadsheet()
     ws = spreadsheet.worksheet(USERS_SHEET_NAME)
     users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
     try:
-        df = pd.DataFrame(ws.get_all_records(expected_headers=users_headers))
+        records = _cached_get_all_records(USERS_SHEET_NAME, users_headers)
     except Exception:
-        df = pd.DataFrame(ws.get_all_records())
+        records = ws.get_all_records()
+    df = pd.DataFrame(records)
     return ws, df
 
 
@@ -450,12 +517,11 @@ def login_user(email: str, password: str):
 
 def register_user(email: str, full_name: str, password: str):
     try:
-        client = get_gsheets_client()
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
+        spreadsheet = get_spreadsheet()
         ws = spreadsheet.worksheet(USERS_SHEET_NAME)
         users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
         try:
-            df = pd.DataFrame(ws.get_all_records(expected_headers=users_headers))
+            df = pd.DataFrame(_cached_get_all_records(USERS_SHEET_NAME, users_headers))
         except Exception:
             df = pd.DataFrame(ws.get_all_records())
         email_lower = email.lower()
@@ -485,7 +551,17 @@ def register_user(email: str, full_name: str, password: str):
                 row_values.append(1)
             else:
                 row_values.append("")
-        ws.append_row(row_values)
+        # Retry and cache invalidation
+        for i in range(3):
+            try:
+                ws.append_row(row_values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
         try:
             send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
         except Exception:
@@ -513,8 +589,7 @@ def gen_id(prefix: str):
 
 
 def _get_ws(name: str):
-    client = get_gsheets_client()
-    spreadsheet = client.open_by_url(SPREADSHEET_URL)
+    spreadsheet = get_spreadsheet()
     return spreadsheet.worksheet(name)
 
 
@@ -522,7 +597,17 @@ def audit_log(module: str, action: str, target: str = "", details: str = ""):
     try:
         ws = _get_ws(AUDIT_SHEET_NAME)
         actor = (get_current_user() or {}).get("email", "guest")
-        ws.append_row([datetime.utcnow().isoformat(), actor, module, action, target, details])
+        data = [datetime.utcnow().isoformat(), actor, module, action, target, details]
+        for i in range(3):
+            try:
+                ws.append_row(data)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
     except Exception:
         # Non-blocking
         pass
@@ -549,7 +634,7 @@ def inventory_module():
             "file_id", "file_name", "file_link"
         ]
         try:
-            df = pd.DataFrame(ws.get_all_records(expected_headers=inv_headers))
+            df = pd.DataFrame(_cached_get_all_records(INVENTORY_SHEET_NAME, inv_headers))
         except Exception:
             df = pd.DataFrame(ws.get_all_records())
         # Ensure all expected columns exist to avoid KeyError in filters
@@ -563,7 +648,16 @@ def inventory_module():
         ws = _inv_ws()
         headers = ws.row_values(1)
         values = [row.get(h, "") for h in headers]
-        ws.append_row(values)
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
 
     def _inv_update_by_id(iid: str, updates: dict):
         ws = _inv_ws()
@@ -577,7 +671,17 @@ def inventory_module():
                 continue
             col_idx = headers.index(k) + 1
             a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-            ws.update(a1, [[v]])
+            # Retry updates
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
 
     def format_datetime_wib(ts: str) -> str:
         try:
@@ -985,7 +1089,7 @@ def _cuti_read_df():
         "alasan", "created_at"
     ]
     try:
-        df = pd.DataFrame(ws.get_all_records(expected_headers=cuti_headers))
+        df = pd.DataFrame(_cached_get_all_records(CUTI_SHEET_NAME, cuti_headers))
     except Exception:
         df = pd.DataFrame(ws.get_all_records())
     # Ensure all expected columns exist
@@ -999,7 +1103,16 @@ def _cuti_append(row_dict: dict):
     ws = _get_ws(CUTI_SHEET_NAME)
     headers = ws.row_values(1)
     values = [row_dict.get(h, "") for h in headers]
-    ws.append_row(values)
+    for i in range(3):
+        try:
+            ws.append_row(values)
+            _invalidate_data_cache()
+            break
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e):
+                time.sleep(1.2 * (i + 1))
+                continue
+            raise
 
 
 def _cuti_update_by_id(cid: str, updates: dict):
@@ -1015,7 +1128,16 @@ def _cuti_update_by_id(cid: str, updates: dict):
             continue
         col_idx = headers.index(k) + 1
         a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-        ws.update(a1, [[v]])
+        for i in range(3):
+            try:
+                ws.update(a1, [[v]])
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+    _invalidate_data_cache()
 
 
 def main():
@@ -1324,5 +1446,4 @@ def main():
 
 
 if __name__ == "__main__":
-    ensure_core_sheets()
     main()
