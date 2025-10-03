@@ -240,7 +240,7 @@ def ensure_core_sheets():
         inv_headers = [
             "id", "name", "location", "status", "pic", "updated_at",
             "finance_note", "finance_approved", "director_note", "director_approved",
-            "file_id", "file_name", "file_link"
+            "file_id", "file_name", "file_link", "loan_info"
         ]
         ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
 
@@ -577,6 +577,46 @@ def auth_sidebar():
         st.sidebar.info(f"Masuk sebagai: {user.get('full_name') or user.get('email')} ({user.get('role')})")
 
 
+def _get_emails_by_role(role: str) -> list[str]:
+    """Kembalikan list email untuk user dengan role tertentu dan active=1 (jika ada)."""
+    try:
+        _, df = _load_users_df()
+        if df is None or df.empty:
+            return []
+        role_mask = df.get('role', pd.Series(dtype=str)).astype(str).str.lower() == str(role).lower()
+        if 'active' in df.columns:
+            active_mask = pd.to_numeric(df['active'], errors='coerce').fillna(0).astype(int) == 1
+            role_mask = role_mask & active_mask
+        email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
+        if not email_col:
+            return []
+        emails = (
+            df.loc[role_mask, email_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        return emails
+    except Exception:
+        return []
+
+
+def _notify_role(role: str, subject: str, body: str):
+    """Kirim email ke semua user dengan role tersebut. Non-blocking per kegagalan satu alamat."""
+    emails = _get_emails_by_role(role)
+    sent = 0
+    for e in emails:
+        try:
+            if send_notification_email(e, subject, body):
+                sent += 1
+        except Exception:
+            pass
+    if emails:
+        st.toast(f"Notifikasi terkirim ke {sent}/{len(emails)} {role}")
+
+
 def require_login():
     user = get_current_user()
     if not user:
@@ -631,7 +671,7 @@ def inventory_module():
         inv_headers = [
             "id", "name", "location", "status", "pic", "updated_at",
             "finance_note", "finance_approved", "director_note", "director_approved",
-            "file_id", "file_name", "file_link"
+            "file_id", "file_name", "file_link", "loan_info"
         ]
         try:
             df = pd.DataFrame(_cached_get_all_records(INVENTORY_SHEET_NAME, inv_headers))
@@ -641,7 +681,7 @@ def inventory_module():
         for h in inv_headers:
             if h not in df.columns:
                 # defaults: numeric approvals -> 0, others empty string
-                df[h] = 0 if h in ("finance_approved", "director_approved") else ""
+        df[h] = 0 if h in ("finance_approved", "director_approved") else ""
         return ws, df
 
     def _inv_append(row: dict):
@@ -769,7 +809,8 @@ def inventory_module():
                         iid = gen_id("inv")
                         now = datetime.utcnow().isoformat()
                         file_id, file_name, file_link = upload_file_to_drive(f) if f else ("", "", "")
-                        pic = ""  # PIC removed per spec
+                        # PIC adalah user penginput
+                        pic = (user.get("full_name") or user.get("email") or "").strip()
                         _inv_append({
                             "id": iid,
                             "name": full_nama,
@@ -783,10 +824,17 @@ def inventory_module():
                             "director_approved": 0,
                             "file_id": file_id,
                             "file_name": file_name,
-                            "file_link": file_link
+                            "file_link": file_link,
+                            "loan_info": ""
                         })
                         try:
                             audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
+                        except Exception:
+                            pass
+                        # Notify Finance users
+                        try:
+                            _notify_role("finance", "[WIJNA] Draft Inventaris Baru",
+                                         f"Item inventaris baru menunggu review Finance.\n\nNama: {full_nama}\nID: {iid}\nLokasi: {loc}\nStatus: {status}\nPIC: {pic}")
                         except Exception:
                             pass
                         st.success("Item disimpan sebagai draft. Menunggu review Finance.")
@@ -826,6 +874,12 @@ def inventory_module():
                             _inv_update_by_id(r.get('id'), {"finance_note": note, "finance_approved": 1})
                             try:
                                 audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
+                            except Exception:
+                                pass
+                            # Notify Directors
+                            try:
+                                _notify_role("director", "[WIJNA] Inventaris Menunggu Approval Director",
+                                             f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
                             except Exception:
                                 pass
                             st.success("Finance reviewed. Menunggu persetujuan Director.")
@@ -922,7 +976,9 @@ def inventory_module():
             if filtered_df.empty:
                 st.info("Tidak ada data inventaris sesuai filter.")
             else:
-                show_df = filtered_df.drop(columns=["file_link"], errors="ignore")
+                # Tampilkan hanya kolom: id, name, location, status, pic, updated_at
+                cols_show = ["id", "name", "location", "status", "pic", "updated_at"]
+                show_df = filtered_df.reindex(columns=cols_show)
                 st.dataframe(show_df, use_container_width=True)
 
                 lampiran_list = [
@@ -961,9 +1017,10 @@ def inventory_module():
                         ajukan = st.button("Ajukan Pinjam", key=f"ajukan_{row.get('id')}")
                         if ajukan:
                             try:
+                                # Simpan detail pinjam terpisah agar tidak menimpa PIC penginput
                                 info_pic = f"{user.get('email')}|{keperluan}|{tgl_kembali}|0|0"
                                 _inv_update_by_id(row.get('id'), {
-                                    "pic": info_pic,
+                                    "loan_info": info_pic,
                                     "finance_approved": 0,
                                     "director_approved": 0,
                                     "updated_at": datetime.utcnow().isoformat()
@@ -1443,7 +1500,6 @@ def main():
         audit_trail_module()
     elif choice == "Superuser Panel":
         superuser_panel()
-
 
 if __name__ == "__main__":
     main()
