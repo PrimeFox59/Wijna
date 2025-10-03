@@ -681,7 +681,7 @@ def inventory_module():
         for h in inv_headers:
             if h not in df.columns:
                 # defaults: numeric approvals -> 0, others empty string
-        df[h] = 0 if h in ("finance_approved", "director_approved") else ""
+                df[h] = 0 if h in ("finance_approved", "director_approved") else ""
         return ws, df
 
     def _inv_append(row: dict):
