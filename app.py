@@ -114,8 +114,10 @@ def initialize_users_sheet():
 
 
 def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
-    """Ensure a worksheet exists and has at least the provided headers in row 1.
-    If the sheet exists but missing some columns, it will add them to the end.
+    """Ensure a worksheet exists and its header row is valid and unique.
+    - If worksheet doesn't exist: create it and set exact headers.
+    - If header row is empty or contains duplicates/whitespace variants: replace with canonical headers.
+    - If some required headers are missing: append them to the end (keeping existing columns).
     """
     try:
         ws = spreadsheet.worksheet(title)
@@ -124,18 +126,28 @@ def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
         ws.update("A1", [headers])
         return ws
 
-    # Ensure headers present
+    # Ensure headers present and unique
     try:
         current = ws.row_values(1)
-        changed = False
         if not current:
             ws.update("A1", [headers])
             return ws
-        missing = [h for h in headers if h not in current]
+
+        # Normalize for duplicate detection
+        curr_norm = [str(h).strip() for h in current]
+        has_duplicates = len(curr_norm) != len(set(curr_norm))
+
+        if has_duplicates:
+            # If duplicates exist (e.g., ['active', 'active']), reset to canonical headers
+            ws.update("A1", [headers])
+            return ws
+
+        # Append any missing required headers (avoid case/whitespace issues)
+        present = set(curr_norm)
+        missing = [h for h in headers if h.strip() not in present]
         if missing:
-            current += missing
-            ws.update("A1", [current])
-            changed = True
+            new_headers = curr_norm + missing
+            ws.update("A1", [new_headers])
         return ws
     except Exception:
         # If header fetch fails for any reason, set headers
@@ -144,7 +156,7 @@ def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
 
 
 def ensure_core_sheets():
-    """Initialize required worksheets: users, cuti, audit_log."""
+    """Initialize required worksheets: users, cuti, audit_log, and fix duplicate headers if any."""
     try:
         client = get_gsheets_client()
         spreadsheet = client.open_by_url(SPREADSHEET_URL)
@@ -153,20 +165,22 @@ def ensure_core_sheets():
         users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
         users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
 
-        # Ensure at least an admin exists
-        df_users = pd.DataFrame(users_ws.get_all_records())
+        # Ensure at least an admin exists — use expected_headers to avoid duplicate header error during read
+        try:
+            df_users = pd.DataFrame(users_ws.get_all_records(expected_headers=users_headers))
+        except Exception:
+            # Fallback read without mapping
+            df_users = pd.DataFrame(users_ws.get_all_records())
+
         if df_users.empty:
             users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
         else:
-            # Legacy support: if it uses 'username' column and no 'email'
-            if "email" not in df_users.columns and "username" in df_users.columns:
-                # Don't migrate; just ensure an admin row exists one way or another
-                if not (df_users["username"].astype(str).str.lower() == "admin").any():
-                    users_ws.append_row(["admin", hash_password("admin")])
-            else:
-                if not (df_users.get("role", pd.Series()).astype(str).str.lower() == "superuser").any():
-                    # ensure at least one superuser
-                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
+            # If there is no superuser, ensure one exists
+            has_superuser = False
+            if "role" in df_users.columns:
+                has_superuser = (df_users["role"].astype(str).str.lower() == "superuser").any()
+            if not has_superuser:
+                users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
 
         # Cuti sheet
         cuti_headers = [
@@ -382,7 +396,12 @@ def _load_users_df():
     client = get_gsheets_client()
     spreadsheet = client.open_by_url(SPREADSHEET_URL)
     ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-    return ws, pd.DataFrame(ws.get_all_records())
+    users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+    try:
+        df = pd.DataFrame(ws.get_all_records(expected_headers=users_headers))
+    except Exception:
+        df = pd.DataFrame(ws.get_all_records())
+    return ws, df
 
 
 def login_user(email: str, password: str):
@@ -425,7 +444,11 @@ def register_user(email: str, full_name: str, password: str):
         client = get_gsheets_client()
         spreadsheet = client.open_by_url(SPREADSHEET_URL)
         ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-        df = pd.DataFrame(ws.get_all_records())
+        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+        try:
+            df = pd.DataFrame(ws.get_all_records(expected_headers=users_headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
         email_lower = email.lower()
         # Check existing
         email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
@@ -570,7 +593,11 @@ def audit_trail_module():
     st.header("🕵️ Audit Trail")
     try:
         ws = _get_ws(AUDIT_SHEET_NAME)
-        df = pd.DataFrame(ws.get_all_records())
+        audit_headers = ["timestamp", "actor", "module", "action", "target", "details"]
+        try:
+            df = pd.DataFrame(ws.get_all_records(expected_headers=audit_headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
         st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Gagal memuat audit trail: {e}")
@@ -583,7 +610,17 @@ def superuser_panel():
 
 def _cuti_read_df():
     ws = _get_ws(CUTI_SHEET_NAME)
-    return ws, pd.DataFrame(ws.get_all_records())
+    cuti_headers = [
+        "id", "nama", "tgl_mulai", "tgl_selesai", "durasi",
+        "kuota_tahunan", "cuti_terpakai", "sisa_kuota", "status",
+        "finance_note", "finance_approved", "director_note", "director_approved",
+        "alasan", "created_at"
+    ]
+    try:
+        df = pd.DataFrame(ws.get_all_records(expected_headers=cuti_headers))
+    except Exception:
+        df = pd.DataFrame(ws.get_all_records())
+    return ws, df
 
 
 def _cuti_append(row_dict: dict):
@@ -600,23 +637,13 @@ def _cuti_update_by_id(cid: str, updates: dict):
     if not id_cell:
         raise ValueError("ID tidak ditemukan")
     row_idx = id_cell.row
-    # Prepare batch update per column
-    cell_updates = []
+    # Update each cell individually (simpler, avoids API mismatch)
     for k, v in updates.items():
         if k not in headers:
             continue
         col_idx = headers.index(k) + 1
-        cell_updates.append({
-            'range': gspread.utils.rowcol_to_a1(row_idx, col_idx),
-            'values': [[v]]
-        })
-    if cell_updates:
-        # Use batch_update with data values
-        body = {
-            'valueInputOption': 'USER_ENTERED',
-            'data': [{'range': u['range'], 'values': u['values']} for u in cell_updates]
-        }
-        ws.spreadsheet.values_batch_update(body)
+        a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+        ws.update(a1, [[v]])
 
 
 def main():
