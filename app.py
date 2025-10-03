@@ -436,10 +436,13 @@ def show_login_page():
                     stored_hash = user_data.iloc[0]["password_hash"]
                     if verify_password(password, stored_hash):
                         
-                        # Kirim notifikasi email saat LOGIN
+                        # Kirim notifikasi ke seluruh SUPERUSER saat LOGIN
                         email_subject = "Notifikasi: User Login"
                         email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
-                        send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
+                        try:
+                            _notify_roles(["superuser"], email_subject, email_body)
+                        except Exception:
+                            pass
                         
                         st.session_state.logged_in = True
                         st.session_state.username = username
@@ -473,20 +476,26 @@ def show_login_page():
                     worksheet.append_row([new_username, hashed_pass])
                     st.success("Registrasi berhasil! Silakan login.")
 
-                    # Kirim notifikasi email saat REGISTRASI
+                    # Kirim notifikasi ke seluruh SUPERUSER saat REGISTRASI
                     email_subject = "Notifikasi: User Baru Telah Mendaftar"
                     email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
-                    send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
+                    try:
+                        _notify_roles(["superuser"], email_subject, email_body)
+                    except Exception:
+                        pass
 
 def show_main_app():
     """Menampilkan aplikasi utama setelah user berhasil login."""
     st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
         
-        # Notifikasi ke semua Superuser saat LOGOUT (role-based)
+        # Kirim notifikasi ke seluruh SUPERUSER saat LOGOUT
         email_subject = "Notifikasi: User Logout"
-        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi."
-        _notify_roles(["superuser"], email_subject, email_body)
+        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
+        try:
+            _notify_roles(["superuser"], email_subject, email_body)
+        except Exception:
+            pass
         
         st.session_state.logged_in = False
         st.session_state.username = ""
@@ -606,7 +615,7 @@ def logout():
     user = get_current_user()
     if user:
         try:
-            _notify_roles(["superuser"], "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi.")
+            _notify_roles(["superuser"], "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
         except Exception:
             pass
         # Audit logout event
