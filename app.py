@@ -483,10 +483,10 @@ def show_main_app():
     st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
         
-        # Kirim notifikasi email saat LOGOUT
+        # Notifikasi ke semua Superuser saat LOGOUT (role-based)
         email_subject = "Notifikasi: User Logout"
-        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
-        send_notification_email(ADMIN_EMAIL_RECIPIENT, email_subject, email_body)
+        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi."
+        _notify_roles(["superuser"], email_subject, email_body)
         
         st.session_state.logged_in = False
         st.session_state.username = ""
@@ -606,7 +606,7 @@ def logout():
     user = get_current_user()
     if user:
         try:
-            send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
+            _notify_roles(["superuser"], "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi.")
         except Exception:
             pass
         # Audit logout event
@@ -658,7 +658,7 @@ def login_user(email: str, password: str):
         st.session_state.logged_in = True
         st.session_state.username = user_obj["email"]
         try:
-            send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
+            _notify_roles(["superuser"], "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
         except Exception:
             pass
         # Audit login event
@@ -719,7 +719,7 @@ def register_user(email: str, full_name: str, password: str):
                     continue
                 raise
         try:
-            send_notification_email(ADMIN_EMAIL_RECIPIENT, "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
+            _notify_roles(["superuser"], "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
         except Exception:
             pass
         # Audit register
