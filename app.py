@@ -2192,7 +2192,7 @@ def main():
         # Centered header using 3 columns; place content in the middle column
         col1, col2, col3 = st.columns(3)
         with col2:
-            st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=300)
+            st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=500)
             st.markdown("<h2 style='text-align:center;font-size:1.4rem;'>WIJNA Management System</h2>", unsafe_allow_html=True)
         tabs = st.tabs(["Login", "Register"])
         with tabs[0]:
