@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 # --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
 GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
-USERS_SHE-ET_NAME = "users"
+USERS_SHEET_NAME = "users" # <-- BARIS INI SUDAH DIPERBAIKI
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
 
