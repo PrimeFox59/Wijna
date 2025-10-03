@@ -653,6 +653,58 @@ def audit_log(module: str, action: str, target: str = "", details: str = ""):
         pass
 
 
+# --- Helpers: Users sheet operations ---
+def _find_user_row(ws, email_or_username: str) -> int | None:
+    """Find row index (1-based) by matching email or username columns (case-insensitive). Returns None if not found."""
+    headers = ws.row_values(1)
+    email_col_idx = (headers.index('email') + 1) if 'email' in headers else None
+    user_col_idx = (headers.index('username') + 1) if 'username' in headers else None
+    # Prefer email search
+    try_cols = [email_col_idx, user_col_idx]
+    for col_idx in try_cols:
+        if not col_idx:
+            continue
+        try:
+            cell = ws.find(email_or_username, in_column=col_idx, case_sensitive=False)
+            if cell:
+                return cell.row
+        except Exception:
+            continue
+    return None
+
+
+def _users_update_row(ws, row_idx: int, updates: dict):
+    """Update specified columns for a given row with retries; clear cache after."""
+    headers = ws.row_values(1)
+    for k, v in updates.items():
+        if k not in headers:
+            continue
+        a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+        for i in range(3):
+            try:
+                ws.update(a1, [[v]])
+                break
+            except gspread.exceptions.APIError as e:
+                if '429' in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+    _invalidate_data_cache()
+
+
+def _users_delete_row(ws, row_idx: int):
+    for i in range(3):
+        try:
+            ws.delete_rows(row_idx)
+            _invalidate_data_cache()
+            break
+        except gspread.exceptions.APIError as e:
+            if '429' in str(e):
+                time.sleep(1.2 * (i + 1))
+                continue
+            raise
+
+
 def dashboard():
     st.title("🏠 Dashboard")
     st.write("Selamat datang di WIJNA Manajemen System.")
@@ -1114,8 +1166,121 @@ def notulen_module():
 
 
 def user_setting_module():
+    user = require_login()
     st.header("⚙️ User Setting")
-    st.info("Module coming soon (Sheets + Drive)")
+    ws, df = _load_users_df()
+    email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
+    if not email_col:
+        st.error("Sheet users tidak memiliki kolom email/username.")
+        return
+
+    current_identifier = user.get('email')
+    row = df[df[email_col].astype(str).str.lower() == str(current_identifier).lower()]
+    if row.empty:
+        st.warning("Data user Anda tidak ditemukan di database.")
+
+    tab1, tab2 = st.tabs(["👤 Profil", "🔒 Ganti Password"])
+    with tab1:
+        st.subheader("Update Profil")
+        full_name = st.text_input("Nama Lengkap", value=user.get('full_name', ''))
+        if st.button("Simpan Profil"):
+            try:
+                row_idx = _find_user_row(ws, current_identifier)
+                if row_idx:
+                    _users_update_row(ws, row_idx, {"full_name": full_name})
+                    set_current_user({**user, "full_name": full_name})
+                    audit_log("users", "update_profile", target=current_identifier, details=f"full_name -> {full_name}")
+                    st.success("Profil berhasil diperbarui.")
+                else:
+                    st.error("Gagal menemukan baris user di sheet.")
+            except Exception as e:
+                st.error(f"Gagal menyimpan profil: {e}")
+
+    with tab2:
+        st.subheader("Ganti Password")
+        old_pw = st.text_input("Password Lama", type="password")
+        new_pw = st.text_input("Password Baru", type="password")
+        new_pw2 = st.text_input("Ulangi Password Baru", type="password")
+        if st.button("Simpan Password"):
+            if not (old_pw and new_pw and new_pw2):
+                st.warning("Semua field password wajib diisi.")
+            elif new_pw != new_pw2:
+                st.error("Ulangi password baru tidak sama.")
+            else:
+                try:
+                    # verify
+                    hashed = row.iloc[0].get('password_hash') if not row.empty else None
+                    if not hashed or not verify_password(old_pw, hashed):
+                        st.error("Password lama salah.")
+                    else:
+                        row_idx = _find_user_row(ws, current_identifier)
+                        if not row_idx:
+                            st.error("Gagal menemukan baris user di sheet.")
+                        else:
+                            _users_update_row(ws, row_idx, {"password_hash": hash_password(new_pw)})
+                            audit_log("users", "change_password", target=current_identifier)
+                            st.success("Password berhasil diganti.")
+                except Exception as e:
+                    st.error(f"Gagal mengganti password: {e}")
+
+    # Director admin panel
+    st.markdown("---")
+    if str(user.get('role', '')).lower() in ["director", "superuser"]:
+        st.subheader("🛠️ Admin Pengguna (Director)")
+        # Simple grid
+        df_show = df.copy()
+        cols_wanted = [c for c in [email_col, 'full_name', 'role', 'active', 'created_at'] if c in df_show.columns]
+        st.dataframe(df_show[cols_wanted], use_container_width=True)
+
+        st.markdown("### Edit User")
+        sel_user = st.selectbox("Pilih user", df[email_col].astype(str).tolist())
+        if sel_user:
+            target_row = df[df[email_col].astype(str) == sel_user]
+            cur_role = str(target_row.get('role', pd.Series(['user'])).iloc[0]) if not target_row.empty else 'user'
+            cur_active = int(pd.to_numeric(target_row.get('active', pd.Series([1])), errors='coerce').fillna(1).iloc[0]) if not target_row.empty else 1
+            new_role = st.selectbox("Role", ["user", "staff", "finance", "director", "superuser"], index=["user","staff","finance","director","superuser"].index(cur_role) if cur_role in ["user","staff","finance","director","superuser"] else 0)
+            new_active = st.checkbox("Aktif", value=bool(cur_active))
+            colA, colB, colC = st.columns(3)
+            with colA:
+                if st.button("Simpan Perubahan"):
+                    try:
+                        row_idx = _find_user_row(ws, sel_user)
+                        if not row_idx:
+                            st.error("User tidak ditemukan di sheet.")
+                        else:
+                            _users_update_row(ws, row_idx, {"role": new_role, "active": 1 if new_active else 0})
+                            audit_log("users", "admin_update", target=sel_user, details=f"role={new_role}; active={int(new_active)}")
+                            st.success("Perubahan disimpan.")
+                            st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Gagal menyimpan: {e}")
+            with colB:
+                if st.button("Nonaktifkan"):
+                    try:
+                        row_idx = _find_user_row(ws, sel_user)
+                        if row_idx:
+                            _users_update_row(ws, row_idx, {"active": 0})
+                            audit_log("users", "admin_deactivate", target=sel_user)
+                            st.success("User dinonaktifkan.")
+                            st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Gagal: {e}")
+            with colC:
+                if st.button("Hapus User", type="primary"):
+                    if sel_user.lower() == str(current_identifier).lower():
+                        st.error("Tidak dapat menghapus akun Anda sendiri.")
+                    else:
+                        try:
+                            row_idx = _find_user_row(ws, sel_user)
+                            if row_idx:
+                                _users_delete_row(ws, row_idx)
+                                audit_log("users", "admin_delete", target=sel_user)
+                                st.success("User dihapus.")
+                                st.experimental_rerun()
+                        except Exception as e:
+                            st.error(f"Gagal menghapus: {e}")
+    else:
+        st.info("Hubungi Director jika perlu perubahan role atau manajemen akun lain.")
 
 
 def audit_trail_module():
