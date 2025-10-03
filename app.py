@@ -1054,11 +1054,22 @@ def inventory_module():
         def finance_tab():
             st.info("Approve item yang sudah diinput staf.")
             _, df = _inv_read_df()
-            if not df.empty:
-                df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
-            rows = df[df['finance_approved'] == 0]
-            for idx, r in rows.iterrows():
-                st.markdown(f"""
+            if df.empty:
+                st.info("Tidak ada item untuk direview.")
+                return
+            df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
+            pending = df[df['finance_approved'] == 0].copy()
+            if pending.empty:
+                st.info("Tidak ada item pending untuk Finance.")
+                return
+            options = [f"{r['name']} (ID: {r['id']})" for _, r in pending.iterrows()]
+            mapping = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in pending.iterrows()}
+            pick = st.selectbox("Pilih item untuk direview:", options, key="fin_pick_inv")
+            if not pick:
+                return
+            sel_id = mapping[pick]
+            r = pending[pending['id'] == sel_id].iloc[0]
+            st.markdown(f"""
 <div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
 <b>📦 {r.get('name')}</b> <span style='color:#888;'>(ID: {r.get('id')})</span><br>
 <b>Lokasi:</b> {r.get('location')}<br>
@@ -1066,33 +1077,27 @@ def inventory_module():
 <b>Penanggung Jawab:</b> {r.get('pic','')}<br>
 <b>Terakhir Update:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
 """, unsafe_allow_html=True)
-                file_id = r.get('file_id')
-                file_name = r.get('file_name')
-                if file_id and file_name:
-                    drive_download_button(file_id, file_name, key=f"dl_fin_{r.get('id')}_{idx}")
-                st.markdown("**Catatan Finance:**")
-                note = st.text_area("Tulis catatan atau alasan jika perlu", value=r.get("finance_note") or "", key=f"fin_note_{r.get('id')}_{idx}")
-                colf1, colf2 = st.columns([1,2])
-                with colf1:
-                    if st.button("🔎 Review", key=f"ap_fin_{r.get('id')}_{idx}"):
-                        try:
-                            _inv_update_by_id(r.get('id'), {"finance_note": note, "finance_approved": 1})
-                            try:
-                                audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
-                            except Exception:
-                                pass
-                            # Notify Directors + Superuser
-                            try:
-                                _notify_roles(["director"], "[WIJNA] Inventaris Menunggu Approval Director",
-                                               f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
-                            except Exception:
-                                pass
-                            st.success("Finance reviewed. Menunggu persetujuan Director.")
-                        except Exception as e:
-                            st.error(f"Gagal menyimpan: {e}")
-                        st.rerun()
-                with colf2:
-                    st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
+            file_id = r.get('file_id')
+            file_name = r.get('file_name')
+            if file_id and file_name:
+                drive_download_button(file_id, file_name, key=f"dl_fin_{r.get('id')}")
+            note = st.text_area("Catatan Finance (opsional)", value=r.get("finance_note") or "", key=f"fin_note_{r.get('id')}")
+            if st.button("🔎 Simpan Review Finance", key=f"ap_fin_{r.get('id')}"):
+                try:
+                    _inv_update_by_id(r.get('id'), {"finance_note": note, "finance_approved": 1})
+                    try:
+                        audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
+                    except Exception:
+                        pass
+                    try:
+                        _notify_roles(["director"], "[WIJNA] Inventaris Menunggu Approval Director",
+                                       f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
+                    except Exception:
+                        pass
+                    st.success("Finance reviewed. Menunggu persetujuan Director.")
+                except Exception as e:
+                    st.error(f"Gagal menyimpan: {e}")
+                st.rerun()
 
         tab_contents.append(finance_tab)
 
@@ -1106,48 +1111,55 @@ def inventory_module():
             if not df.empty:
                 df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
                 df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
-            rows = df[(df['finance_approved'] == 1) & (df['director_approved'] == 0)]
-            for idx, r in rows.iterrows():
-                with st.expander(f"[Menunggu Approval Director] {r.get('name')} ({r.get('id')})"):
-                    st.markdown(f"""
-                    <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
-                        <b>Nama:</b> {r.get('name')}<br>
-                        <b>ID:</b> {r.get('id')}<br>
-                        <b>Lokasi:</b> {r.get('location')}<br>
-                        <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r.get('status')}</span><br>
-                        <b>PIC:</b> {r.get('pic','')}<br>
-                        <b>Update Terakhir:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    if r.get('file_id') and r.get('file_name'):
-                        drive_download_button(r.get('file_id'), r.get('file_name'), key=f"dl_dir_{r.get('id')}_{idx}")
-                    st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
-                    note2 = st.text_area("", value=r.get("director_note") or "", key=f"dir_note_{r.get('id')}_{idx}", placeholder="Tulis catatan atau alasan jika perlu...", height=80)
-                    colA, colB = st.columns([1,1])
-                    with colA:
-                        if st.button("✅ Approve", key=f"ap_dir_{r.get('id')}_{idx}"):
-                            try:
-                                _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": 1})
-                                try:
-                                    audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=1; note={note2}")
-                                except Exception:
-                                    pass
-                                st.success("Item telah di-approve Director.")
-                            except Exception as e:
-                                st.error(f"Gagal menyimpan: {e}")
-                            st.rerun()
-                    with colB:
-                        if st.button("❌ Tolak", key=f"reject_dir_{r.get('id')}_{idx}"):
-                            try:
-                                _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": -1})
-                                try:
-                                    audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=0; note={note2}")
-                                except Exception:
-                                    pass
-                                st.success("Item ditolak Director.")
-                            except Exception as e:
-                                st.error(f"Gagal menyimpan: {e}")
-                            st.rerun()
+            rows = df[(df['finance_approved'] == 1) & (df['director_approved'] == 0)].copy()
+            if rows.empty:
+                st.info("Tidak ada item yang menunggu Approval Director.")
+                return
+            options = [f"{r['name']} (ID: {r['id']})" for _, r in rows.iterrows()]
+            mapping = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in rows.iterrows()}
+            pick = st.selectbox("Pilih item untuk disetujui/ditolak:", options, key="dir_pick_inv")
+            if not pick:
+                return
+            sel_id = mapping[pick]
+            r = rows[rows['id'] == sel_id].iloc[0]
+            st.markdown(f"""
+            <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
+                <b>Nama:</b> {r.get('name')}<br>
+                <b>ID:</b> {r.get('id')}<br>
+                <b>Lokasi:</b> {r.get('location')}<br>
+                <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r.get('status')}</span><br>
+                <b>PIC:</b> {r.get('pic','')}<br>
+                <b>Update Terakhir:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
+            </div>
+            """, unsafe_allow_html=True)
+            if r.get('file_id') and r.get('file_name'):
+                drive_download_button(r.get('file_id'), r.get('file_name'), key=f"dl_dir_{r.get('id')}")
+            note2 = st.text_area("Catatan Director", value=r.get("director_note") or "", key=f"dir_note_{r.get('id')}", height=80)
+            colA, colB = st.columns([1,1])
+            with colA:
+                if st.button("✅ Approve", key=f"ap_dir_{r.get('id')}"):
+                    try:
+                        _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": 1})
+                        try:
+                            audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=1; note={note2}")
+                        except Exception:
+                            pass
+                        st.success("Item telah di-approve Director.")
+                    except Exception as e:
+                        st.error(f"Gagal menyimpan: {e}")
+                    st.rerun()
+            with colB:
+                if st.button("❌ Tolak", key=f"reject_dir_{r.get('id')}"):
+                    try:
+                        _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": -1})
+                        try:
+                            audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=0; note={note2}")
+                        except Exception:
+                            pass
+                        st.success("Item ditolak Director.")
+                    except Exception as e:
+                        st.error(f"Gagal menyimpan: {e}")
+                    st.rerun()
 
         tab_contents.append(director_tab)
 
@@ -1214,35 +1226,40 @@ def inventory_module():
             if filter_status != "Semua":
                 filtered_df2 = filtered_df2[filtered_df2.get('status','') == filter_status]
 
-            for idx, row in filtered_df2.iterrows():
-                if row.get('status') != "Dipinjam":
-                    with st.expander(f"Pinjam: {row.get('name')} ({row.get('id')})"):
-                        keperluan = st.text_input(f"Keperluan pinjam untuk {row.get('name')}", key=f"keperluan_{row.get('id')}")
-                        tgl_kembali = st.date_input("Tanggal Kembali", key=f"tglkembali_{row.get('id')}", min_value=date.today())
-                        ajukan = st.button("Ajukan Pinjam", key=f"ajukan_{row.get('id')}")
-                        if ajukan:
+            # Pilih satu item saja agar UI ringan
+            available = filtered_df2[filtered_df2.get('status','') != "Dipinjam"].copy()
+            if available.empty:
+                st.info("Tidak ada barang yang bisa dipinjam sesuai filter.")
+            else:
+                opts = [f"{r['name']} (ID: {r['id']})" for _, r in available.iterrows()]
+                map_id = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in available.iterrows()}
+                choose = st.selectbox("Pilih barang untuk dipinjam:", opts, key="pinjam_pick")
+                if choose:
+                    rid = map_id[choose]
+                    row = available[available['id'] == rid].iloc[0]
+                    keperluan = st.text_input("Keperluan pinjam", key=f"keperluan_{rid}")
+                    tgl_kembali = st.date_input("Tanggal Kembali", key=f"tglkembali_{rid}", min_value=date.today())
+                    if st.button("Ajukan Pinjam", key=f"ajukan_{rid}"):
+                        try:
+                            info_pic = f"{user.get('email')}|{keperluan}|{tgl_kembali}|0|0"
+                            _inv_update_by_id(rid, {
+                                "loan_info": info_pic,
+                                "finance_approved": 0,
+                                "director_approved": 0,
+                                "updated_at": datetime.utcnow().isoformat()
+                            })
                             try:
-                                # Simpan detail pinjam terpisah agar tidak menimpa PIC penginput
-                                info_pic = f"{user.get('email')}|{keperluan}|{tgl_kembali}|0|0"
-                                _inv_update_by_id(row.get('id'), {
-                                    "loan_info": info_pic,
-                                    "finance_approved": 0,
-                                    "director_approved": 0,
-                                    "updated_at": datetime.utcnow().isoformat()
-                                })
-                                try:
-                                    audit_log("inventory", "loan_request", target=row.get('id'), details=f"keperluan={keperluan}; kembali={tgl_kembali}")
-                                except Exception:
-                                    pass
-                                # Notifikasi ke Finance + Superuser untuk review pinjaman
-                                try:
-                                    _notify_roles(["finance"], "[WIJNA] Permohonan Pinjam Barang",
-                                                   f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
-                                except Exception:
-                                    pass
-                                st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
-                            except Exception as e:
-                                st.error(f"Gagal mengajukan pinjam: {e}")
+                                audit_log("inventory", "loan_request", target=rid, details=f"keperluan={keperluan}; kembali={tgl_kembali}")
+                            except Exception:
+                                pass
+                            try:
+                                _notify_roles(["finance"], "[WIJNA] Permohonan Pinjam Barang",
+                                               f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
+                            except Exception:
+                                pass
+                            st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
+                        except Exception as e:
+                            st.error(f"Gagal mengajukan pinjam: {e}")
 
     # Build tab labels and contents
     # Ensure display names
@@ -1471,45 +1488,49 @@ def surat_masuk_module():
         st.markdown("### Approval Surat Masuk")
         if role in ["director", "superuser"]:
             _, df = _sm_read_df()
-            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
-                if int(row.get("director_approved", 0)) == 0:
-                    with st.expander(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"):
-                        st.write(f"Pengirim: {row.get('pengirim','')}")
-                        st.write(f"Status: {row.get('status','')}")
-                        st.write(f"Follow Up: {row.get('follow_up','')}")
-                        if row.get("file_link"):
-                            st.markdown(f"[Link Surat]({row.get('file_link')})")
-                        if row.get("file_id") and row.get("file_name"):
-                            _download_button(row.get("file_id"), row.get("file_name"), key=f"dl_sm_{row.get('id')}_{idx}")
-                        colA, colB = st.columns(2)
-                        with colA:
-                            if st.button("Approve Surat Masuk", key=f"approve_{row.get('id')}"):
-                                _sm_update_by_id(row.get("id"), {"director_approved": 1})
-                                audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
-                                # Opsional: beri tahu pengaju
-                                try:
-                                    submitter = str(row.get("submitted_by",""))
-                                    if submitter:
-                                        send_notification_email(submitter, "[WIJNA] Surat Masuk Disetujui",
-                                                                f"Surat Masuk {row.get('nomor','')} telah disetujui Director.")
-                                except Exception:
-                                    pass
-                                st.success("Surat masuk di-approve Director.")
-                                st.rerun()
-                        with colB:
-                            if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
-                                _sm_update_by_id(row.get("id"), {"director_approved": -1})
-                                audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
-                                # Opsional: beri tahu pengaju
-                                try:
-                                    submitter = str(row.get("submitted_by",""))
-                                    if submitter:
-                                        send_notification_email(submitter, "[WIJNA] Surat Masuk Ditolak",
-                                                                f"Surat Masuk {row.get('nomor','')} ditolak Director.")
-                                except Exception:
-                                    pass
-                                st.warning("Surat masuk ditolak Director.")
-                                st.rerun()
+            pending = df[pd.to_numeric(df.get("director_approved", 0), errors="coerce").fillna(0).astype(int) == 0]
+            if pending.empty:
+                st.info("Tidak ada surat masuk yang menunggu approval.")
+            else:
+                opts = [f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')}" for _, r in pending.sort_values(by="tanggal", ascending=False).iterrows()]
+                map_id = {f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')}": r.get('id') for _, r in pending.iterrows()}
+                pick = st.selectbox("Pilih surat untuk approval:", opts, key="sm_pick")
+                if pick:
+                    row = pending[pending['id'] == map_id[pick]].iloc[0]
+                    st.write(f"Pengirim: {row.get('pengirim','')}")
+                    st.write(f"Status: {row.get('status','')}")
+                    st.write(f"Follow Up: {row.get('follow_up','')}")
+                    if row.get("file_link"):
+                        st.markdown(f"[Link Surat]({row.get('file_link')})")
+                    if row.get("file_id") and row.get("file_name"):
+                        _download_button(row.get("file_id"), row.get("file_name"), key=f"dl_sm_{row.get('id')}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        if st.button("Approve Surat Masuk", key=f"approve_{row.get('id')}"):
+                            _sm_update_by_id(row.get("id"), {"director_approved": 1})
+                            audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
+                            try:
+                                submitter = str(row.get("submitted_by",""))
+                                if submitter:
+                                    send_notification_email(submitter, "[WIJNA] Surat Masuk Disetujui",
+                                                            f"Surat Masuk {row.get('nomor','')} telah disetujui Director.")
+                            except Exception:
+                                pass
+                            st.success("Surat masuk di-approve Director.")
+                            st.rerun()
+                    with colB:
+                        if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
+                            _sm_update_by_id(row.get("id"), {"director_approved": -1})
+                            audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
+                            try:
+                                submitter = str(row.get("submitted_by",""))
+                                if submitter:
+                                    send_notification_email(submitter, "[WIJNA] Surat Masuk Ditolak",
+                                                            f"Surat Masuk {row.get('nomor','')} ditolak Director.")
+                            except Exception:
+                                pass
+                            st.warning("Surat masuk ditolak Director.")
+                            st.rerun()
                 elif int(row.get("director_approved", 0)) == 1:
                     st.success(
                         f"Sudah di-approve Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
@@ -1784,53 +1805,57 @@ def surat_keluar_module():
         role = str(user.get("role", "")).lower()
         if role in ["director", "superuser"]:
             _, df = _sk_read_df()
-            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
-                with st.expander(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')} | Status: {row.get('status','')}"):
-                    st.write(f"Ditujukan: {row.get('ditujukan','')}")
-                    st.write(f"Pengirim: {row.get('pengirim','')}")
-                    st.write(f"Follow Up: {row.get('follow_up','')}")
-                    if row.get("draft_file_id") and row.get("draft_name"):
-                        st.markdown(f"**Draft Surat (file):** {row.get('draft_name')}")
-                        _download_button(row.get("draft_file_id"), row.get("draft_name"), key=f"dl_sk_draft_{row.get('id')}_{idx}")
-                    elif row.get("draft_link"):
-                        st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row.get('draft_link')})")
-                    note = st.text_area("Catatan Director", value=str(row.get("director_note","")), key=f"sk_note_{row.get('id')}")
-                    final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"sk_final_{row.get('id')}")
-                    colA, colB = st.columns(2)
-                    with colA:
-                        approve = st.button("✅ Approve & Upload Final", key=f"sk_approve_{row.get('id')}")
-                    with colB:
-                        disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"sk_disapprove_{row.get('id')}")
-                    if approve:
-                        if not final:
-                            st.error("File final wajib diupload agar surat keluar tercatat resmi.")
+            df = df.copy().sort_values(by="tanggal", ascending=False)
+            opts = [f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')} | {r.get('status','')}" for _, r in df.iterrows()]
+            map_id = {f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')} | {r.get('status','')}": r.get('id') for _, r in df.iterrows()}
+            pick = st.selectbox("Pilih surat untuk diproses:", opts, key="sk_pick")
+            if pick:
+                row = df[df['id'] == map_id[pick]].iloc[0]
+                st.write(f"Ditujukan: {row.get('ditujukan','')}")
+                st.write(f"Pengirim: {row.get('pengirim','')}")
+                st.write(f"Follow Up: {row.get('follow_up','')}")
+                if row.get("draft_file_id") and row.get("draft_name"):
+                    st.markdown(f"**Draft Surat (file):** {row.get('draft_name')}")
+                    _download_button(row.get("draft_file_id"), row.get("draft_name"), key=f"dl_sk_draft_{row.get('id')}")
+                elif row.get("draft_link"):
+                    st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row.get('draft_link')})")
+                note = st.text_area("Catatan Director", value=str(row.get("director_note","")), key=f"sk_note_{row.get('id')}")
+                final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"sk_final_{row.get('id')}")
+                colA, colB = st.columns(2)
+                with colA:
+                    approve = st.button("✅ Approve & Upload Final", key=f"sk_approve_{row.get('id')}")
+                with colB:
+                    disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"sk_disapprove_{row.get('id')}")
+                if approve:
+                    if not final:
+                        st.error("File final wajib diupload agar surat keluar tercatat resmi.")
+                    else:
+                        fid, fname, flink = _upload_to_drive(final)
+                        if not fid:
+                            st.error("Gagal mengupload final ke Drive.")
                         else:
-                            fid, fname, flink = _upload_to_drive(final)
-                            if not fid:
-                                st.error("Gagal mengupload final ke Drive.")
-                            else:
-                                _sk_update_by_id(row.get("id"), {
-                                    "final_file_id": fid,
-                                    "final_name": fname,
-                                    "final_link": flink,
-                                    "director_note": note,
-                                    "director_approved": 1,
-                                    "status": "Final",
-                                    "updated_at": datetime.utcnow().isoformat(),
-                                })
-                                audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
-                                st.success("Final uploaded & approved.")
-                                st.rerun()
-                    if disapprove:
-                        _sk_update_by_id(row.get("id"), {
-                            "status": "Draft",
-                            "director_note": note,
-                            "director_approved": 0,
-                            "updated_at": datetime.utcnow().isoformat(),
-                        })
-                        audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
-                        st.warning("Surat dikembalikan ke draft untuk direvisi.")
-                        st.rerun()
+                            _sk_update_by_id(row.get("id"), {
+                                "final_file_id": fid,
+                                "final_name": fname,
+                                "final_link": flink,
+                                "director_note": note,
+                                "director_approved": 1,
+                                "status": "Final",
+                                "updated_at": datetime.utcnow().isoformat(),
+                            })
+                            audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
+                            st.success("Final uploaded & approved.")
+                            st.rerun()
+                if disapprove:
+                    _sk_update_by_id(row.get("id"), {
+                        "status": "Draft",
+                        "director_note": note,
+                        "director_approved": 0,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    })
+                    audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
+                    st.warning("Surat dikembalikan ke draft untuk direvisi.")
+                    st.rerun()
         else:
             st.info("Hanya Director yang dapat meng-approve dan upload file final.")
 
