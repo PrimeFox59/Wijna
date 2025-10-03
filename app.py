@@ -6,15 +6,19 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-# --- KONFIGURASI ---
+# --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
 GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
-USERS_SHEET_NAME = "users"
+USERS_SHE-ET_NAME = "users"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
 
-# --- KONEKSI & AUTENTIKASI ---
+
+# --- 2. FUNGSI KONEKSI & AUTENTIKASI ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @st.cache_resource
@@ -44,14 +48,41 @@ def get_gdrive_service():
     service = build('drive', 'v3', credentials=creds)
     return service
 
-# --- FUNGSI HELPER ---
+
+# --- 3. FUNGSI HELPER & UTILITAS ---
 def hash_password(password: str):
+    """Mengubah password plain text menjadi hash."""
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str):
+    """Memverifikasi password dengan hash yang tersimpan."""
     return pwd_context.verify(plain_password, hashed_password)
 
+def send_notification_email(recipient_email, subject, body):
+    """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
+    try:
+        sender_email = st.secrets["email_credentials"]["username"]
+        sender_password = st.secrets["email_credentials"]["app_password"]
+
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = recipient_email
+        message["Subject"] = subject
+        message.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(message)
+        server.quit()
+        st.toast(f"📧 Notifikasi email terkirim ke {recipient_email}")
+        return True
+    except Exception as e:
+        st.toast(f" Gagal mengirim email: {e}")
+        return False
+
 def initialize_users_sheet():
+    """Memastikan sheet 'users' ada dan berisi user default 'admin'."""
     try:
         client = get_gsheets_client()
         spreadsheet = client.open_by_url(SPREADSHEET_URL)
@@ -72,18 +103,20 @@ def initialize_users_sheet():
             hashed_admin_pass = hash_password('admin')
             worksheet.append_row(['admin', hashed_admin_pass])
             st.success("User default 'admin' dengan password 'admin' berhasil ditambahkan.")
-
     except Exception as e:
         st.error(f"Gagal inisialisasi Google Sheet: {e}")
 
-# --- INISIALISASI SESSION STATE ---
+
+# --- 4. MANAJEMEN SESSION STATE ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'username' not in st.session_state:
     st.session_state.username = ""
 
-# --- Tampilan LOGIN / REGISTER ---
+
+# --- 5. TAMPILAN HALAMAN (UI) ---
 def show_login_page():
+    """Menampilkan halaman login dan registrasi."""
     st.header("🔐 Secure App Login")
     
     with st.sidebar:
@@ -148,8 +181,14 @@ def show_login_page():
                     worksheet.append_row([new_username, hashed_pass])
                     st.success("Registrasi berhasil! Silakan login.")
 
-# --- Tampilan APLIKASI UTAMA (Setelah Login) ---
+                    # Kirim notifikasi email ke admin
+                    admin_email = "gantidenganemailadmin@gmail.com"  # GANTI DENGAN EMAIL ADMIN ANDA
+                    email_subject = "Notifikasi: User Baru Telah Mendaftar"
+                    email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
+                    send_notification_email(admin_email, email_subject, email_body)
+
 def show_main_app():
+    """Menampilkan aplikasi utama setelah user berhasil login."""
     st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
@@ -166,10 +205,7 @@ def show_main_app():
             with st.spinner("Mengupload file..."):
                 try:
                     drive_service = get_gdrive_service()
-                    file_metadata = {
-                        'name': uploaded_file.name,
-                        'parents': [GDRIVE_FOLDER_ID]
-                    }
+                    file_metadata = {'name': uploaded_file.name, 'parents': [GDRIVE_FOLDER_ID]}
                     file_buffer = io.BytesIO(uploaded_file.getvalue())
                     media = MediaIoBaseUpload(file_buffer, mimetype=uploaded_file.type, resumable=True)
                     
@@ -177,7 +213,7 @@ def show_main_app():
                         body=file_metadata,
                         media_body=media,
                         fields='id',
-                        supportsAllDrives=True # <-- DITAMBAHKAN
+                        supportsAllDrives=True
                     ).execute()
                     st.success(f"✅ File '{uploaded_file.name}' berhasil diupload!")
                 except Exception as e:
@@ -195,8 +231,8 @@ def show_main_app():
                 q=query,
                 pageSize=100,
                 fields="nextPageToken, files(id, name)",
-                supportsAllDrives=True,          # <-- DITAMBAHKAN
-                includeItemsFromAllDrives=True   # <-- DITAMBAHKAN
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
             ).execute()
             items = results.get('files', [])
 
@@ -209,9 +245,8 @@ def show_main_app():
                 with col1:
                     st.write(f"📄 **{item['name']}**")
                 with col2:
-                    # @st.cache_data lebih aman di luar loop, tapi untuk kesederhanaan, kita definisikan di sini
                     def download_file_from_drive(file_id):
-                        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True) # <-- DITAMBAHKAN
+                        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
                         fh = io.BytesIO()
                         fh.write(request.execute())
                         fh.seek(0)
@@ -227,7 +262,8 @@ def show_main_app():
     except Exception as e:
         st.error(f"Gagal memuat daftar file: {e}")
 
-# --- MAIN LOGIC ---
+
+# --- 6. LOGIKA UTAMA APLIKASI ---
 if __name__ == "__main__":
     initialize_users_sheet()
     
