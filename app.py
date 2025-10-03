@@ -109,24 +109,45 @@ def verify_password(plain_password: str, hashed_password: str):
 def send_notification_email(recipient_email, subject, body):
     """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
     try:
-        sender_email = st.secrets["email_credentials"]["username"]
-        sender_password = st.secrets["email_credentials"]["app_password"]
+        creds = st.secrets.get("email_credentials", {})
+        sender_email = (creds.get("username") or "").strip()
+        sender_password = (creds.get("app_password") or "").strip()
+        if not sender_email or not sender_password:
+            st.toast("Konfigurasi email tidak lengkap (username/app_password).")
+            return False
 
         message = MIMEMultipart()
         message["From"] = sender_email
         message["To"] = recipient_email
         message["Subject"] = subject
-        message.attach(MIMEText(body, "plain"))
+        message.attach(MIMEText(body or "", "plain"))
 
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.send_message(message)
-        server.quit()
-        st.toast(f"📧 Notifikasi email terkirim ke {recipient_email}")
-        return True
+        # Coba TLS 587 kemudian fallback ke SSL 465 jika gagal
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+                    server.ehlo()
+                    server.starttls()
+                    server.login(sender_email, sender_password)
+                else:
+                    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+                    server.login(sender_email, sender_password)
+                server.send_message(message)
+                server.quit()
+                st.toast(f"📧 Notifikasi email terkirim ke {recipient_email}")
+                return True
+            except Exception as inner_e:
+                if attempt == 1:
+                    raise inner_e
+                # tunggu sebentar lalu coba SSL
+                try:
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+        return False
     except Exception as e:
-        st.toast(f" Gagal mengirim email: {e}")
+        st.toast(f"Gagal mengirim email: {e}")
         return False
 
 def initialize_users_sheet():
@@ -628,6 +649,18 @@ def _get_emails_by_role(role: str) -> list[str]:
 def _notify_role(role: str, subject: str, body: str):
     """Kirim email ke semua user dengan role tersebut. Non-blocking per kegagalan satu alamat."""
     emails = _get_emails_by_role(role)
+    # Tambahkan superuser dan admin (fallback) agar tidak sunyi
+    try:
+        superusers = _get_emails_by_role("superuser")
+    except Exception:
+        superusers = []
+    admin_email = ""
+    try:
+        admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip()
+    except Exception:
+        admin_email = ""
+    pool = set(emails or []) | set(superusers or []) | ({admin_email} if admin_email else set())
+    emails = sorted(e for e in pool if e)
     sent = 0
     for e in emails:
         try:
@@ -637,6 +670,8 @@ def _notify_role(role: str, subject: str, body: str):
             pass
     if emails:
         st.toast(f"Notifikasi terkirim ke {sent}/{len(emails)} {role}")
+    else:
+        st.toast(f"Tidak ada penerima untuk role {role}")
 
 
 def _notify_roles(roles: list[str], subject: str, body: str):
@@ -650,6 +685,13 @@ def _notify_roles(roles: list[str], subject: str, body: str):
         for e in _get_emails_by_role(r):
             if e:
                 all_emails.add(str(e).strip())
+    # Tambahkan admin fallback jika ada
+    try:
+        admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip()
+        if admin_email:
+            all_emails.add(admin_email)
+    except Exception:
+        pass
     sent = 0
     for e in sorted(all_emails):
         try:
@@ -660,6 +702,8 @@ def _notify_roles(roles: list[str], subject: str, body: str):
             pass
     if all_emails:
         st.toast(f"Notifikasi terkirim ke {sent}/{len(all_emails)} penerima ({', '.join(sorted(unique_roles))})")
+    else:
+        st.toast("Tidak ada penerima notifikasi untuk roles: " + ", ".join(sorted(unique_roles)))
 
 
 def require_login():
