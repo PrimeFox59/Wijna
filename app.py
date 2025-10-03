@@ -29,6 +29,20 @@ ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout="centered")
 
+# Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
+def _enforce_page_title():
+    try:
+        import streamlit.components.v1 as components  # Lazy import to avoid global dependency
+        components.html(
+            "<script>window.parent.document.title = 'WIJNA Management System';</script>",
+            height=0,
+        )
+    except Exception:
+        # Non-blocking; fall back to set_page_config title
+        pass
+
+_enforce_page_title()
+
 
 # --- 2. FUNGSI KONEKSI & AUTENTIKASI ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
