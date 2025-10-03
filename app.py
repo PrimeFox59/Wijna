@@ -27,7 +27,7 @@ SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
-st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout="centered")
+st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout="wide")
 
 # Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
 def _enforce_page_title():
