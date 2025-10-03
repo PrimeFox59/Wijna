@@ -552,6 +552,11 @@ def inventory_module():
             df = pd.DataFrame(ws.get_all_records(expected_headers=inv_headers))
         except Exception:
             df = pd.DataFrame(ws.get_all_records())
+        # Ensure all expected columns exist to avoid KeyError in filters
+        for h in inv_headers:
+            if h not in df.columns:
+                # defaults: numeric approvals -> 0, others empty string
+                df[h] = 0 if h in ("finance_approved", "director_approved") else ""
         return ws, df
 
     def _inv_append(row: dict):
@@ -692,9 +697,9 @@ def inventory_module():
         def finance_tab():
             st.info("Approve item yang sudah diinput staf.")
             _, df = _inv_read_df()
-            if not df.empty and 'finance_approved' in df.columns:
-                df['finance_approved'] = pd.to_numeric(df['finance_approved'], errors='coerce').fillna(0).astype(int)
-            rows = df[df.get('finance_approved', 0) == 0]
+            if not df.empty:
+                df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
+            rows = df[df['finance_approved'] == 0]
             for idx, r in rows.iterrows():
                 st.markdown(f"""
 <div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
@@ -736,9 +741,9 @@ def inventory_module():
             st.info("Approve/Tolak item yang sudah di-approve Finance.")
             _, df = _inv_read_df()
             if not df.empty:
-                df['finance_approved'] = pd.to_numeric(df.get('finance_approved', 0), errors='coerce').fillna(0).astype(int)
-                df['director_approved'] = pd.to_numeric(df.get('director_approved', 0), errors='coerce').fillna(0).astype(int)
-            rows = df[(df.get('finance_approved', 0) == 1) & (df.get('director_approved', 0) == 0)]
+                df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
+                df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
+            rows = df[(df['finance_approved'] == 1) & (df['director_approved'] == 0)]
             for idx, r in rows.iterrows():
                 with st.expander(f"[Menunggu Approval Director] {r.get('name')} ({r.get('id')})"):
                     st.markdown(f"""
@@ -983,6 +988,10 @@ def _cuti_read_df():
         df = pd.DataFrame(ws.get_all_records(expected_headers=cuti_headers))
     except Exception:
         df = pd.DataFrame(ws.get_all_records())
+    # Ensure all expected columns exist
+    for h in cuti_headers:
+        if h not in df.columns:
+            df[h] = 0 if h in ("finance_approved", "director_approved", "durasi", "kuota_tahunan", "cuti_terpakai", "sisa_kuota") else ""
     return ws, df
 
 
