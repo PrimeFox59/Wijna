@@ -2189,7 +2189,10 @@ def main():
             }
             </style>
         """, unsafe_allow_html=True)
-        st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=500)
+        # Centered header using 3 columns; place content in the middle column
+        col1, col2, col3 = st.columns(3)
+        with col2:
+            st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=500)
         tabs = st.tabs(["Login", "Register"])
         with tabs[0]:
             email = st.text_input("Email", key="login_email", placeholder="Masukkan email Anda")
