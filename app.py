@@ -639,6 +639,29 @@ def _notify_role(role: str, subject: str, body: str):
         st.toast(f"Notifikasi terkirim ke {sent}/{len(emails)} {role}")
 
 
+def _notify_roles(roles: list[str], subject: str, body: str):
+    """Kirim email ke gabungan beberapa role sekaligus (dedupe),
+    selalu menyertakan superuser sesuai requirement agar menerima semua jenis notifikasi.
+    """
+    # Pastikan superuser selalu ikut
+    unique_roles = {*(r.strip().lower() for r in roles if r), "superuser"}
+    all_emails: set[str] = set()
+    for r in unique_roles:
+        for e in _get_emails_by_role(r):
+            if e:
+                all_emails.add(str(e).strip())
+    sent = 0
+    for e in sorted(all_emails):
+        try:
+            if send_notification_email(e, subject, body):
+                sent += 1
+        except Exception:
+            # lanjut ke alamat berikutnya
+            pass
+    if all_emails:
+        st.toast(f"Notifikasi terkirim ke {sent}/{len(all_emails)} penerima ({', '.join(sorted(unique_roles))})")
+
+
 def require_login():
     user = get_current_user()
     if not user:
@@ -907,8 +930,8 @@ def inventory_module():
                             pass
                         # Notify Finance users
                         try:
-                            _notify_role("finance", "[WIJNA] Draft Inventaris Baru",
-                                         f"Item inventaris baru menunggu review Finance.\n\nNama: {full_nama}\nID: {iid}\nLokasi: {loc}\nStatus: {status}\nPIC: {pic}")
+                            _notify_roles(["finance"], "[WIJNA] Draft Inventaris Baru",
+                                          f"Item inventaris baru menunggu review Finance.\n\nNama: {full_nama}\nID: {iid}\nLokasi: {loc}\nStatus: {status}\nPIC: {pic}")
                         except Exception:
                             pass
                         st.success("Item disimpan sebagai draft. Menunggu review Finance.")
@@ -950,10 +973,10 @@ def inventory_module():
                                 audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
                             except Exception:
                                 pass
-                            # Notify Directors
+                            # Notify Directors + Superuser
                             try:
-                                _notify_role("director", "[WIJNA] Inventaris Menunggu Approval Director",
-                                             f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
+                                _notify_roles(["director"], "[WIJNA] Inventaris Menunggu Approval Director",
+                                               f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
                             except Exception:
                                 pass
                             st.success("Finance reviewed. Menunggu persetujuan Director.")
@@ -1101,6 +1124,12 @@ def inventory_module():
                                 })
                                 try:
                                     audit_log("inventory", "loan_request", target=row.get('id'), details=f"keperluan={keperluan}; kembali={tgl_kembali}")
+                                except Exception:
+                                    pass
+                                # Notifikasi ke Finance + Superuser untuk review pinjaman
+                                try:
+                                    _notify_roles(["finance"], "[WIJNA] Permohonan Pinjam Barang",
+                                                   f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
                                 except Exception:
                                     pass
                                 st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
@@ -1320,6 +1349,12 @@ def surat_masuk_module():
                                 target=sid,
                                 details=f"{nomor} - {perihal} ({pengirim})",
                             )
+                            # Notifikasi: Ada surat masuk baru perlu review/approve oleh Director
+                            try:
+                                _notify_roles(["director"], "[WIJNA] Surat Masuk Baru",
+                                               f"Surat Masuk baru menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nPengirim: {pengirim}\nTanggal: {tanggal}")
+                            except Exception:
+                                pass
                             st.success("Surat masuk berhasil dicatat.")
                             st.rerun()
 
@@ -1343,12 +1378,28 @@ def surat_masuk_module():
                             if st.button("Approve Surat Masuk", key=f"approve_{row.get('id')}"):
                                 _sm_update_by_id(row.get("id"), {"director_approved": 1})
                                 audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
+                                # Opsional: beri tahu pengaju
+                                try:
+                                    submitter = str(row.get("submitted_by",""))
+                                    if submitter:
+                                        send_notification_email(submitter, "[WIJNA] Surat Masuk Disetujui",
+                                                                f"Surat Masuk {row.get('nomor','')} telah disetujui Director.")
+                                except Exception:
+                                    pass
                                 st.success("Surat masuk di-approve Director.")
                                 st.rerun()
                         with colB:
                             if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
                                 _sm_update_by_id(row.get("id"), {"director_approved": -1})
                                 audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
+                                # Opsional: beri tahu pengaju
+                                try:
+                                    submitter = str(row.get("submitted_by",""))
+                                    if submitter:
+                                        send_notification_email(submitter, "[WIJNA] Surat Masuk Ditolak",
+                                                                f"Surat Masuk {row.get('nomor','')} ditolak Director.")
+                                except Exception:
+                                    pass
                                 st.warning("Surat masuk ditolak Director.")
                                 st.rerun()
                 elif int(row.get("director_approved", 0)) == 1:
@@ -1610,6 +1661,12 @@ def surat_keluar_module():
                         "submitted_by": user.get("email"),
                     })
                     audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; draft={'file:'+draft_name if draft_name else 'url:'+str(draft_link)}")
+                    # Notifikasi: Ada draft Surat Keluar yang perlu direview/approve
+                    try:
+                        _notify_roles(["director"], "[WIJNA] Draft Surat Keluar Baru",
+                                       f"Draft Surat Keluar menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nDitujukan: {ditujukan}\nDibuat oleh: {user.get('full_name') or user.get('email')}\nTanggal: {tanggal}")
+                    except Exception:
+                        pass
                     st.success("✅ Surat keluar (draft) tersimpan.")
                     st.rerun()
 
@@ -2153,6 +2210,12 @@ def main():
                             audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
                         except Exception:
                             pass
+                        # Notifikasi ke Finance + Superuser untuk review
+                        try:
+                            _notify_roles(["finance"], "[WIJNA] Pengajuan Cuti Baru",
+                                           f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}")
+                        except Exception:
+                            pass
                         st.rerun()
             # Tab 2: Review Finance
             with tab2:
@@ -2182,6 +2245,13 @@ def main():
                                         audit_log("cuti", "finance_review", target=row.get('id'), details=f"approve={bool(approve)}; status={status}")
                                     except Exception:
                                         pass
+                                    # Jika approve, beritahu Director + Superuser
+                                    if approve:
+                                        try:
+                                            _notify_roles(["director"], "[WIJNA] Cuti Menunggu Approval Director",
+                                                           f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari")
+                                        except Exception:
+                                            pass
                                 except Exception as e:
                                     st.error(f"Gagal menyimpan: {e}")
                                 st.rerun()
@@ -2224,6 +2294,16 @@ def main():
                                     st.success("Approval Director disimpan.")
                                     try:
                                         audit_log("cuti", "director_approval", target=row.get('id'), details=f"approve={bool(approve)}")
+                                    except Exception:
+                                        pass
+                                    # Notifikasi ke pemohon terkait keputusan Director (jika ada kolom submitted_by gunakan itu)
+                                    try:
+                                        # Gunakan 'submitted_by' jika ada, fallback skip
+                                        if 'submitted_by' in row.index:
+                                            sb = str(row.get('submitted_by',''))
+                                            if sb:
+                                                send_notification_email(sb, f"[WIJNA] Pengajuan Cuti {'Disetujui' if approve else 'Ditolak'}",
+                                                                        f"Pengajuan cuti Anda {'disetujui' if approve else 'ditolak'} oleh Director.")
                                     except Exception:
                                         pass
                                 except Exception as e:
