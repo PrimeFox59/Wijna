@@ -1321,7 +1321,7 @@ def surat_masuk_module():
                                 details=f"{nomor} - {perihal} ({pengirim})",
                             )
                             st.success("Surat masuk berhasil dicatat.")
-                            st.experimental_rerun()
+                            st.rerun()
 
     # Tab 2: Approval (Director/Superuser)
     with tab2:
@@ -1344,13 +1344,13 @@ def surat_masuk_module():
                                 _sm_update_by_id(row.get("id"), {"director_approved": 1})
                                 audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
                                 st.success("Surat masuk di-approve Director.")
-                                st.experimental_rerun()
+                                st.rerun()
                         with colB:
                             if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
                                 _sm_update_by_id(row.get("id"), {"director_approved": -1})
                                 audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
                                 st.warning("Surat masuk ditolak Director.")
-                                st.experimental_rerun()
+                                st.rerun()
                 elif int(row.get("director_approved", 0)) == 1:
                     st.success(
                         f"Sudah di-approve Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
@@ -1411,7 +1411,7 @@ def surat_masuk_module():
                         _sm_update_by_id(row.get("id"), {"rekap": 1})
                         audit_log("surat_masuk", "rekap_add", target=row.get("id"))
                         st.success("Surat masuk dimasukan ke rekap.")
-                        st.experimental_rerun()
+                        st.rerun()
 
 
 def surat_keluar_module():
@@ -1595,7 +1595,7 @@ def surat_keluar_module():
                     })
                     audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; draft={'file:'+draft_name if draft_name else 'url:'+str(draft_link)}")
                     st.success("✅ Surat keluar (draft) tersimpan.")
-                    st.experimental_rerun()
+                    st.rerun()
 
     # Tab 2: Approval Director
     with tab2:
@@ -1639,7 +1639,7 @@ def surat_keluar_module():
                                 })
                                 audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
                                 st.success("Final uploaded & approved.")
-                                st.experimental_rerun()
+                                st.rerun()
                     if disapprove:
                         _sk_update_by_id(row.get("id"), {
                             "status": "Draft",
@@ -1649,7 +1649,7 @@ def surat_keluar_module():
                         })
                         audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
                         st.warning("Surat dikembalikan ke draft untuk direvisi.")
-                        st.experimental_rerun()
+                        st.rerun()
         else:
             st.info("Hanya Director yang dapat meng-approve dan upload file final.")
 
@@ -1826,7 +1826,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"role": new_role, "active": 1 if new_active else 0})
                             audit_log("users", "admin_update", target=sel_user, details=f"role={new_role}; active={int(new_active)}")
                             st.success("Perubahan disimpan.")
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Gagal menyimpan: {e}")
             with colB:
@@ -1837,7 +1837,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"active": 0})
                             audit_log("users", "admin_deactivate", target=sel_user)
                             st.success("User dinonaktifkan.")
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Gagal: {e}")
             with colC:
@@ -1851,7 +1851,7 @@ def user_setting_module():
                                 _users_delete_row(ws, row_idx)
                                 audit_log("users", "admin_delete", target=sel_user)
                                 st.success("User dihapus.")
-                                st.experimental_rerun()
+                                st.rerun()
                         except Exception as e:
                             st.error(f"Gagal menghapus: {e}")
     else:
