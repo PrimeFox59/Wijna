@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from streamlit_gsheets import GSheetsConnection
+from st_gsheets_connection import GSheetsConnection
 from passlib.context import CryptContext
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -225,3 +225,4 @@ if __name__ == "__main__":
         show_login_page()
     else:
         show_main_app()
+
