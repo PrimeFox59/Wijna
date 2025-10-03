@@ -8,17 +8,18 @@ from googleapiclient.http import MediaIoBaseUpload
 import io
 
 # --- KONFIGURASI ---
-GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1"
+# PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
+GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
 USERS_SHEET_NAME = "users"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
 
-# --- KONEKSI & AUTENTIKASI (VERSI PERBAIKAN) ---
+# --- KONEKSI & AUTENTIKASI ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @st.cache_resource
 def get_credentials():
-    """Membuat object credentials dari secrets. Ini akan digunakan oleh kedua service."""
+    """Membuat object credentials dari secrets."""
     creds_dict = st.secrets["connections"]["gsheets"]
     creds = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -39,11 +40,11 @@ def get_gsheets_client():
 @st.cache_resource
 def get_gdrive_service():
     """Membuat service untuk Google Drive API menggunakan credentials."""
-    creds = get_credentials() # <-- Ambil credentials langsung
-    service = build('drive', 'v3', credentials=creds) # <-- Gunakan credentials langsung
+    creds = get_credentials()
+    service = build('drive', 'v3', credentials=creds)
     return service
 
-# --- FUNGSI HELPER (Tidak ada perubahan) ---
+# --- FUNGSI HELPER ---
 def hash_password(password: str):
     return pwd_context.hash(password)
 
@@ -75,13 +76,13 @@ def initialize_users_sheet():
     except Exception as e:
         st.error(f"Gagal inisialisasi Google Sheet: {e}")
 
-# --- INISIALISASI SESSION STATE (Tidak ada perubahan) ---
+# --- INISIALISASI SESSION STATE ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'username' not in st.session_state:
     st.session_state.username = ""
 
-# --- Tampilan LOGIN / REGISTER (Tidak ada perubahan) ---
+# --- Tampilan LOGIN / REGISTER ---
 def show_login_page():
     st.header("🔐 Secure App Login")
     
@@ -89,9 +90,13 @@ def show_login_page():
         st.subheader("Pilih Aksi")
         action = st.radio(" ", ["Login", "Register"])
 
-    client = get_gsheets_client()
-    spreadsheet = client.open_by_url(SPREADSHEET_URL)
-    worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
+    try:
+        client = get_gsheets_client()
+        spreadsheet = client.open_by_url(SPREADSHEET_URL)
+        worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
+    except Exception as e:
+        st.error(f"Tidak dapat terhubung ke Google Sheet. Pastikan file dibagikan dan URL benar. Error: {e}")
+        st.stop()
 
     if action == "Login":
         st.subheader("Login")
@@ -143,7 +148,7 @@ def show_login_page():
                     worksheet.append_row([new_username, hashed_pass])
                     st.success("Registrasi berhasil! Silakan login.")
 
-# --- Tampilan APLIKASI UTAMA (Tidak ada perubahan) ---
+# --- Tampilan APLIKASI UTAMA (Setelah Login) ---
 def show_main_app():
     st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
@@ -168,10 +173,13 @@ def show_main_app():
                     file_buffer = io.BytesIO(uploaded_file.getvalue())
                     media = MediaIoBaseUpload(file_buffer, mimetype=uploaded_file.type, resumable=True)
                     
-                    file = drive_service.files().create(body=file_metadata,
-                                                        media_body=media,
-                                                        fields='id').execute()
-                    st.success(f"✅ File '{uploaded_file.name}' berhasil diupload! (ID: {file.get('id')})")
+                    file = drive_service.files().create(
+                        body=file_metadata,
+                        media_body=media,
+                        fields='id',
+                        supportsAllDrives=True # <-- DITAMBAHKAN
+                    ).execute()
+                    st.success(f"✅ File '{uploaded_file.name}' berhasil diupload!")
                 except Exception as e:
                     st.error(f"Gagal mengupload file: {e}")
 
@@ -186,12 +194,14 @@ def show_main_app():
             results = drive_service.files().list(
                 q=query,
                 pageSize=100,
-                fields="nextPageToken, files(id, name)"
+                fields="nextPageToken, files(id, name)",
+                supportsAllDrives=True,          # <-- DITAMBAHKAN
+                includeItemsFromAllDrives=True   # <-- DITAMBAHKAN
             ).execute()
             items = results.get('files', [])
 
         if not items:
-            st.info("📂 Folder ini masih kosong.")
+            st.info("📂 Folder ini masih kosong atau ID salah/belum di-share.")
         else:
             st.write(f"Ditemukan {len(items)} file:")
             for item in items:
@@ -199,11 +209,13 @@ def show_main_app():
                 with col1:
                     st.write(f"📄 **{item['name']}**")
                 with col2:
-                    @st.cache_data(ttl=300)
+                    # @st.cache_data lebih aman di luar loop, tapi untuk kesederhanaan, kita definisikan di sini
                     def download_file_from_drive(file_id):
-                        request = drive_service.files().get_media(fileId=file_id)
-                        downloader = io.BytesIO(request.execute())
-                        return downloader.getvalue()
+                        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True) # <-- DITAMBAHKAN
+                        fh = io.BytesIO()
+                        fh.write(request.execute())
+                        fh.seek(0)
+                        return fh.getvalue()
 
                     file_data = download_file_from_drive(item['id'])
                     st.download_button(
@@ -215,7 +227,7 @@ def show_main_app():
     except Exception as e:
         st.error(f"Gagal memuat daftar file: {e}")
 
-# --- MAIN LOGIC (Tidak ada perubahan) ---
+# --- MAIN LOGIC ---
 if __name__ == "__main__":
     initialize_users_sheet()
     
