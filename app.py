@@ -13,6 +13,7 @@ import os
 import uuid
 from datetime import datetime, date, timedelta
 import time
+import threading
 
 # --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
@@ -149,6 +150,87 @@ def send_notification_email(recipient_email, subject, body):
     except Exception as e:
         st.toast(f"Gagal mengirim email: {e}")
         return False
+
+def send_notification_bulk(recipients: list[str], subject: str, body: str) -> tuple[int, int]:
+    """Kirim email ke banyak penerima dalam satu sesi SMTP untuk performa lebih baik.
+    Return: (jumlah_terkirim, total_penerima)
+    Catatan: Fungsi ini tidak menampilkan toast per penerima untuk menghindari lag.
+    """
+    try:
+        # Normalisasi dan dedupe
+        recipients = sorted({(e or "").strip() for e in recipients if (e or "").strip()})
+        total = len(recipients)
+        if total == 0:
+            return 0, 0
+
+        creds = st.secrets.get("email_credentials", {})
+        sender_email = (creds.get("username") or "").strip()
+        sender_password = (creds.get("app_password") or "").strip()
+        if not sender_email or not sender_password:
+            return 0, total
+
+        def build_msg(to_addr: str):
+            msg = MIMEMultipart()
+            msg["From"] = sender_email
+            msg["To"] = to_addr or "Undisclosed recipients"
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body or "", "plain"))
+            return msg
+
+        sent = 0
+        # 1) Coba TLS 587 dahulu
+        try:
+            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+            try:
+                server.ehlo()
+                server.starttls()
+                server.login(sender_email, sender_password)
+                for rcpt in recipients:
+                    try:
+                        server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
+                        sent += 1
+                    except Exception:
+                        # lanjut ke penerima berikutnya
+                        pass
+            finally:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+            return sent, total
+        except Exception:
+            # 2) Fallback SSL 465
+            try:
+                server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+                try:
+                    server.login(sender_email, sender_password)
+                    for rcpt in recipients:
+                        try:
+                            server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
+                            sent += 1
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+                return sent, total
+            except Exception:
+                return 0, total
+    except Exception:
+        return 0, 0
+
+def _send_async(func, *args, **kwargs):
+    """Jalankan fungsi di background thread agar UI tidak menunggu I/O jaringan."""
+    try:
+        t = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+    except Exception:
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            pass
 
 def initialize_users_sheet():
     """Memastikan sheet 'users' ada dan berisi user default 'admin'."""
@@ -647,61 +729,43 @@ def _get_emails_by_role(role: str) -> list[str]:
 
 
 def _notify_role(role: str, subject: str, body: str):
-    """Kirim email ke semua user dengan role tersebut. Non-blocking per kegagalan satu alamat."""
+    """Kirim email ke semua user dengan role tersebut (async + bulk)."""
     emails = _get_emails_by_role(role)
-    # Tambahkan superuser dan admin (fallback) agar tidak sunyi
+    # Tambahkan superuser dan admin (fallback)
+    superusers = []
     try:
         superusers = _get_emails_by_role("superuser")
     except Exception:
-        superusers = []
-    admin_email = ""
-    try:
-        admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip()
-    except Exception:
-        admin_email = ""
+        pass
+    admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip() if ADMIN_EMAIL_RECIPIENT else ""
     pool = set(emails or []) | set(superusers or []) | ({admin_email} if admin_email else set())
-    emails = sorted(e for e in pool if e)
-    sent = 0
-    for e in emails:
-        try:
-            if send_notification_email(e, subject, body):
-                sent += 1
-        except Exception:
-            pass
-    if emails:
-        st.toast(f"Notifikasi terkirim ke {sent}/{len(emails)} {role}")
+    recipients = sorted(e for e in pool if e)
+    if recipients:
+        _send_async(send_notification_bulk, recipients, subject, body)
+        st.toast(f"Mengirim notifikasi ke {len(recipients)} penerima ({role})…")
     else:
         st.toast(f"Tidak ada penerima untuk role {role}")
 
 
 def _notify_roles(roles: list[str], subject: str, body: str):
-    """Kirim email ke gabungan beberapa role sekaligus (dedupe),
-    selalu menyertakan superuser sesuai requirement agar menerima semua jenis notifikasi.
-    """
-    # Pastikan superuser selalu ikut
+    """Kirim email ke gabungan beberapa role (dedupe), selalu menyertakan superuser. Async + bulk."""
     unique_roles = {*(r.strip().lower() for r in roles if r), "superuser"}
     all_emails: set[str] = set()
     for r in unique_roles:
-        for e in _get_emails_by_role(r):
-            if e:
-                all_emails.add(str(e).strip())
-    # Tambahkan admin fallback jika ada
-    try:
-        admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip()
-        if admin_email:
-            all_emails.add(admin_email)
-    except Exception:
-        pass
-    sent = 0
-    for e in sorted(all_emails):
         try:
-            if send_notification_email(e, subject, body):
-                sent += 1
+            for e in _get_emails_by_role(r):
+                if e:
+                    all_emails.add(str(e).strip())
         except Exception:
-            # lanjut ke alamat berikutnya
-            pass
-    if all_emails:
-        st.toast(f"Notifikasi terkirim ke {sent}/{len(all_emails)} penerima ({', '.join(sorted(unique_roles))})")
+            continue
+    # Tambahkan admin fallback jika ada
+    admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip() if ADMIN_EMAIL_RECIPIENT else ""
+    if admin_email:
+        all_emails.add(admin_email)
+    recipients = sorted(all_emails)
+    if recipients:
+        _send_async(send_notification_bulk, recipients, subject, body)
+        st.toast(f"Mengirim notifikasi ke {len(recipients)} penerima ({', '.join(sorted(unique_roles))})…")
     else:
         st.toast("Tidak ada penerima notifikasi untuk roles: " + ", ".join(sorted(unique_roles)))
 
