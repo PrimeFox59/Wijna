@@ -32,7 +32,7 @@ st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, la
 # Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
 def _enforce_page_title():
     try:
-        import streamlit.components.v1 as components  # Lazy import to avoid global dependency
+        import streamlit.components.v1 as components
         components.html(
             "<script>window.parent.document.title = 'WIJNA Management System';</script>",
             height=0,
