@@ -1,1581 +1,4106 @@
 import streamlit as st
+import os
+import sqlite3
+from sqlite3 import Connection
+from datetime import datetime, date, timedelta
+import base64
 import pandas as pd
-from datetime import datetime
-from fpdf import FPDF
+import uuid
+import json
 import io
-import bcrypt
-import plotly.express as px
-import gspread
-from gspread.exceptions import WorksheetNotFound
+from typing import Dict, Any, List, Optional
 
-st.set_page_config(
-    page_title="PT. BKA - Sistem Kontrol Stok & Penggajian",
-    page_icon="🛍️",   # ikon toko / belanja
-    layout="wide"
-)
+# Google APIs
+try:
+    import gspread
+    from gspread.exceptions import WorksheetNotFound
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+except Exception:
+    gspread = None
+    WorksheetNotFound = None
+    Credentials = None
+    build = None
+    MediaIoBaseUpload = None
 
+# ------------------------------------------------------------------
+# Google Sheets / Drive Adapter (non-breaking, mirrors SQLite <-> Sheets)
+# ------------------------------------------------------------------
 
-st.markdown("""
-<style>
-    .reportview-container {
-        background: #F0F2F6;
-    }
-    .main .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
-    }
-    .st-emotion-cache-1r6509j {
-        background-color: #2F3E50;
-    }
-    .st-emotion-cache-1r6509j .stButton>button {
-        color: white;
-    }
-    .st-emotion-cache-1r6509j .stButton>button:hover {
-        background-color: #455A64;
-    }
-    .st-emotion-cache-1r6509j .st-bv {
-        color: white;
-    }
-    .st-emotion-cache-16k1w7m {
-        background-color: #2F3E50;
-    }
-    h1, h2, h3, h4, h5, h6 {
-        color: #2F3E50;
-    }
-    .st-emotion-cache-1av5400 {
-        background-color: #FFFFFF;
-        padding: 2rem;
-        border-radius: 10px;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-    }
-    .st-emotion-cache-1av5400 h3 {
-        color: #172B4D;
-    }
-    .st-emotion-cache-1av5400 .st-cc {
-        color: #172B4D;
-    }
-    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-        font-size: 1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Configuration from Streamlit Secrets
+_secrets = st.secrets if hasattr(st, "secrets") else {}
+_conn_secrets = _secrets.get("connections", {}).get("gsheets", {}) if isinstance(_secrets, dict) else {}
+GSHEETS_SPREADSHEET_URL = _conn_secrets.get("spreadsheet")
+# Folder ID provided by user; can be overridden in secrets as gdrive_folder_id
+DRIVE_FOLDER_ID = _secrets.get("gdrive_folder_id", "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1")
 
-# --- GOOGLE SHEETS CONNECTION & SETUP ---
-def get_gsheet_connection():
+def _extract_spreadsheet_key(url_or_key: Optional[str]) -> Optional[str]:
+    """Accepts a full URL or a key; returns spreadsheet key or None."""
+    if not url_or_key:
+        return None
+    s = str(url_or_key)
+    # If it's a URL, try robust extractions
+    if "/spreadsheets/d/" in s:
+        try:
+            return s.split("/spreadsheets/d/")[1].split("/")[0]
+        except Exception:
+            pass
+    if "http" in s and "/" in s:
+        try:
+            return s.strip("/").split("/")[-2]
+        except Exception:
+            pass
+    # Otherwise assume it's already a key
+    return s
+
+def _google_creds():
+    if Credentials is None:
+        return None
+    info = dict(_conn_secrets)
+    # streamlit stores private_key with \n escapes; google lib needs actual newlines
+    if info.get("private_key"):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
     try:
-        creds = st.secrets["connections"]["gsheets"]
-        gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"].split('/')[-2])
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    except Exception:
+        return None
+
+@st.cache_resource(show_spinner=False)
+def _gs_client_and_sheet():
+    """Return (gspread_client, spreadsheet) or (None, None) if not configured.
+    Tries opening by key (preferred) or URL, and creates a new spreadsheet if not found.
+    """
+    if not GSHEETS_SPREADSHEET_URL or gspread is None:
+        return None, None
+    creds = _google_creds()
+    gc = None
+    # Prefer google-auth credentials, fallback to gspread's service_account_from_dict
+    if creds is not None:
+        try:
+            gc = gspread.authorize(creds)
+        except Exception:
+            gc = None
+    if gc is None:
+        try:
+            gc = gspread.service_account_from_dict(_conn_secrets)
+        except Exception:
+            return None, None
+    # Try by key first (works even if secrets contains a full URL)
+    sh = None
+    key = _extract_spreadsheet_key(GSHEETS_SPREADSHEET_URL)
+    try:
+        if key:
+            sh = gc.open_by_key(key)
+    except Exception:
+        sh = None
+    if sh is None:
+        try:
+            # Fallback: try by URL if a URL was provided
+            sh = gc.open_by_url(GSHEETS_SPREADSHEET_URL)
+        except Exception:
+            sh = None
+    if sh is None:
+        # As a last resort, create a new spreadsheet (requires Drive scope)
+        try:
+            sh = gc.create("WIJNA Backend")
+        except Exception:
+            return gc, None
+    return gc, sh
+
+@st.cache_resource(show_spinner=False)
+def _drive_service():
+    if build is None:
+        return None
+    creds = _google_creds()
+    if not creds:
+        return None
+    try:
+        return build("drive", "v3", credentials=creds)
+    except Exception:
+        return None
+
+def _ensure_worksheet(name: str, columns: List[str]) -> Optional[Any]:
+    """Ensure a worksheet exists with at least provided columns as header."""
+    gc, sh = _gs_client_and_sheet()
+    if not sh:
+        return None
+    try:
+        try:
+            ws = sh.worksheet(name)
+        except Exception:
+            ws = sh.add_worksheet(title=name, rows=1000, cols=max(10, len(columns)))
+        # Ensure headers
+        existing = ws.row_values(1)
+        if not existing:
+            ws.update("1:1", [columns])
+        else:
+            # Merge columns, preserve order of existing then add missing at end
+            merged = existing[:]
+            for c in columns:
+                if c not in merged:
+                    merged.append(c)
+            if merged != existing:
+                ws.update("1:1", [merged])
+        return ws
+    except Exception:
+        return None
+
+# --- Compatibility helpers based on user's reference code ---
+def get_gsheet_connection():
+    """Open the Google Spreadsheet defined in secrets; stop the app with a helpful error if it fails."""
+    gc, sh = _gs_client_and_sheet()
+    if sh:
         return sh
+    # If we reach here, provide a clear error and stop like the reference code
+    try:
+        raise RuntimeError("Gagal terhubung ke Google Sheets. Pastikan secrets.toml benar dan API Sheets/Drive aktif.")
     except Exception as e:
         st.error(f"Gagal terhubung ke Google Sheets. Pastikan file secrets.toml sudah benar dan API Google Sheets/Drive telah diaktifkan: {e}")
         st.stop()
     return None
 
-sh = get_gsheet_connection()
-
-# --- UTILITY FUNCTIONS ---
-def get_worksheet(sheet_name):
+def get_worksheet(sheet_name: str):
+    """Return a worksheet by name, or None if not found (no exception)."""
     try:
+        sh = get_gsheet_connection()
         return sh.worksheet(sheet_name)
-    except WorksheetNotFound:
+    except Exception:
         return None
 
 def check_and_create_worksheets():
-    """Checks for required worksheets and creates them with headers if they don't exist."""
-    required_worksheets = {
-        "users": ['username', 'password_hash', 'role'],
-        "master_barang": ['kode_bahan', 'nama_supplier', 'nama_bahan', 'warna', 'rak', 'harga'],
-        "barang_masuk": ['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'],
-        "barang_keluar": ['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'],
-        "invoices": ['invoice_number', 'tanggal_waktu', 'customer_name'],
-        "invoice_items": ['invoice_number', 'kode_bahan', 'nama_bahan', 'qty', 'harga', 'total'],
-        "employees": ['nama_karyawan', 'bagian', 'gaji_pokok'],
-        "payroll": ['tanggal_waktu', 'gaji_bulan', 'employee_id', 'gaji_pokok', 'lembur', 'lembur_minggu', 'uang_makan', 'pot_absen_finger', 'ijin_hr', 'simpanan_wajib', 'potongan_koperasi', 'kasbon', 'gaji_akhir', 'keterangan']
-    }
-
-    existing_worksheets = [ws.title for ws in sh.worksheets()]
-    
-    for ws_name, headers in required_worksheets.items():
-        if ws_name not in existing_worksheets:
-            st.warning(f"Worksheet '{ws_name}' tidak ditemukan. Membuat sekarang...")
-            new_ws = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
-            new_ws.append_row(headers)
-            st.success(f"Worksheet '{ws_name}' berhasil dibuat dengan header.")
-
-# PERBAIKAN: MENAMBAHKAN CACHING UNTUK MENGURANGI PANGGILAN API
-@st.cache_data(ttl=600)  # Cache data selama 10 menit
-def get_data_from_gsheets(sheet_name):
-    worksheet = get_worksheet(sheet_name)
-    if worksheet:
-        data = worksheet.get_all_records()
-        df = pd.DataFrame(data)
-        # Drop rows that are all empty, which can happen with get_all_records
-        df = df.replace('', pd.NA).dropna(how='all')
-        return df
-    return pd.DataFrame()
-
-def append_row_to_gsheet(sheet_name, data_list):
-    worksheet = get_worksheet(sheet_name)
-    if worksheet:
-        worksheet.append_row(data_list)
-        st.cache_data.clear() # PERBAIKAN: Hapus cache setelah menulis
-        return True
-    return False
-
-def update_row_in_gsheet(sheet_name, row_index, data_list):
-    worksheet = get_worksheet(sheet_name)
-    if worksheet:
-        worksheet.update(f"A{row_index+2}", [data_list])
-        st.cache_data.clear() # PERBAIKAN: Hapus cache setelah menulis
-        return True
-    return False
-
-def delete_row_from_gsheet(sheet_name, row_index):
-    worksheet = get_worksheet(sheet_name)
-    if worksheet:
-        worksheet.delete_rows(row_index+2)
-        st.cache_data.clear() # PERBAIKAN: Hapus cache setelah menulis
-        return True
-    return False
-
-def create_excel_backup():
-    """Menggabungkan semua data dari berbagai worksheet ke dalam satu file Excel."""
+    """Ensure all required worksheets exist with required headers (idempotent)."""
+    # Reuse the same source of truth as ensure_gsheets_backend
     try:
-        # Nama worksheet dan header yang relevan
-        worksheets_to_backup = {
-            "master_barang": ['kode_bahan', 'nama_supplier', 'nama_bahan', 'warna', 'rak', 'harga'],
-            "barang_masuk": ['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'],
-            "barang_keluar": ['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'],
-            "invoices": ['invoice_number', 'tanggal_waktu', 'customer_name'],
-            "invoice_items": ['invoice_number', 'kode_bahan', 'nama_bahan', 'qty', 'harga', 'total'],
-            "employees": ['nama_karyawan', 'bagian', 'gaji_pokok'],
-            "payroll": ['tanggal_waktu', 'gaji_bulan', 'employee_id', 'gaji_pokok', 'lembur', 'lembur_minggu', 'uang_makan', 'pot_absen_finger', 'ijin_hr', 'simpanan_wajib', 'potongan_koperasi', 'kasbon', 'gaji_akhir', 'keterangan']
+        ensure_gsheets_backend()
+    except Exception:
+        # Silently ignore here; ensure_gsheets_backend already handles internal errors
+        pass
+
+def _ws_headers(ws) -> List[str]:
+    try:
+        return ws.row_values(1)
+    except Exception:
+        return []
+
+def _serialize_row_for_sheet(row: Dict[str, Any]) -> Dict[str, str]:
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, (bytes, bytearray)):
+            out[k] = ""  # don't store blobs in sheet
+        elif v is None:
+            out[k] = ""
+        elif isinstance(v, (dict, list)):
+            out[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[k] = str(v)
+    return out
+
+def _sheet_upsert(table: str, row: Dict[str, Any], key: str = "id"):
+    ws = _ensure_worksheet(table, list(row.keys()))
+    if not ws:
+        return
+    headers = _ws_headers(ws)
+    key_idx = headers.index(key) + 1 if key in headers else None
+    if not key_idx:
+        # add key to header
+        headers.append(key)
+        ws.update("1:1", [headers])
+        key_idx = len(headers)
+    row_s = _serialize_row_for_sheet(row)
+    # Ensure all header keys exist
+    for h in headers:
+        if h not in row_s:
+            row_s[h] = ""
+    try:
+        # Find existing row by key
+        col_vals = ws.col_values(key_idx)
+        try:
+            found = col_vals.index(str(row.get(key))) + 1  # 1-based
+        except ValueError:
+            found = None
+        values = [row_s.get(h, "") for h in headers]
+        if found and found != 1:
+            ws.update(f"{found}:{found}", [values])
+        else:
+            ws.append_row(values, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+def _sheet_delete(table: str, key_val: str, key: str = "id"):
+    ws = _ensure_worksheet(table, [key])
+    if not ws:
+        return
+    headers = _ws_headers(ws)
+    if key not in headers:
+        return
+    key_idx = headers.index(key) + 1
+    try:
+        col_vals = ws.col_values(key_idx)
+        idx = col_vals.index(str(key_val)) + 1
+        if idx > 1:
+            ws.delete_rows(idx)
+    except Exception:
+        pass
+
+def _sync_sqlite_row_to_sheet(table: str, row_id: Optional[str]):
+    if not row_id:
+        return
+    try:
+        # Read full row from SQLite and push to Sheets
+        st.session_state["__audit_disabled"] = True
+        conn = sqlite3.connect(DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        cur.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,))
+        r = cur.fetchone()
+        if not r:
+            return
+        row_dict = {c: r[c] for c in cols if c in r.keys()}
+        # Mirror: don't store blobs
+        for c in list(row_dict.keys()):
+            if isinstance(row_dict[c], (bytes, bytearray)):
+                row_dict[c] = ""
+        _sheet_upsert(table, row_dict, key="id")
+    except Exception:
+        pass
+    finally:
+        st.session_state["__audit_disabled"] = False
+
+def _drive_upload(file_bytes: bytes, filename: str) -> Dict[str, str]:
+    svc = _drive_service()
+    res = {"file_id": "", "webViewLink": "", "webContentLink": ""}
+    if not svc:
+        return res
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="application/octet-stream", resumable=False)
+    meta = {"name": filename}
+    if DRIVE_FOLDER_ID:
+        meta["parents"] = [DRIVE_FOLDER_ID]
+    try:
+        f = svc.files().create(body=meta, media_body=media, fields="id, name, webViewLink, webContentLink").execute()
+        file_id = f.get("id")
+        # Make it readable by anyone with link
+        try:
+            svc.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+        except Exception:
+            pass
+        # Re-fetch to get links
+        f2 = svc.files().get(fileId=file_id, fields="id, webViewLink, webContentLink").execute()
+        res = {
+            "file_id": file_id or "",
+            "webViewLink": f2.get("webViewLink", ""),
+            "webContentLink": f2.get("webContentLink", f"https://drive.google.com/uc?id={file_id}&export=download") if file_id else "",
         }
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            for sheet_name in worksheets_to_backup:
-                st.write(f"Mengambil data dari worksheet '{sheet_name}'...")
-                df = get_data_from_gsheets(sheet_name)
-                if not df.empty:
-                    # Ganti semua nilai None/NaN dengan string kosong agar tidak ada masalah saat menulis ke Excel
-                    df.fillna('', inplace=True)
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+        return res
+    except Exception:
+        return res
+
+def _drive_find_file_by_name(filename: str) -> Dict[str, str]:
+    svc = _drive_service()
+    if not svc or not filename:
+        return {}
+    try:
+        # Search in folder if provided; newest first
+        safe_name = filename.replace("'", "\'")
+        q_parts = [f"name = '{safe_name}'", "trashed = false"]
+        if DRIVE_FOLDER_ID:
+            q_parts.append(f"'{DRIVE_FOLDER_ID}' in parents")
+        q = " and ".join(q_parts)
+        resp = svc.files().list(q=q, fields="files(id, name, webViewLink, webContentLink)", orderBy="modifiedTime desc", pageSize=1).execute()
+        files = resp.get("files", [])
+        if not files:
+            return {}
+        f = files[0]
+        fid = f.get("id")
+        # Ensure public readable
+        try:
+            svc.permissions().create(fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
+        except Exception:
+            pass
+        return {
+            "file_id": fid,
+            "webViewLink": f.get("webViewLink", ""),
+            "webContentLink": f.get("webContentLink", f"https://drive.google.com/uc?id={fid}&export=download") if fid else "",
+        }
+    except Exception:
+        return {}
+
+def ensure_gsheets_backend():
+    """Prepare worksheets with minimal columns used by the app so syncing doesn't fail."""
+    table_columns: Dict[str, List[str]] = {
+        "users": ["id","email","full_name","role","password_hash","status","created_at","last_login"],
+        "sop": ["id","judul","file_name","file_id","file_url","tanggal_upload","tanggal_terbit","director_approved","memo","board_note"],
+        "notulen": ["id","judul","file_name","file_id","file_url","tanggal_upload","uploaded_by","deadline","director_note","director_approved","tanggal_rapat"],
+        "surat_masuk": ["id","indeks","nomor","pengirim","tanggal","perihal","file_name","file_id","file_url","status","follow_up","rekap","director_approved"],
+        "surat_keluar": ["id","indeks","nomor","tanggal","ditujukan","perihal","lampiran_name","lampiran_id","lampiran_url","draft_name","draft_id","draft_url","status","follow_up","pengirim","director_note","director_approved","final_name","final_id","final_url"],
+        "mou": ["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","file_name","file_id","file_url","board_note","board_approved","director_note","director_approved","final_name","final_id","final_url"],
+        "cash_advance": ["id","divisi","items_json","totals","tanggal","finance_note","finance_approved","director_note","director_approved"],
+        "pmr": ["id","nama","file1_name","file1_id","file1_url","file2_name","file2_id","file2_url","bulan","finance_note","finance_approved","director_note","director_approved","tanggal_submit"],
+        "cuti": ["id","nama","tgl_mulai","tgl_selesai","durasi","kuota_tahunan","cuti_terpakai","sisa_kuota","status","finance_note","finance_approved","director_note","director_approved"],
+        "flex": ["id","nama","tanggal","jam_mulai","jam_selesai","alasan","catatan_finance","approval_finance","catatan_director","approval_director","finance_note","finance_approved","director_note","director_approved"],
+        "delegasi": ["id","judul","deskripsi","pic","tgl_mulai","tgl_selesai","file_name","file_id","file_url","status","tanggal_update"],
+        "mobil": ["id","nama_pengguna","divisi","tgl_mulai","tgl_selesai","tujuan","kendaraan","driver","status","finance_note"],
+        "calendar": ["id","jenis","judul","nama_divisi","tgl_mulai","tgl_selesai","deskripsi","file_name","file_id","file_url","is_holiday","sumber","ditetapkan_oleh","tanggal_penetapan"],
+        "public_holidays": ["tahun","tanggal","nama","keterangan","ditetapkan_oleh","tanggal_penetapan"],
+        "inventory": ["id","nama_barang","kode_barang","qty","harga","updated_at","finance_approved","director_approved","divisi"]
+    }
+    for t, cols in table_columns.items():
+        _ensure_worksheet(t, cols)
+
+def sop_module():
+    user = require_login()
+    st.header("📚 Kebijakan & SOP")
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Introspeksi kolom untuk fleksibilitas skema
+    cur.execute("PRAGMA table_info(sop)")
+    sop_cols = [row[1] for row in cur.fetchall()]
+    sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
+
+    tab_upload, tab_daftar, tab_approve = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director"])
+
+    # --- Tab 1: Upload SOP ---
+    with tab_upload:
+        st.subheader("Upload SOP / Kebijakan")
+        with st.form("sop_add", clear_on_submit=True):
+            judul = st.text_input("Judul Kebijakan / SOP")
+            tgl = st.date_input("Tanggal Terbit" if sop_date_col == "tanggal_terbit" else "Tanggal", value=date.today())
+            f = st.file_uploader("Upload File SOP (PDF/DOC)")
+            submit = st.form_submit_button("💾 Simpan")
+            if submit:
+                if not judul or not f:
+                    st.warning("Judul dan file wajib diisi.")
                 else:
-                    # Jika DataFrame kosong, buat yang kosong dengan header
-                    empty_df = pd.DataFrame(columns=worksheets_to_backup[sheet_name])
-                    empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        
-        processed_data = output.getvalue()
-        return processed_data
-    except Exception as e:
-        st.error(f"Gagal membuat backup Excel: {e}")
-        return None
-
-# --- AUTHENTICATION FUNCTIONS ---
-def get_user_data():
-    return get_data_from_gsheets('users')
-
-# PERBAIKAN: Mengembalikan role saat login berhasil
-def check_login(username, password):
-    users_df = get_user_data()
-    user = users_df[users_df['username'] == username]
-    if not user.empty:
-        stored_password = user.iloc[0]['password_hash'] # Menggunakan password_hash sebagai password plain text untuk demo
-        role = user.iloc[0]['role']
-        if password == stored_password:
-            return True, role
-    return False, None
-
-def check_and_create_owner():
-    users_df = get_data_from_gsheets('users')
-    if users_df.empty or 'owner' not in users_df['username'].tolist():
-        st.warning("Pengguna 'owner' tidak ditemukan. Membuat sekarang...")
-        if append_row_to_gsheet('users', ['owner', 'owner123', 'owner']):
-            st.success("Pengguna 'owner' berhasil dibuat.")
-        # Tambahkan pengguna 'adm kasir' dan 'adm gudang' jika belum ada
-        if 'adm kasir' not in users_df['username'].tolist():
-            append_row_to_gsheet('users', ['adm kasir', 'adm123', 'adm kasir'])
-        if 'adm gudang' not in users_df['username'].tolist():
-            append_row_to_gsheet('users', ['adm gudang', 'adm123', 'adm gudang'])
-
-# --- CRUD Functions - Inventory ---
-def add_master_item(kode, supplier, nama, warna, rak, harga):
-    df_master = get_data_from_gsheets('master_barang')
-    if not df_master.empty and ((df_master['kode_bahan'] == kode) & (df_master['warna'] == warna)).any():
-        return False
-    return append_row_to_gsheet('master_barang', [kode, supplier, nama, warna, rak, harga])
-
-def get_master_barang():
-    df = get_data_from_gsheets('master_barang')
-    if not df.empty:
-        df['harga'] = pd.to_numeric(df['harga'], errors='coerce').fillna(0)
-    return df
-
-def update_master_item(old_kode, old_warna, new_kode, new_warna, supplier, nama, rak, harga):
-    df_master = get_master_barang() # Use the function that returns a clean df
-    row_index = df_master.index[(df_master['kode_bahan'] == old_kode) & (df_master['warna'] == old_warna)].tolist()
-    if not row_index:
-        return False
-    
-    row_index = row_index[0]
-    
-    # Check for duplicate key combination
-    if (new_kode != old_kode or new_warna != old_warna):
-        if ((df_master['kode_bahan'] == new_kode) & (df_master['warna'] == new_warna)).any():
-            return False
-
-    return update_row_in_gsheet('master_barang', row_index, [new_kode, supplier, nama, new_warna, rak, harga])
-
-def delete_master_item(kode, warna):
-    df_master = get_data_from_gsheets('master_barang')
-    row_index = df_master.index[(df_master['kode_bahan'] == kode) & (df_master['warna'] == warna)].tolist()
-    if not row_index:
-        return False
-    return delete_row_from_gsheet('master_barang', row_index[0])
-
-def add_barang_masuk(tanggal_waktu, kode_bahan, warna, stok, yard, keterangan):
-    return append_row_to_gsheet('barang_masuk', [tanggal_waktu, kode_bahan, warna, stok, yard, keterangan])
-
-def get_barang_masuk():
-    df = get_data_from_gsheets('barang_masuk')
-    if df.empty:
-        # Perbaikan: Buat DataFrame kosong dengan kolom yang dibutuhkan
-        return pd.DataFrame(columns=['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'])
-
-    df['stok'] = pd.to_numeric(df['stok'], errors='coerce').fillna(0).astype(int)
-    df['yard'] = pd.to_numeric(df['yard'], errors='coerce').fillna(0.0)
-    return df
-
-def update_barang_masuk(row_index, tanggal_waktu, kode_bahan, warna, stok, yard, keterangan):
-    return update_row_in_gsheet('barang_masuk', row_index, [tanggal_waktu, kode_bahan, warna, stok, yard, keterangan])
-
-def delete_barang_masuk(row_index):
-    return delete_row_from_gsheet('barang_masuk', row_index)
-
-def get_stock_balance(kode_bahan, warna):
-    df_in = get_barang_masuk()
-    df_out = get_barang_keluar()
-    
-    # Perbaikan: Periksa apakah DataFrame memiliki kolom sebelum melakukan filter
-    if not df_in.empty:
-        in_stock = df_in[(df_in['kode_bahan'] == kode_bahan) & (df_in['warna'] == warna)]['stok'].sum()
-    else:
-        in_stock = 0
-    
-    if not df_out.empty:
-        out_stock = df_out[(df_out['kode_bahan'] == kode_bahan) & (df_out['warna'] == warna)]['stok'].sum()
-    else:
-        out_stock = 0
-
-    return in_stock - out_stock
-
-def get_in_out_records(start_date, end_date):
-    df_in = get_barang_masuk()
-    df_out = get_barang_keluar()
-    
-    if df_in.empty and df_out.empty:
-        return pd.DataFrame()
-
-    if not df_in.empty:
-        df_in['tanggal_waktu'] = pd.to_datetime(df_in['tanggal_waktu'])
-        df_in = df_in[(df_in['tanggal_waktu'].dt.date >= start_date) & (df_in['tanggal_waktu'].dt.date <= end_date)]
-        df_in = df_in.assign(qty=df_in['stok'], type='Masuk', keterangan=df_in['keterangan'])
-    
-    if not df_out.empty:
-        df_out['tanggal_waktu'] = pd.to_datetime(df_out['tanggal_waktu'])
-        df_out = df_out[(df_out['tanggal_waktu'].dt.date >= start_date) & (df_out['tanggal_waktu'].dt.date <= end_date)]
-        df_out = df_out.assign(qty=df_out['stok'], type='Keluar', keterangan=df_out['keterangan'])
-    
-    df = pd.concat([df_in[['tanggal_waktu', 'kode_bahan', 'warna', 'qty', 'type', 'keterangan']], 
-                    df_out[['tanggal_waktu', 'kode_bahan', 'warna', 'qty', 'type', 'keterangan']]], ignore_index=True)
-    
-    df = df.sort_values(by='tanggal_waktu')
-    return df
-
-# --- Invoice Functions ---
-def get_invoices():
-    return get_data_from_gsheets('invoices')
-
-def get_invoice_items(invoice_number):
-    df_items = get_data_from_gsheets('invoice_items')
-    if not df_items.empty:
-        df_items['harga'] = pd.to_numeric(df_items['harga'], errors='coerce').fillna(0)
-        df_items['total'] = pd.to_numeric(df_items['total'], errors='coerce').fillna(0)
-    return df_items[df_items['invoice_number'] == invoice_number]
-
-def get_barang_keluar():
-    df = get_data_from_gsheets('barang_keluar')
-    if df.empty:
-        # Perbaikan: Buat DataFrame kosong dengan kolom yang dibutuhkan
-        return pd.DataFrame(columns=['tanggal_waktu', 'kode_bahan', 'warna', 'stok', 'yard', 'keterangan'])
-
-    df['stok'] = pd.to_numeric(df['stok'], errors='coerce').fillna(0).astype(int)
-    df['yard'] = pd.to_numeric(df['yard'], errors='coerce').fillna(0.0)
-    return df
-    
-def generate_invoice_pdf(invoice_data, invoice_items):
-    pdf = FPDF(orientation='P', unit='mm', format='A4')
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    
-    pdf.cell(0, 10, 'PT. BERKAT KARYA ANUGERAH', 0, 1, 'C')
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, 'INVOICE', 0, 1, 'C')
-    pdf.set_font("Arial", '', 12)
-    pdf.ln(5)
-    
-    pdf.cell(0, 5, f"No Invoice: {invoice_data['No Invoice']}", 0, 1, 'L')
-    pdf.cell(0, 5, f"Tanggal: {invoice_data['Tanggal & Waktu']}", 0, 1, 'L')
-    pdf.cell(0, 5, f"Nama Pelanggan: {invoice_data['Nama Pelanggan']}", 0, 1, 'L')
-    
-    pdf.ln(10)
-
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(10, 10, 'No', 1, 0, 'C')
-    pdf.cell(70, 10, 'Item', 1, 0, 'C')
-    pdf.cell(30, 10, 'Qty', 1, 0, 'C')
-    pdf.cell(40, 10, 'Harga', 1, 0, 'C')
-    pdf.cell(40, 10, 'Total Harga', 1, 1, 'C')
-
-    pdf.set_font("Arial", '', 12)
-    total_invoice_amount = 0
-    for idx, row in invoice_items.iterrows():
-        total_invoice_amount += row['total']
-        pdf.cell(10, 10, str(idx + 1), 1, 0, 'C')
-        pdf.cell(70, 10, row['nama_bahan'], 1)
-        pdf.cell(30, 10, str(row['qty']), 1, 0, 'R')
-        pdf.cell(40, 10, f"Rp {row['harga']:,.2f}", 1, 0, 'R')
-        pdf.cell(40, 10, f"Rp {row['total']:,.2f}", 1, 1, 'R')
-
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(150, 10, 'Total', 1, 0, 'R')
-    pdf.cell(40, 10, f"Rp {total_invoice_amount:,.2f}", 1, 1, 'R')
-    
-    pdf.ln(10)
-    pdf.set_font("Arial", '', 12)
-    pdf.cell(0, 5, "Terimakasih atas pembelian anda", 0, 1, 'C')
-    pdf.ln(10)
-    pdf.cell(0, 5, "Ttd Accounting", 0, 1, 'R')
-    
-    return io.BytesIO(pdf.output(dest='S'))
-    
-def generate_invoice_number():
-    df_invoices = get_invoices()
-    today_date = datetime.now().strftime('%y%m%d')
-    prefix = f"INV-{today_date}-"
-    
-    if not df_invoices.empty:
-        df_invoices = df_invoices[df_invoices['invoice_number'].str.startswith(prefix)]
-        if not df_invoices.empty:
-            last_invoice = df_invoices['invoice_number'].max()
-            last_seq = int(last_invoice.split('-')[-1])
-            new_seq = last_seq + 1
-        else:
-            new_seq = 1
-    else:
-        new_seq = 1
-        
-    new_invoice_number = f"{prefix}{new_seq:03d}"
-    return new_invoice_number
-
-def add_barang_keluar_and_invoice(invoice_number, customer_name, items):
-    tanggal_waktu = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # Check stock before starting transactions
-    for item in items:
-        current_stock = get_stock_balance(item['kode_bahan'], item['warna'])
-        if item['qty'] > current_stock:
-            return False, f"Stok untuk item {item['nama_bahan']} ({item['warna']}) tidak mencukupi. Stok saat ini: {current_stock}"
-
-    # Insert into invoices table
-    if not append_row_to_gsheet('invoices', [invoice_number, tanggal_waktu, customer_name]):
-        return False, "Gagal membuat invoice."
-    
-    # Insert items and outgoing goods
-    for item in items:
-        if not append_row_to_gsheet('invoice_items', [invoice_number, item['kode_bahan'], item['nama_bahan'], item['qty'], item['harga'], item['total']]):
-            return False, "Gagal menambahkan item ke invoice."
-        if not append_row_to_gsheet('barang_keluar', [tanggal_waktu, item['kode_bahan'], item['warna'], item['qty'], item['yard'], item['keterangan']]):
-            return False, "Gagal mencatat barang keluar."
-    
-    return True, "Transaksi berhasil dicatat dan invoice dibuat."
-
-# --- Payroll Functions ---
-def add_employee(nama, bagian, gaji):
-    df_employees = get_employees()
-    # Check if employee already exists to avoid duplicates
-    if not df_employees.empty and (df_employees['nama_karyawan'] == nama).any():
-        return False
-    return append_row_to_gsheet('employees', [nama, bagian, gaji])
-
-def get_employees():
-    df = get_data_from_gsheets('employees')
-    if not df.empty:
-        df['gaji_pokok'] = pd.to_numeric(df['gaji_pokok'], errors='coerce').fillna(0)
-    return df
-
-def update_employee(old_name, new_nama, new_bagian, new_gaji):
-    df_employees = get_employees()
-    row_index = df_employees.index[df_employees['nama_karyawan'] == old_name].tolist()
-    if not row_index:
-        return False
-    return update_row_in_gsheet('employees', row_index[0], [new_nama, new_bagian, new_gaji])
-
-def delete_employee(nama):
-    df_employees = get_employees()
-    row_index = df_employees.index[df_employees['nama_karyawan'] == nama].tolist()
-    if not row_index:
-        return False
-    return delete_row_from_gsheet('employees', row_index[0])
-
-def add_payroll_record(employee_id, gaji_bulan, gaji_pokok, lembur, lembur_minggu, uang_makan, pot_absen_finger, ijin_hr, simpanan_wajib, potongan_koperasi, kasbon, gaji_akhir, keterangan):
-    tanggal_waktu = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    # Convert numerical inputs to float to ensure they are JSON serializable
-    data_list = [
-        tanggal_waktu,
-        gaji_bulan,
-        employee_id,
-        float(gaji_pokok),
-        float(lembur),
-        float(lembur_minggu),
-        float(uang_makan),
-        float(pot_absen_finger),
-        float(ijin_hr),
-        float(simpanan_wajib),
-        float(potongan_koperasi),
-        float(kasbon),
-        float(gaji_akhir),
-        keterangan
-    ]
-    return append_row_to_gsheet('payroll', data_list)
-    
-def get_payroll_records():
-    df_payroll = get_data_from_gsheets('payroll')
-    df_employees = get_employees()
-
-    if df_payroll.empty or df_employees.empty:
-        return pd.DataFrame()
-    
-    df_employees['id'] = range(1, len(df_employees) + 1)
-    
-    df_payroll = df_payroll.merge(df_employees, left_on='employee_id', right_on='id', how='left')
-    
-    return df_payroll[['tanggal_waktu', 'gaji_bulan', 'nama_karyawan', 'gaji_akhir', 'keterangan']]
-
-def get_payroll_records_by_month(month_str):
-    df_payroll = get_data_from_gsheets('payroll')
-    df_employees = get_employees()
-    
-    if df_payroll.empty or df_employees.empty:
-        return pd.DataFrame()
-        
-    df_employees['id'] = range(1, len(df_employees) + 1)
-    
-    df_payroll = df_payroll[df_payroll['gaji_bulan'] == month_str]
-    
-    # Perbaikan: Pastikan kolom numerik dikonversi sebelum diolah
-    for col in ['gaji_pokok', 'lembur', 'lembur_minggu', 'uang_makan', 'pot_absen_finger', 'ijin_hr', 'simpanan_wajib', 'potongan_koperasi', 'kasbon', 'gaji_akhir']:
-        df_payroll[col] = pd.to_numeric(df_payroll[col], errors='coerce').fillna(0)
-    
-    df_payroll = df_payroll.merge(df_employees, left_on='employee_id', right_on='id', how='left')
-    
-    return df_payroll
-
-def generate_payslips_pdf(payslip_df):
-    pdf = FPDF(orientation='P', unit='mm', format='A4')
-    
-    for idx, row in payslip_df.iterrows():
-        pdf.add_page()
-        pdf.set_font("Arial", 'B', 16)
-        
-        pdf.cell(0, 10, 'PT. BERKAT KARYA ANUGERAH', 0, 1, 'C')
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 5, 'SLIP GAJI', 0, 1, 'C')
-        pdf.ln(5)
-
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(40, 5, 'Nama Karyawan:', 0)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 5, row['nama_karyawan'], 0, 1)
-
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(40, 5, 'Bagian:', 0)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 5, row['bagian'], 0, 1)
-
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(40, 5, 'Gaji Bulan:', 0)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 5, row['gaji_bulan'], 0, 1)
-
-        pdf.ln(5)
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 10, 'Pendapatan', 0, 1)
-        pdf.set_font("Arial", '', 10)
-        
-        # Pendapatan
-        pdf.cell(60, 5, 'Gaji Pokok', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['gaji_pokok_x']:,.2f}", 0, 1, 'R')
-        
-        pdf.cell(60, 5, 'Lembur', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['lembur']:,.2f}", 0, 1, 'R')
-        
-        pdf.cell(60, 5, 'Lembur Minggu', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['lembur_minggu']:,.2f}", 0, 1, 'R')
-        
-        pdf.cell(60, 5, 'Uang Makan', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['uang_makan']:,.2f}", 0, 1, 'R')
-
-        # Total 1
-        total1 = row['gaji_pokok_x'] + row['lembur'] + row['lembur_minggu'] + row['uang_makan']
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(60, 5, 'Total Pendapatan (1)', 'T', 0)
-        pdf.cell(5, 5, ':', 'T', 0)
-        pdf.cell(0, 5, f"Rp {total1:,.2f}", 'T', 1, 'R')
-
-        pdf.ln(5)
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 10, 'Potongan', 0, 1)
-        pdf.set_font("Arial", '', 10)
-        
-        # Potongan
-        pdf.cell(60, 5, 'Absen Finger', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['pot_absen_finger']:,.2f}", 0, 1, 'R')
-
-        pdf.cell(60, 5, 'Ijin HR', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['ijin_hr']:,.2f}", 0, 1, 'R')
-
-        # Total 2
-        total2 = total1 - row['pot_absen_finger'] - row['ijin_hr']
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(60, 5, 'Total Pendapatan Setelah Potongan Absen (2)', 'T', 0)
-        pdf.cell(5, 5, ':', 'T', 0)
-        pdf.cell(0, 5, f"Rp {total2:,.2f}", 'T', 1, 'R')
-
-        pdf.ln(5)
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 10, 'Potongan Lain-lain', 0, 1)
-        pdf.set_font("Arial", '', 10)
-
-        # Potongan Lain-lain
-        pdf.cell(60, 5, 'Simpanan Wajib', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['simpanan_wajib']:,.2f}", 0, 1, 'R')
-
-        pdf.cell(60, 5, 'Potongan Koperasi', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['potongan_koperasi']:,.2f}", 0, 1, 'R')
-
-        pdf.cell(60, 5, 'Kasbon', 0, 0)
-        pdf.cell(5, 5, ':', 0, 0)
-        pdf.cell(0, 5, f"Rp {row['kasbon']:,.2f}", 0, 1, 'R')
-        
-        pdf.ln(5)
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(60, 5, 'TOTAL GAJI AKHIR', 'T', 0)
-        pdf.cell(5, 5, ':', 'T', 0)
-        pdf.cell(0, 5, f"Rp {row['gaji_akhir']:,.2f}", 'T', 1, 'R')
-
-        pdf.ln(10)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 5, f"Keterangan: {row['keterangan']}", 0, 1)
-        pdf.ln(15)
-        pdf.cell(0, 5, "Ttd Accounting", 0, 1, 'R')
-
-    return io.BytesIO(pdf.output(dest='S'))
-
-def show_user_guide():
-    st.title("Panduan Pengguna ℹ️")
-    st.markdown("---")
-    st.markdown("""
-    Selamat datang di **Sistem Kontrol Stok & Penggajian PT. Berkat Karya Anugerah**.  
-    Aplikasi ini membantu mengelola **inventaris**, **penjualan + invoice**, serta **penggajian** berbasis Google Sheets.
-
-    ---
-
-    ## 👥 Peran & Akses Menu
-    **Owner (Pemilik)** — akses penuh:
-    - Dashboard 📈 • Master Barang 📦 • Barang Masuk 📥 • Transaksi Keluar 🧾 • Monitoring Stok 📊 • Penggajian 💰 • Panduan ℹ️
-
-    **Adm Kasir** — fokus penjualan:
-    - Dashboard 📈 • Transaksi Keluar 🧾 • Monitoring Stok 📊 • Panduan ℹ️
-
-    **Adm Gudang** — fokus inventaris:
-    - Dashboard 📈 • Master Barang 📦 • Barang Masuk 📥 • Monitoring Stok 📊 • Panduan ℹ️
-
-    ---
-
-    ## 🔑 Alur Global
-    1) **Login** → Masukkan *username* & *password* sesuai peran, klik **Login**.  
-    2) **Navigasi** → Gunakan **sidebar** untuk ganti halaman (menu yang tampil mengikuti peran).  
-    3) **Input & Kelola Data** → Ikuti formulir di tiap halaman.  
-    4) **Unduh Dokumen** → Invoice & Slip Gaji (PDF), Backup (Excel).  
-    5) **Logout** → Klik **Logout** di sidebar.
-
-    ---
-
-    ## ⌨️ Perilaku Tombol & Keyboard (Penting!)
-    - Semua formulir utama menggunakan tombol **Simpan** di dalam `form`.  
-      **Tekan Enter = Submit Form** *jika fokus* berada pada **input satu baris** (text/number/select).  
-    - **Khusus kolom `Keterangan`** (tipe *text area*):
-      - **Enter** akan **menambah baris baru**, **bukan** submit.
-      - Untuk submit, klik tombol **Simpan** (disarankan) atau pindahkan fokus dari text area lalu tekan **Enter**.
-    - Setelah simpan berhasil, halaman akan **refresh otomatis** (indikasi: pesan sukses + data terbarui).
-
-    ---
-
-    ## 📈 Dashboard
-    **Ringkasan bisnis**:
-    - **Total Nilai Stok** & **Total Barang** (otomatis dari master barang + pergerakan stok).  
-    - Grafik **10 stok terendah** → membantu prioritas restock.
-    **Tips**:
-    - Jika kosong, berarti **belum ada master barang** atau stok masih 0.
-
-    ---
-
-    ## 📦 Master Barang (Owner, Adm Gudang)
-    ### A. Tambah Barang Baru
-    - Isi:
-      - **Kode barang** → otomatis disimpan **UPPERCASE**.
-      - **Nama Supplier**, **Nama Item**
-      - **Warna** → otomatis disimpan **lowercase**.
-      - **Rak**
-      - **Harga** (angka).  
-    - Klik **💾 Simpan Barang**.
-    - **Validasi unik**: kombinasi **Kode barang + Warna** tidak boleh duplikat. Jika duplikat → muncul pesan **gagal**.
-    - **Enter** saat fokus di input satu baris → submit form.  
-      Saat mengetik di **Keterangan** (jika ada) → Enter hanya menambah baris.
-
-    ### B. Daftar & Kelola
-    - Tabel menampilkan semua barang (dengan harga).  
-    - **Edit**:
-      - Pilih barang → ubah field yang perlu → **Simpan Perubahan**.
-      - Jika mengubah **Kode/Warna** menjadi kombinasi yang **sudah ada**, penyimpanan akan **ditolak**.
-    - **Hapus**:
-      - Pilih barang → **Hapus Barang**.
-    - Setelah **Simpan/Hapus**, halaman **refresh otomatis**.
-
-    ---
-
-    ## 📥 Barang Masuk (Owner, Adm Gudang)
-    ### A. Input Barang Masuk Baru
-    1) **Pilih Kode barang** → daftar diambil dari Master Barang.  
-    2) **Pilih Warna** → otomatis terfilter sesuai Kode barang.  
-    3) Isi **Stok** (≥ 1), **Yard** (≥ 0), **Keterangan** (opsional).  
-    4) Klik **💾 Simpan Barang Masuk**.
-
-    **Tentang Enter di form ini**:
-    - Jika fokus berada di **Kode/Warna/Stok/Yard** → **Enter = submit** data masuk.
-    - Jika fokus berada di **Keterangan** (text area) → **Enter menambah baris**, **tidak** submit.
-
-    **Setelah Simpan**:
-    - Sistem menambahkan baris dengan waktu sekarang (**Tanggal & Waktu** otomatis).
-    - Halaman **refresh** dan data tampil di tabel di bawahnya.
-
-    ### B. Daftar & Kelola Barang Masuk
-    - Lihat riwayat **Barang Masuk** (tanggal, kode, warna, stok, yard, keterangan).
-    - **Edit**:
-      - Pilih baris unik (gabungan beberapa kolom) → ubah field → **Simpan Perubahan**.
-      - Jika **Kode/Warna** yang direferensikan **sudah dihapus** dari Master Barang, aplikasi akan **memperingatkan** dan memilih opsi pertama yang tersedia.
-    - **Hapus**:
-      - Pilih baris → **Hapus Data**.
-    - **Enter** saat mengedit di input baris → **submit**; di text area keterangan → **Enter menambah baris**.
-    - Setelah simpan/hapus → halaman **refresh**.
-
-    ---
-
-    ## 🧾 Transaksi Keluar & Invoice (Owner, Adm Kasir)
-    ### A. Menambah Item ke Keranjang
-    - Pilih item dari daftar (format: `KODE - NAMA (warna)`), klik **➕ Tambah Item**.  
-    - Item tampil dalam **keranjang**:
-      - Atur **Jumlah** (dibatasi maksimal **stok tersedia**).
-      - Atur **Yard** (opsional).
-      - Isi **Keterangan** per item (opsional).
-      - Lihat **Harga Satuan** & **Total per Item**.
-      - Hapus item dengan tombol **🗑️**.
-
-    **Tentang Enter di bagian ini**:
-    - Saat fokus di **Jumlah/Yard** → **Enter** akan **submit form transaksi** jika tombol simpan ada di form yang sama.  
-      **Saran:** isi semua item dulu, lalu klik **💾 Simpan Transaksi & Buat Invoice**.
-    - Di **Keterangan** (text area) → **Enter menambah baris**, bukan submit.
-
-    ### B. Simpan Transaksi & Buat Invoice
-    - Isi **Nama Pelanggan** (wajib).  
-    - Klik **💾 Simpan Transaksi & Buat Invoice**.
-    - Sistem akan:
-      1) **Validasi stok** setiap item (tidak boleh melebihi stok tersedia).  
-         Jika kurang, muncul pesan **Stok tidak mencukupi** (menyebut item & stok saat ini).
-      2) Membuat **Nomor Invoice** otomatis: `INV-YYMMDD-XXX` (urut harian).
-      3) Menyimpan header invoice + item detail, dan mencatat **Barang Keluar**.
-      4) Mengosongkan keranjang & menampilkan pesan **berhasil** (dengan animasi 🎈).
-
-    ### C. Riwayat & Unduh Invoice
-    - Lihat tabel riwayat invoice.  
-    - Pilih **No Invoice** → **Tampilkan & Unduh Invoice**:
-      - Lihat rincian (item, qty, harga, total).
-      - Unduh **PDF** invoice.
-
-    ---
-
-    ## 📊 Monitoring Stok (Owner, Adm Kasir, Adm Gudang)
-    - **Stok Saat Ini** → hitungan real-time dari (Masuk − Keluar) untuk setiap **Kode + Warna**.  
-    - **Rekam Jejak Stok**:
-      - Pilih **Tanggal Mulai** & **Tanggal Selesai** → klik **Tampilkan Rekam Jejak**.
-      - Tabel gabungan **Masuk** dan **Keluar** berurutan waktu.
-    - **Backup Data 💾**:
-      - Klik **Buat & Unduh Backup Data Lengkap** → menghasilkan file **Excel** berisi sheet:
-        `master_barang`, `barang_masuk`, `barang_keluar`, `invoices`, `invoice_items`,
-        `employees`, `payroll`.  
-      - Sheet kosong tetap dibuat dengan **header** agar konsisten.
-
-    **Catatan Enter**:
-    - Tombol backup bukan form → **Enter tidak memicu** proses. Klik tombolnya.
-
-    ---
-
-    ## 💰 Penggajian (Owner)
-    ### A. Master Karyawan
-    - **Tambah**: Nama, Bagian, **Gaji Pokok per Hari** (angka).  
-      Jika nama sudah ada → tambah **ditolak**.
-    - **Edit/Hapus** karyawan dari daftar.
-
-    ### B. Proses Penggajian Bulanan
-    1) Pilih karyawan (format: `ID - Nama (Bagian)`).
-    2) Pilih **Tanggal Gaji** → sistem membentuk label **Bulan Gaji** (misal: *September 2025*).
-    3) **Pendapatan**:
-       - **Gaji per Hari** (terkunci dari master) × **Jumlah Hari Masuk** → **Gaji Pokok (Total)**.
-       - Tambah **Lembur**, **Lembur Minggu**, **Uang Makan**.
-    4) **Potongan**:
-       - **Potongan Absen Finger**, **Ijin HR**.
-    5) **Potongan Lain**:
-       - **Simpanan Wajib**, **Potongan Koperasi**, **Kasbon**.
-    6) Sistem menghitung **TOTAL GAJI AKHIR** otomatis.
-    7) Klik **💾 Simpan Gaji**.
-
-    **Tentang Enter**:
-    - Saat fokus di input angka pada form ini → **Enter = submit**.  
-      **Saran:** klik tombol **Simpan Gaji** agar tidak tersubmit sebelum siap.
-
-    ### C. Riwayat & Slip Gaji
-    - Pilih **Bulan Gaji** → **Unduh PDF** berisi **semua slip** untuk bulan tersebut.  
-    - Tabel riwayat menampilkan tanggal (dengan nama bulan **Indonesia**), karyawan, gaji akhir, keterangan.
-
-    ---
-
-    ## 🧩 Aturan Data & Perhitungan (Ringkas)
-    - **Stok Saat Ini** = ∑(Barang Masuk) − ∑(Barang Keluar) per **Kode + Warna**.  
-    - **Duplikat Master Barang** ditolak jika **Kode + Warna** sudah ada.  
-    - **Harga**, **Gaji**, dan komponen angka lainnya otomatis dikonversi ke numerik (non-angka → 0).  
-    - **Format Invoice**: `INV-YYMMDD-XXX` (contoh: `INV-250903-001`).  
-    - **Waktu Transaksi** diset otomatis saat penyimpanan (*server time*).
-
-    ---
-
-    ## 🛠️ FAQ & Troubleshooting
-    - **"Worksheet '...' tidak ditemukan. Membuat sekarang..."**  
-      → Normal pada penggunaan pertama; sistem membuat sheet + header otomatis.
-    - **"Kombinasi Kode barang dan Warna sudah ada."**  
-      → Ubah salah satu agar unik.
-    - **"Belum ada master barang."**  
-      → Tambah barang di **Master Barang** dulu (wajib sebelum *Barang Masuk* / *Penjualan*).
-    - **"Stok tidak mencukupi" saat simpan transaksi**  
-      → Kurangi jumlah sesuai stok tampil atau tambah stok di **Barang Masuk**.
-    - **Perubahan tidak terlihat**  
-      → Setelah simpan berhasil, halaman otomatis refresh. Jika belum, lakukan refresh manual browser.
-
-    ---
-
-    ## 🚪 Logout
-    Klik **Logout** di sidebar → sesi dihapus, kembali ke halaman login.
-
-    --- 
-
-    ## 💡 Tips Penggunaan Cepat
-    - **Enter untuk submit** saat fokus di input satu baris; **Enter di text area** hanya menambah baris.  
-    - Di **Transaksi Keluar**, atur semua item dulu baru klik **Simpan** agar tidak tersubmit dini.  
-    - Rutin lakukan **Backup Excel** dari menu **Monitoring Stok**.
-    """)
-
-
-def show_dashboard():
-    st.title("Dashboard Bisnis 📈")
-    st.markdown("---")
-
-    master_df = get_master_barang()
-    
-    col_total_value, col_total_items = st.columns(2)
-    if not master_df.empty:
-        # Perbaikan: Konversi harga ke numerik
-        master_df['harga'] = pd.to_numeric(master_df['harga'], errors='coerce').fillna(0)
-        
-        master_df['Stok Saat Ini'] = master_df.apply(lambda row: get_stock_balance(row['kode_bahan'], row['warna']), axis=1)
-        total_value = (master_df['Stok Saat Ini'] * master_df['harga']).sum()
-        total_items = master_df['Stok Saat Ini'].sum()
-
-        with col_total_value:
-            st.metric("Total Nilai Stok Saat Ini", f"Rp {total_value:,.2f}")
-        with col_total_items:
-            st.metric("Total Barang di Gudang", f"{int(total_items)} Unit")
-    else:
-        st.info("Belum ada master barang untuk ditampilkan di dashboard.")
-
-    st.markdown("---")
-    st.header("Stok 10 Item Terendah")
-    if not master_df.empty:
-        low_stock_df = master_df.sort_values(by='Stok Saat Ini', ascending=True).head(10)
-        low_stock_df['label'] = low_stock_df['nama_bahan'] + ' (' + low_stock_df['warna'] + ')'
-        
-        if not low_stock_df.empty:
-            fig = px.bar(low_stock_df, 
-                         x='label', 
-                         y='Stok Saat Ini',
-                         title='10 Item dengan Stok Terendah',
-                         labels={'label': 'Nama Item', 'Stok Saat Ini': 'Jumlah Stok'},
-                         color='Stok Saat Ini',
-                         color_continuous_scale=px.colors.sequential.Sunset
-                         )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Semua stok barang sudah habis.")
-    else:
-        st.info("Belum ada master barang untuk menampilkan grafik.")
-
-def show_master_barang():
-    st.title("Master Barang 📦")
-    st.markdown("---")
-    
-    tab_add, tab_list = st.tabs(["➕ Tambah Barang Baru", "📝 Daftar Barang & Kelola"])
-    
-    with tab_add:
-        with st.expander("Form Tambah Barang Baru", expanded=True):
-            with st.form("add_item_form"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    kode_bahan = st.text_input("Kode barang").upper()
-                    nama_supplier = st.text_input("Nama Supplier")
-                    warna = st.text_input("Warna").lower()
-                with col2:
-                    nama_bahan = st.text_input("Nama Item")
-                    rak = st.text_input("Rak")
-                    harga = st.number_input("Harga", min_value=0.0)
-                
-                submitted = st.form_submit_button("💾 Simpan Barang")
-                if submitted:
-                    if add_master_item(kode_bahan, nama_supplier, nama_bahan, warna, rak, harga):
-                        st.success(f"Barang **{nama_bahan}** dengan warna **{warna}** berhasil ditambahkan. ✅")
-                        st.rerun()
-                    else:
-                        st.error("Kombinasi Kode barang dan Warna tersebut sudah ada. ❌")
-    
-    with tab_list:
-        st.subheader("Daftar Barang")
-        df = get_master_barang()
-        if not df.empty:
-            df_display = df.copy()
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-            
-            st.markdown("---")
-            with st.expander("Kelola Data Master"):
-                item_options_map = {f"{row['kode_bahan']} ({row['warna']})": (row['kode_bahan'], row['warna']) for _, row in df.iterrows()}
-                item_to_edit_str = st.selectbox("Pilih Kode barang (Warna)", list(item_options_map.keys()), key="select_edit_master")
-                
-                if item_to_edit_str:
-                    selected_kode, selected_warna = item_options_map[item_to_edit_str]
-                    
-                    filtered_df = df[(df['kode_bahan'] == selected_kode) & (df['warna'] == selected_warna)]
-
-                    if not filtered_df.empty:
-                        selected_row = filtered_df.iloc[0]
-                        
-                        harga_value = float(selected_row['harga']) if pd.notna(selected_row['harga']) else 0.0
-
-                        with st.form("edit_master_form"):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                new_kode_bahan = st.text_input("Kode barang Baru", value=selected_row['kode_bahan']).upper()
-                                new_nama_bahan = st.text_input("Nama Item", value=selected_row['nama_bahan'])
-                                new_rak = st.text_input("Rak", value=selected_row['rak'])
-                            with col2:
-                                new_warna = st.text_input("Warna Baru", value=selected_row['warna']).lower()
-                                new_nama_supplier = st.text_input("Nama Supplier", value=selected_row['nama_supplier'])
-                                new_harga = st.number_input("Harga", value=harga_value, min_value=0.0)
-                                
-                            col_btn1, col_btn2 = st.columns(2)
-                            with col_btn1:
-                                if st.form_submit_button("Simpan Perubahan"):
-                                    if update_master_item(selected_row['kode_bahan'], selected_row['warna'], new_kode_bahan, new_warna, new_nama_supplier, new_nama_bahan, new_rak, new_harga):
-                                        st.success("Data berhasil diperbarui! ✅")
-                                        st.rerun()
-                                    else:
-                                        st.error("Kombinasi Kode barang dan Warna baru sudah ada. Gagal menyimpan perubahan. ❌")
-                            with col_btn2:
-                                if st.form_submit_button("Hapus Barang"):
-                                    if delete_master_item(selected_row['kode_bahan'], selected_row['warna']):
-                                        st.success("Data berhasil dihapus! 🗑️")
-                                        st.rerun()
-                                    else:
-                                        st.error("Gagal menghapus data.")
-                    else:
-                        st.warning("Data yang dipilih tidak ditemukan. Silakan refresh halaman atau pilih data lain.")
-        else:
-            st.info("Belum ada master barang.")
-
-def show_input_masuk():
-    st.title("Input Barang Masuk 📥")
-    st.markdown("---")
-    
-    master_df = get_master_barang()
-    if master_df.empty:
-        st.warning("Belum ada master barang. Silakan tambahkan di menu Master Barang. ⚠️")
-        return
-
-    tab_add, tab_list = st.tabs(["➕ Input Barang Masuk Baru", "📝 Daftar Barang Masuk & Kelola"])
-
-    with tab_add:
-        with st.expander("Form Input Barang Masuk", expanded=True):
-            master_df['display_option'] = master_df['kode_bahan'] + ' (' + master_df['warna'] + ')'
-            combined_options = master_df['display_option'].unique().tolist()
-            
-            with st.form("input_masuk_form"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    # Dropdown tunggal untuk Kode barang dan Warna
-                    selected_combined = st.selectbox(
-                        "Pilih Kode Barang (Warna)",
-                        options=combined_options,
-                        key="combined_select"
-                    )
-    
-                    # Ekstrak Kode bahan dan Warna dari string yang dipilih
-                    kode_bahan_selected = None
-                    warna_selected = None
-                    if selected_combined:
+                    sid = gen_id("sop")
+                    blob, fname, _ = upload_file_and_store(f)
+                    meta = get_last_upload_meta()
+                    cols = ["id", "judul", "file_name"]
+                    vals = [sid, judul, fname]
+                    # Store Drive metadata
+                    for k_sql, v in (("file_id", meta.get("file_id")), ("file_url", meta.get("file_url"))):
                         try:
-                            kode_bahan_selected = selected_combined.split(' ')[0]
-                            warna_selected = selected_combined.split('(')[1].replace(')', '')
-                        except IndexError:
-                            st.error("Format pilihan tidak valid. Periksa data master.")
-                    
-                    stok = st.number_input("Stok", min_value=1, key="in_stok")
-                    
-                with col2:
-                    yard = st.number_input("Yard", min_value=0.0, key="in_yard")
-                    keterangan = st.text_area("Keterangan", key="in_keterangan")
-                
-                submitted = st.form_submit_button("💾 Simpan Barang Masuk")
-                if submitted:
-                    if kode_bahan_selected and warna_selected:
-                        tanggal_waktu = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        if add_barang_masuk(tanggal_waktu, kode_bahan_selected, warna_selected, stok, yard, keterangan):
-                            st.success("Barang masuk berhasil dicatat! ✅")
-                            st.cache_data.clear()
-                            st.rerun()
-                        else:
-                            st.error("Gagal mencatat barang masuk.")
-                    else:
-                        st.error("Pilihan kode barang tidak valid.")
-    
-    with tab_list:
-        st.subheader("Daftar Barang Masuk")
-        df = get_barang_masuk()
-        if not df.empty:
-            df['tanggal_waktu'] = pd.to_datetime(df['tanggal_waktu']).dt.strftime('%Y-%m-%d %H:%M:%S')
-            st.dataframe(df, use_container_width=True, hide_index=True)
+                            cur.execute(f"ALTER TABLE sop ADD COLUMN {k_sql} TEXT")
+                        except Exception:
+                            pass
+                        cols.append(k_sql); vals.append(v)
+                    if sop_date_col == "tanggal_terbit":
+                        cols.append("tanggal_terbit"); vals.append(tgl.isoformat())
+                    elif sop_date_col == "tanggal_upload":
+                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                    if "director_approved" in sop_cols:
+                        cols.append("director_approved"); vals.append(0)
+                    for opt in ("memo", "board_note"):
+                        if opt in sop_cols:
+                            cols.append(opt); vals.append("")
+                    placeholders = ", ".join(["?" for _ in cols])
+                    cur.execute(f"INSERT INTO sop ({', '.join(cols)}) VALUES ({placeholders})", vals)
+                    conn.commit()
+                    try:
+                        audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
+                    except Exception:
+                        pass
+                    st.success("SOP berhasil diupload. Menunggu approval Director.")
 
-            st.markdown("---")
-            with st.expander("Kelola Data Barang Masuk"):
-                # Gsheets doesn't have a simple ID column, so we'll use a combination of fields as a unique identifier.
-                df_to_edit = df.copy()
-                df_to_edit['unique_key'] = df_to_edit['tanggal_waktu'] + ' - ' + df_to_edit['kode_bahan'] + ' - ' + df_to_edit['warna'] + ' - ' + df_to_edit['stok'].astype(str)
-                record_to_edit_str = st.selectbox("Pilih Data yang akan diedit/dihapus", df_to_edit['unique_key'].tolist(), key="select_edit_in")
+    # --- Tab 2: Daftar & Rekap ---
+    with tab_daftar:
+        st.subheader("Daftar SOP")
+        # Build SELECT dinamis
+        cur.execute("PRAGMA table_info(sop)")
+        sop_cols = [row[1] for row in cur.fetchall()]
+        sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
+        select_cols = ["id", "judul"]
+        if sop_date_col: select_cols.append(sop_date_col)
+        if "director_approved" in sop_cols: select_cols.append("director_approved")
+        if "file_name" in sop_cols: select_cols.append("file_name")
+        df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM sop ORDER BY " + (sop_date_col or "id") + " DESC", conn)
 
-                if record_to_edit_str:
-                    selected_row = df_to_edit[df_to_edit['unique_key'] == record_to_edit_str].iloc[0]
-                    row_index = df_to_edit[df_to_edit['unique_key'] == record_to_edit_str].index.tolist()[0]
-                    
-                    with st.form("edit_in_form"):
-                        edit_tanggal_waktu = st.text_input("Tanggal & Waktu", value=selected_row['tanggal_waktu'])
-                        
-                        kode_bahan_options = master_df['kode_bahan'].unique().tolist()
-                        
-                        # PERBAIKAN: Menambahkan blok try-except untuk menangani ValueError
-                        try:
-                            selected_kode_index = kode_bahan_options.index(selected_row['kode_bahan'])
-                        except ValueError:
-                            st.warning(f"Kode barang '{selected_row['kode_bahan']}' tidak ditemukan di Master Barang. Data master mungkin telah dihapus.")
-                            selected_kode_index = 0
-                            
-                        edit_kode_bahan = st.selectbox("Kode barang", kode_bahan_options, index=selected_kode_index, key="edit_in_kode")
-                        
-                        filtered_colors_edit = master_df[master_df['kode_bahan'] == edit_kode_bahan]['warna'].tolist()
-                        
-                        # PERBAIKAN: Menambahkan blok try-except untuk menangani ValueError pada warna
-                        try:
-                            selected_warna_index = filtered_colors_edit.index(selected_row['warna'])
-                        except ValueError:
-                            st.warning(f"Warna '{selected_row['warna']}' untuk Kode barang yang dipilih tidak ditemukan di Master Barang.")
-                            selected_warna_index = 0
-                            
-                        edit_warna = st.selectbox("Warna", filtered_colors_edit, index=selected_warna_index, key="edit_in_warna")
-                        
-                        # PERBAIKAN: Menggunakan int() dan min_value=0
-                        stok_value = int(selected_row['stok']) if pd.notna(selected_row['stok']) else 0
-                        yard_value = float(selected_row['yard']) if pd.notna(selected_row['yard']) else 0.0
-
-                        edit_stok = st.number_input("Stok", value=stok_value, min_value=0, key="edit_in_stok")
-                        edit_yard = st.number_input("Yard", value=yard_value, min_value=0.0, key="edit_in_yard")
-                        
-                        # PERBAIKAN: Tangani nilai NaN dari kolom keterangan
-                        keterangan_value = str(selected_row['keterangan']) if pd.notna(selected_row['keterangan']) else ""
-                        edit_keterangan = st.text_area("Keterangan", value=keterangan_value, key="edit_in_ket")
-
-                        col_btn1, col_btn2 = st.columns(2)
-                        with col_btn1:
-                            if st.form_submit_button("Simpan Perubahan"):
-                                if update_barang_masuk(row_index, edit_tanggal_waktu, edit_kode_bahan, edit_warna, edit_stok, edit_yard, edit_keterangan):
-                                    st.success("Data berhasil diperbarui! ✅")
-                                    st.rerun()
-                                else:
-                                    st.error("Gagal memperbarui data.")
-                        with col_btn2:
-                            if st.form_submit_button("Hapus Data"):
-                                if delete_barang_masuk(row_index):
-                                    st.success("Data berhasil dihapus! 🗑️")
-                                    st.rerun()
-                                else:
-                                    st.error("Gagal menghapus data.")
-        else:
-            st.info("Belum ada data barang masuk.")
-
-def show_transaksi_keluar_invoice_page():
-    st.title("Transaksi Keluar (Penjualan) & Invoice 🧾")
-    st.markdown("---")
-    
-    tab_new_invoice, tab_history = st.tabs(["➕ Buat Transaksi & Invoice Baru", "📝 Riwayat Transaksi"])
-    
-    master_df = get_master_barang()
-    if master_df.empty:
-        st.warning("Belum ada master barang. Silakan tambahkan di menu Master Barang. ⚠️")
-        return
-
-    master_df['display_name'] = master_df['kode_bahan'] + ' - ' + master_df['nama_bahan'] + ' (' + master_df['warna'] + ')'
-    item_options = master_df['display_name'].tolist()
-
-    if 'cart_items' not in st.session_state:
-        st.session_state['cart_items'] = []
-    
-    with tab_new_invoice:
-        st.subheader("Formulir Transaksi Penjualan")
-
-        # Use a separate container for adding items
-        with st.container(border=True):
-            with st.form("add_item_form"):
-                col_item_select, col_add_btn = st.columns([0.8, 0.2])
-                with col_item_select:
-                    item_to_add_str = st.selectbox("Pilih Item yang Akan Dijual", item_options, key="item_add_select")
-                with col_add_btn:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    add_item_submitted = st.form_submit_button("➕ Tambah Item")
-                
-                if add_item_submitted:
-                    selected_item_data = master_df[master_df['display_name'] == item_to_add_str].iloc[0]
-                    harga_cleaned = float(selected_item_data['harga']) if pd.notna(selected_item_data['harga']) else 0.0
-                    new_item = {
-                        "kode_bahan": selected_item_data['kode_bahan'],
-                        "nama_bahan": selected_item_data['nama_bahan'],
-                        "warna": selected_item_data['warna'],
-                        "harga": harga_cleaned,
-                        "qty": 0,
-                        "yard": 0.0,
-                        "keterangan": ""
-                    }
-                    st.session_state['cart_items'].append(new_item)
-                    st.rerun()
-
-        st.subheader("Keranjang Belanja 🛒")
-        
-        # PERBAIKAN: Move delete button logic outside the form
-        if 'cart_items' in st.session_state:
-            for i, item in enumerate(st.session_state['cart_items']):
-                with st.container(border=True):
-                    col_item_display, col_delete_btn = st.columns([0.9, 0.1])
-                    
-                    with col_item_display:
-                        st.markdown(f"**Item {i+1}:** `{item['nama_bahan']} ({item['warna']})`")
-                    
-                    with col_delete_btn:
-                        if st.button("🗑️", key=f"delete_btn_{i}"):
-                            st.session_state['cart_items'].pop(i)
-                            st.rerun()
-
-        # The main transaction form
-        with st.form("new_transaction_form"):
-            customer_name = st.text_input("Nama Pelanggan", help="Wajib diisi", key="customer_name")
-            
-            total_invoice = 0
-            if 'cart_items' in st.session_state:
-                for i, item in enumerate(st.session_state['cart_items']):
-                    with st.container(border=True):
-                        st.markdown(f"**Item {i+1}:** `{item['nama_bahan']} ({item['warna']})`")
-                        stok_saat_ini = get_stock_balance(item['kode_bahan'], item['warna'])
-                        
-                        col_qty, col_yard = st.columns(2)
-                        with col_qty:
-                            min_val = 1 if stok_saat_ini > 0 else 0
-                            max_val = int(stok_saat_ini)
-                            current_qty = int(st.session_state.cart_items[i].get('qty', 0))
-                            st.session_state.cart_items[i]['qty'] = st.number_input(
-                                "Jumlah",
-                                value=st.session_state.cart_items[i]['qty'],
-                                min_value=0, # Ubah min_value dari 1 menjadi 0
-                                key=f"qty_{i}"
-                            )
-                        
-                        with col_yard:
-                            current_yard = float(st.session_state.cart_items[i].get('yard', 0.0))
-                            st.session_state.cart_items[i]['yard'] = st.number_input(
-                                "Yard",
-                                min_value=0.0,
-                                value=current_yard,
-                                key=f"yard_input_{i}"
-                            )
-                        
-                        current_keterangan = str(st.session_state.cart_items[i].get('keterangan', ''))
-                        st.session_state.cart_items[i]['keterangan'] = st.text_area(f"Keterangan (opsional)", value=current_keterangan, key=f"keterangan_{i}")
-                        
-                        current_item_total = st.session_state.cart_items[i]['qty'] * st.session_state.cart_items[i]['harga']
-                        st.session_state.cart_items[i]['total'] = current_item_total
-                        total_invoice += current_item_total
-                        
-                        st.markdown(f"**Harga Satuan:** Rp {st.session_state.cart_items[i]['harga']:,.2f}")
-                        st.markdown(f"**Total Harga Item:** Rp {current_item_total:,.2f}")
-                
-            st.markdown(f"### **Total Keseluruhan:** **Rp {total_invoice:,.2f}**")
-            
-            submitted = st.form_submit_button("💾 Simpan Transaksi & Buat Invoice")
-            if submitted:
-                if not customer_name:
-                    st.error("Nama Pelanggan wajib diisi.")
-                elif not st.session_state['cart_items'] or all(item['qty'] == 0 for item in st.session_state['cart_items']):
-                    st.error("Mohon tambahkan setidaknya satu item dengan jumlah lebih dari 0.")
-                else:
-                    new_invoice_number = generate_invoice_number()
-                    success, message = add_barang_keluar_and_invoice(new_invoice_number, customer_name, st.session_state['cart_items'])
-                    if success:
-                        st.success(f"{message} Nomor Invoice: **{new_invoice_number}** ✅")
-                        st.balloons()
-                        st.session_state['cart_items'] = [] # Reset cart
-                        st.rerun()
-                    else:
-                        st.error(message + " ❌")
-                        
-    with tab_history:
-        st.subheader("Riwayat Transaksi & Invoice")
-        invoice_df = get_invoices()
-        
-        if not invoice_df.empty:
-            # Tambahkan kolom gabungan untuk pencarian dan tampilan
-            invoice_df['display_option'] = invoice_df['invoice_number'] + ' | ' + invoice_df['tanggal_waktu'] + ' | ' + invoice_df['customer_name']
-            
-            # Tambahkan input pencarian
-            search_query = st.text_input("Cari Invoice (No. Invoice, Tanggal, atau Nama Pelanggan)", key="invoice_search_query")
-            
-            # Filter DataFrame berdasarkan kueri pencarian
-            if search_query:
-                filtered_invoices = invoice_df[
-                    invoice_df['display_option'].str.contains(search_query, case=False, na=False)
-                ]
+        # Filter UI
+        col1, col2, col3 = st.columns([2,2,2])
+        with col1:
+            q = st.text_input("Cari Judul", "")
+        with col2:
+            status_opt = ["Semua", "Approved", "Belum"] if "director_approved" in df.columns else ["Semua"]
+            status_sel = st.selectbox("Status", status_opt)
+        with col3:
+            if sop_date_col and not df.empty:
+                min_d = pd.to_datetime(df[sop_date_col]).min().date()
+                max_d = pd.to_datetime(df[sop_date_col]).max().date()
+                dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
             else:
-                filtered_invoices = invoice_df
-                
-            st.dataframe(filtered_invoices[['invoice_number', 'tanggal_waktu', 'customer_name']], use_container_width=True, hide_index=True)
-            
-            st.markdown("---")
-            
-            # Buat daftar opsi yang difilter untuk selectbox
-            invoice_options = filtered_invoices['display_option'].tolist()
-            
-            if not invoice_options:
-                st.info("Tidak ada invoice yang cocok dengan pencarian.")
-            else:
-                selected_combined_option = st.selectbox(
-                    "Pilih Invoice untuk Dilihat/Unduh",
-                    options=invoice_options,
-                    key="select_invoice_to_view"
-                )
-                
-                if selected_combined_option:
-                    # Ekstrak nomor invoice dari string yang dipilih
-                    selected_invoice_number = selected_combined_option.split(' | ')[0]
-    
-                    invoice_data = filtered_invoices[filtered_invoices['invoice_number'] == selected_invoice_number].iloc[0]
-                    invoice_items = get_invoice_items(selected_invoice_number)
-    
-                    st.subheader(f"Detail Invoice: {selected_invoice_number}")
-                    st.write(f"**Tanggal & Waktu:** {invoice_data['tanggal_waktu']}")
-                    st.write(f"**Nama Pelanggan:** {invoice_data['customer_name']}")
-    
-                    st.dataframe(invoice_items, use_container_width=True, hide_index=True)
-    
-                    pdf_content = generate_invoice_pdf({
-                        'No Invoice': invoice_data['invoice_number'],
-                        'Tanggal & Waktu': invoice_data['tanggal_waktu'],
-                        'Nama Pelanggan': invoice_data['customer_name']
-                    }, invoice_items)
-    
-                    st.download_button(
-                        label="Unduh PDF Invoice",
-                        data=pdf_content,
-                        file_name=f"invoice_{selected_invoice_number}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
+                dr = None
+
+        dff = df.copy()
+        if q:
+            dff = dff[dff["judul"].astype(str).str.contains(q, case=False, na=False)]
+        if status_sel != "Semua" and "director_approved" in dff.columns:
+            dff = dff[dff["director_approved"] == (1 if status_sel == "Approved" else 0)]
+        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and sop_date_col and sop_date_col in dff.columns:
+            s, e = dr
+            dff = dff[(pd.to_datetime(dff[sop_date_col]) >= pd.to_datetime(s)) & (pd.to_datetime(dff[sop_date_col]) <= pd.to_datetime(e))]
+
+        # Tampilan tabel ramah pengguna
+        if not dff.empty:
+            show = dff.copy()
+            if "director_approved" in show.columns:
+                show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
+            cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
+            st.dataframe(show[cols_show], use_container_width=True)
+            # Download CSV
+            st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode("utf-8"), file_name="daftar_sop.csv")
+            # Download file per item (opsional pilih)
+            if "id" in show.columns and "file_name" in show.columns:
+                opsi = {f"{r['judul']} — {r.get(sop_date_col, '')} ({r['file_name'] or '-'})": r['id'] for _, r in show.iterrows()}
+                if opsi:
+                    pilih = st.selectbox("Unduh file SOP", [""] + list(opsi.keys()))
+                    if pilih:
+                        sid = opsi[pilih]
+                        row = pd.read_sql_query("SELECT file_name, file_url FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
+                        url = row.get("file_url") if "file_url" in row.index else None
+                        if row["file_name"] and url:
+                            st.markdown(f"<a href='{url}' target='_blank'>⬇️ Download {row['file_name']}</a>", unsafe_allow_html=True)
         else:
-            st.info("Belum ada data transaksi keluar.")
+            st.info("Belum ada SOP.")
 
-def show_monitoring_stok():
-    st.title("Monitoring Stok 📊")
-    st.markdown("---")
-    
-    st.subheader("Stok Saat Ini")
-    master_df = get_master_barang()
-    if not master_df.empty:
-        master_df['Stok Saat Ini'] = master_df.apply(lambda row: get_stock_balance(row['kode_bahan'], row['warna']), axis=1)
-        df_display = master_df[['kode_bahan', 'nama_bahan', 'warna', 'Stok Saat Ini']].copy()
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
-    else:
-        st.warning("Belum ada master barang.")
-
-    st.markdown("---")
-    st.header("Rekam Jejak Stok (In & Out)")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Tanggal Mulai", value=datetime.now().date())
-    with col2:
-        end_date = st.date_input("Tanggal Selesai", value=datetime.now().date())
-        
-    if st.button("Tampilkan Rekam Jejak"):
-        records_df = get_in_out_records(start_date, end_date)
-        if not records_df.empty:
-            st.dataframe(records_df, use_container_width=True, hide_index=True)
+        # Rekap Bulanan SOP
+        st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        if not dff.empty and sop_date_col and sop_date_col in dff.columns:
+            df_month = dff[dff[sop_date_col].astype(str).str[:7] == this_month]
         else:
-            st.info("Tidak ada catatan stok masuk atau keluar pada rentang tanggal tersebut.")
+            df_month = pd.DataFrame()
+        st.write(f"Total SOP/Kebijakan bulan ini: {len(df_month)}")
 
-    # Bagian baru untuk fitur backup data
-    st.markdown("---")
-    st.header("Opsi Backup Data 💾")
-    st.info("Klik tombol di bawah ini untuk membuat dan mengunduh semua data dari Google Sheets sebagai satu file Excel.")
-    
-    if st.button("Buat & Unduh Backup Data Lengkap"):
-        with st.spinner('Membuat file backup Excel...'):
-            excel_data = create_excel_backup()
-        
-        if excel_data:
-            st.success("File backup berhasil dibuat! ✅")
-            st.download_button(
-                label="Unduh File Backup Excel",
-                data=excel_data,
-                file_name=f"backup_data_bka_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    # --- Tab 3: Approval Director ---
+    with tab_approve:
+        if user["role"] not in ["director", "superuser"]:
+            st.info("Hanya Director/Superuser yang dapat meng-approve.")
+        elif "director_approved" not in sop_cols:
+            st.info("Kolom director_approved belum tersedia pada tabel SOP. Approval tidak bisa dilakukan.")
+        else:
+            df_pend = pd.read_sql_query(
+                f"SELECT id, judul" + (f", {sop_date_col}" if sop_date_col else "") + ", file_name FROM sop WHERE director_approved=0 ORDER BY " + (sop_date_col or "id") + " DESC",
+                conn
             )
-        else:
-            st.error("Gagal membuat file backup.")
-
-def show_payroll_page():
-    st.title("Sistem Penggajian Karyawan 💰")
-    st.markdown("---")
-    
-    tab_master, tab_process, tab_history = st.tabs(["👥 Master Karyawan", "💸 Proses Penggajian", "📝 Riwayat Penggajian"])
-
-    with tab_master:
-        st.subheader("Data Master Karyawan")
-        
-        with st.expander("➕ Tambah Karyawan Baru", expanded=False):
-            with st.form("add_employee_form"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    nama = st.text_input("Nama Karyawan")
-                with col2:
-                    bagian = st.text_input("Bagian")
-                # Mengubah label untuk mencerminkan gaji per hari
-                gaji = st.number_input("Gaji Pokok per Hari", min_value=0.0)
-                
-                submitted = st.form_submit_button("Tambah Karyawan")
-                if submitted:
-                    if nama and bagian and gaji > 0:
-                        if add_employee(nama, bagian, gaji):
-                            st.success(f"Karyawan {nama} berhasil ditambahkan. ✅")
+            if df_pend.empty:
+                st.success("Tidak ada item menunggu approval.")
+            else:
+                for _, row in df_pend.iterrows():
+                    title = f"{row['judul']}" + (f" | {row[sop_date_col]}" if sop_date_col and row.get(sop_date_col) else "")
+                    with st.expander(title):
+                        st.write(f"File: {row.get('file_name') or '-'}")
+                        note = st.text_area("Catatan Director (opsional)", key=f"sop_note_{row['id']}")
+                        if st.button("✅ Approve", key=f"sop_approve_{row['id']}"):
+                            if "memo" in sop_cols:
+                                cur.execute("UPDATE sop SET director_approved=1, memo=? WHERE id=?", (note, row['id']))
+                            else:
+                                cur.execute("UPDATE sop SET director_approved=1 WHERE id=?", (row['id'],))
+                            conn.commit()
+                            try:
+                                audit_log("sop", "director_approval", target=row['id'], details=f"note={note}")
+                            except Exception:
+                                pass
+                            st.success("SOP approved.")
                             st.rerun()
-                        else:
-                            st.error("Gagal menambahkan karyawan. Nama karyawan mungkin sudah ada.")
+    # Force create default superuser if not exists (guaranteed on first run)
+    cur.execute("SELECT COUNT(*) as c FROM users")
+    c = cur.fetchone()["c"] if cur.description else 0
+    if c == 0:
+        pw = hash_password("superpassword")
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("superuser@local", "Superuser", "superuser", pw, "active", now))
+        conn.commit()
+    # Surat Masuk
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS surat_masuk (
+        id TEXT PRIMARY KEY,
+        indeks TEXT,
+        nomor TEXT,
+        pengirim TEXT,
+        tanggal TEXT,
+        perihal TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        status TEXT,
+        follow_up TEXT
+    )
+    """)
+    # Surat Keluar
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS surat_keluar (
+        id TEXT PRIMARY KEY,
+        indeks TEXT,
+        nomor TEXT,
+        tanggal TEXT,
+        ditujukan TEXT,
+        perihal TEXT,
+        lampiran_blob BLOB,
+        lampiran_name TEXT,
+        pengirim TEXT,
+        draft_blob BLOB,
+        draft_name TEXT,
+        status TEXT,
+        follow_up TEXT,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        final_blob BLOB,
+        final_name TEXT
+    )
+    """)
+    # MoU
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mou (
+        id TEXT PRIMARY KEY,
+        nomor TEXT,
+        nama TEXT,
+        pihak TEXT,
+        jenis TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        divisi TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        board_note TEXT,
+        board_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        final_blob BLOB,
+        final_name TEXT
+    )
+    """)
+    # Cash Advance
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_advance (
+        id TEXT PRIMARY KEY,
+        divisi TEXT,
+        items_json TEXT,
+        totals REAL,
+        tanggal TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # PMR
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pmr (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        file1_blob BLOB,
+        file1_name TEXT,
+        file2_blob BLOB,
+        file2_name TEXT,
+        bulan TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        tanggal_submit TEXT
+    )
+    """)
+    # Cuti
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cuti (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        durasi INTEGER,
+        kuota_tahunan INTEGER,
+        cuti_terpakai INTEGER,
+        sisa_kuota INTEGER,
+        status TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # Flex
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS flex (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        tanggal TEXT,
+        jam_mulai TEXT,
+        jam_selesai TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # Delegasi
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegasi (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        deskripsi TEXT,
+        pic TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        status TEXT,
+        tanggal_update TEXT
+    )
+    """)
+    # Mobil
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mobil (
+        id TEXT PRIMARY KEY,
+        nama_pengguna TEXT,
+        divisi TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        tujuan TEXT,
+        kendaraan TEXT,
+        driver TEXT,
+        status TEXT,
+        finance_note TEXT
+    )
+    """)
+    # Calendar
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS calendar (
+        id TEXT PRIMARY KEY,
+        jenis TEXT,
+        judul TEXT,
+        nama_divisi TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        deskripsi TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        is_holiday INTEGER DEFAULT 0,
+        sumber TEXT,
+        ditetapkan_oleh TEXT,
+        tanggal_penetapan TEXT
+    )
+    """)
+    # Public Holidays
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS public_holidays (
+        tahun INTEGER,
+        tanggal TEXT,
+        nama TEXT,
+        keterangan TEXT,
+        ditetapkan_oleh TEXT,
+        tanggal_penetapan TEXT
+    )
+    """)
+    # SOP
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sop (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        tanggal_upload TEXT
+    )
+    """)
+    # Notulen
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS notulen (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        tanggal_upload TEXT
+    )
+    """)
+    # File Log
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS file_log (
+        id TEXT PRIMARY KEY,
+        modul TEXT,
+        file_name TEXT,
+        versi INTEGER,
+        deleted_by TEXT,
+        tanggal_hapus TEXT,
+        alasan TEXT
+    )
+    """)
+    # Migration: ensure optional columns exist for richer audit
+    try:
+        cur.execute("PRAGMA table_info(file_log)")
+        fl_cols = [row[1] for row in cur.fetchall()]
+        # add uploaded_by
+        if "uploaded_by" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
+        # add tanggal_upload
+        if "tanggal_upload" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
+        # add action
+        if "action" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+DB_PATH = "office_ops.db"
+SALT = "office_ops_salt_v1"
+
+# --- Password hashing utility ---
+def hash_password(password: str) -> str:
+    import hashlib
+    salted = (password + SALT).encode('utf-8')
+    return hashlib.sha256(salted).hexdigest()
+
+icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
+# --- Global CSS for modern look ---
+st.markdown(
+    """
+    <style>
+    .main .block-container {padding-top: 2rem;}
+    .stButton>button, .stDownloadButton>button {
+        background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+        color: white; border: none; border-radius: 6px; font-weight: 600;
+        box-shadow: 0 2px 8px rgba(80,140,255,0.08);
+        margin-bottom: 6px;
+    }
+    .stButton>button:hover, .stDownloadButton>button:hover {
+        background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
+        color: #fff;
+    }
+    .stDataFrame, .stTable {background: #f8fbff; border-radius: 8px;}
+    .stExpanderHeader {font-weight: 700; color: #2a5d9f;}
+    .stTextInput>div>input, .stTextArea>div>textarea {
+        border-radius: 6px; border: 1px solid #b3d1ff;
+    }
+    .stFileUploader>div>div {background: #eaf4ff; border-radius: 6px;}
+    .stMetric {background: #eaf4ff; border-radius: 8px;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# Pastikan pemanggilan st.markdown(table_html, unsafe_allow_html=True) dilakukan di bagian yang tepat pada kode Daftar Inventaris
+
+# -------------------------
+# Utilities
+# -------------------------
+# --- Database connection utility --- 
+def format_datetime_wib(dtstr):
+    try:
+        dt_utc = datetime.fromisoformat(dtstr)
+        dt_wib = dt_utc + timedelta(hours=7)
+        return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
+    except Exception:
+        return dtstr
+class _AuditCursor:
+    def __init__(self, outer_conn, inner_cursor):
+        self._outer_conn = outer_conn
+        self._c = inner_cursor
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+    def execute(self, sql, params=()):
+        result = self._c.execute(sql, params)
+        try:
+            self._maybe_log(sql, params)
+        except Exception:
+            pass
+        return result
+    def executemany(self, sql, seq_of_params):
+        result = self._c.executemany(sql, seq_of_params)
+        try:
+            for p in seq_of_params:
+                self._maybe_log(sql, p)
+        except Exception:
+            pass
+        return result
+    def _maybe_log(self, sql, params):
+        # Guard or non-DML: skip
+        if st.session_state.get("__audit_disabled"):
+            return
+        sql_l = (sql or "").strip().lower()
+        op = None
+        table = None
+        target_id = None
+        if sql_l.startswith("insert into"):
+            op = "create"
+            try:
+                # parse table and col list
+                after_into = sql_l.split("insert into",1)[1].strip()
+                table = after_into.split("(",1)[0].strip().split()[0]
+                if "(" in after_into:
+                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
+                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
+                    if "id" in cols:
+                        idx = cols.index("id")
+                        if isinstance(params, (list, tuple)) and len(params) > idx:
+                            target_id = params[idx]
+            except Exception:
+                pass
+        elif sql_l.startswith("update"):
+            op = "update"
+            try:
+                table = sql_l.split()[1]
+                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
+                    # assume last param is id
+                    if isinstance(params, (list, tuple)) and len(params) >= 1:
+                        target_id = params[-1]
+            except Exception:
+                pass
+        elif sql_l.startswith("delete from"):
+            op = "delete"
+            try:
+                table = sql_l.split()[2]
+                # assume last param is id
+                if isinstance(params, (list, tuple)) and len(params) >= 1:
+                    target_id = params[-1]
+            except Exception:
+                pass
+        # Only log DML and skip logging file_log table itself
+        if op and table and table != "file_log":
+            try:
+                audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
+            except Exception:
+                pass
+            # Sync to Google Sheets backend
+            try:
+                if op in ("create", "update"):
+                    _sync_sqlite_row_to_sheet(table, target_id)
+                elif op == "delete" and target_id:
+                    _sheet_delete(table, str(target_id))
+            except Exception:
+                pass
+
+class _AuditConnection:
+    def __init__(self, inner_conn: sqlite3.Connection):
+        self._conn = inner_conn
+        self.row_factory = inner_conn.row_factory
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+    def cursor(self, *args, **kwargs):
+        return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
+
+def get_db() -> sqlite3.Connection:
+    db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    # If audit is disabled (e.g., during migrations or within audit_log), return raw connection
+    if st.session_state.get("__audit_disabled"):
+        return conn
+    return _AuditConnection(conn)
+def ensure_db():
+    """Ensure minimum required tables/columns exist so modules load safely.
+    This lightweight bootstrap focuses on Users, Calendar, SOP, Notulen, and File Log.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Users
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+                email TEXT UNIQUE NOT NULL,
+                full_name TEXT,
+                role TEXT,
+                password_hash TEXT,
+                status TEXT,
+                created_at TEXT,
+                last_login TEXT
+            )
+            """
+        )
+        # Calendar tables
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calendar (
+                id TEXT PRIMARY KEY,
+                jenis TEXT,
+                judul TEXT,
+                nama_divisi TEXT,
+                tgl_mulai TEXT,
+                tgl_selesai TEXT,
+                deskripsi TEXT,
+                file_blob BLOB,
+                file_name TEXT,
+                is_holiday INTEGER DEFAULT 0,
+                sumber TEXT,
+                ditetapkan_oleh TEXT,
+                tanggal_penetapan TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public_holidays (
+                tahun INTEGER,
+                tanggal TEXT,
+                nama TEXT,
+                keterangan TEXT,
+                ditetapkan_oleh TEXT,
+                tanggal_penetapan TEXT
+            )
+            """
+        )
+        # SOP and Notulen (minimal compatible schemas)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sop (
+                id TEXT PRIMARY KEY,
+                judul TEXT,
+                file_blob BLOB,
+                file_name TEXT,
+                tanggal_upload TEXT,
+                director_approved INTEGER DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notulen (
+                id TEXT PRIMARY KEY,
+                judul TEXT,
+                file_blob BLOB,
+                file_name TEXT,
+                tanggal_upload TEXT,
+                uploaded_by TEXT,
+                deadline TEXT,
+                director_note TEXT,
+                director_approved INTEGER DEFAULT 0
+            )
+            """
+        )
+        # File Log for audit
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_log (
+                id TEXT PRIMARY KEY,
+                modul TEXT,
+                file_name TEXT,
+                versi INTEGER,
+                deleted_by TEXT,
+                tanggal_hapus TEXT,
+                alasan TEXT
+            )
+            """
+        )
+        cur.execute("PRAGMA table_info(file_log)")
+        fl_cols = {row[1] for row in cur.fetchall()}
+        if "uploaded_by" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
+        if "tanggal_upload" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
+        if "action" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
+        conn.commit()
+    except Exception:
+        pass
+def log_file_delete(modul, file_name, deleted_by, alasan=None):
+    conn = get_db()
+    cur = conn.cursor()
+    log_id = gen_id("log")
+    now = datetime.utcnow().isoformat()
+    cur.execute("INSERT INTO file_log (id, modul, file_name, versi, deleted_by, tanggal_hapus, alasan) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (log_id, modul, file_name, 1, deleted_by, now, alasan or ""))
+    conn.commit()
+    
+def audit_log(modul: str, action: str, target=None, details=None, actor=None):
+    """Write an audit log entry to file_log.
+    - modul: name of module (e.g., 'auth', 'cuti', 'delegasi')
+    - action: verb (e.g., 'login', 'logout', 'create', 'update', 'delete', 'approve', 'review')
+    - target: entity id/name being acted on
+    - details: optional human-readable info
+    - actor: email/name of actor; defaults to current user's email if available
+    """
+    try:
+        # prevent recursive logging
+        st.session_state["__audit_disabled"] = True
+        db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
+        conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+        cur = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        # Resolve actor from session if not provided
+        if not actor:
+            u = st.session_state.get("user")
+            actor = (u.get("email") or u.get("full_name")) if u else "-"
+        # Check available columns
+        cur.execute("PRAGMA table_info(file_log)")
+        cols = {row[1] for row in cur.fetchall()}
+        # Build insert dynamically
+        data = {
+            "id": gen_id("log"),
+            "modul": modul,
+            "file_name": target or "",
+            "versi": 1,
+            "uploaded_by": actor,
+            "tanggal_upload": now,
+            "alasan": (details or ""),
+            "action": action,
+        }
+        insert_cols = [c for c in ["id","modul","file_name","versi",
+                                    "uploaded_by" if "uploaded_by" in cols else None,
+                                    "tanggal_upload" if "tanggal_upload" in cols else None,
+                                    "alasan",
+                                    "action" if "action" in cols else None] if c]
+        placeholders = ", ".join(["?" for _ in insert_cols])
+        cur.execute(f"INSERT INTO file_log ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                    [data[c] for c in insert_cols])
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            del st.session_state["__audit_disabled"]
+        except Exception:
+            pass
+
+
+def to_blob(file_bytes: bytes) -> bytes:
+    # store base64 bytes (text) to BLOB, so we keep as bytes
+    return base64.b64encode(file_bytes)
+
+def from_blob(blob: bytes) -> bytes:
+    if blob is None:
+        return None
+    try:
+        return base64.b64decode(blob)
+    except Exception:
+        return blob
+
+def gen_id(prefix="id"):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+# -------------------------
+# Auth & Session
+# -------------------------
+def register_user(email, full_name, password):
+    conn = get_db()
+    cur = conn.cursor()
+    pw = hash_password(password)
+    now = datetime.utcnow().isoformat()
+    try:
+        cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (email, full_name, "staff", pw, "pending", now))
+        conn.commit()
+        return True, "Registered — menunggu approval superuser."
+    except sqlite3.IntegrityError:
+        return False, "Email sudah terdaftar."
+
+def login_user(email, password):
+    conn = get_db()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    if not row:
+        alasan = "User tidak ditemukan."
+        audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+        return False, alasan
+    if row["status"] != "active":
+        alasan = f"User status: {row['status']}. Tidak bisa login."
+        audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+        return False, alasan
+    if row["password_hash"] == hash_password(password):
+        # set session
+        st.session_state["user"] = {"id": row["id"], "email": row["email"], "role": row["role"], "full_name": row["full_name"]}
+        cur.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
+        audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
+        conn.commit()
+        return True, "Login sukses."
+    else:
+        alasan = "Password salah."
+        audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+        return False, alasan
+
+def logout():
+    # capture actor before clearing session
+    actor_email = None
+    if "user" in st.session_state and st.session_state["user"]:
+        actor_email = st.session_state["user"].get("email") or st.session_state["user"].get("full_name")
+    audit_log("auth", "logout", target=actor_email or "-", details="Logout", actor=actor_email)
+    for k in ("user",):
+        if k in st.session_state:
+            del st.session_state[k]
+
+def get_current_user():
+    return st.session_state.get("user")
+
+# -------------------------
+# Simple decorators / checks
+# -------------------------
+def require_login():
+    user = get_current_user()
+    if not user:
+        st.warning("Silakan login dulu.")
+        st.stop()
+    return user
+
+def require_role(roles):
+    user = require_login()
+    if user["role"] not in roles:
+        st.error(f"Akses ditolak. Diperlukan role: {roles}")
+        st.stop()
+    return user
+
+# -------------------------
+# UI Components: Authentication
+# -------------------------
+def auth_sidebar():
+    st.sidebar.title("Authentication")
+    user = get_current_user()
+    if user:
+        # Ambil info user lebih lengkap dari DB
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT email, full_name, role, status, last_login FROM users WHERE id = ?", (user["id"],))
+        u = cur.fetchone()
+        if u:
+            st.sidebar.markdown("""
+                <b>Email:</b> {email}<br>
+                <b>Role:</b> {role}<br>
+                <b>Status:</b> {status}<br>
+                <b>Last Login:</b> {last_login}
+                </div>
+            """.format(
+                full_name=u["full_name"],
+                email=u["email"],
+                role=u["role"],
+                status=u["status"],
+                last_login=u["last_login"] or "-"
+            ), unsafe_allow_html=True)
+        else:
+            st.sidebar.write(f"Logged in: **{user['full_name']}** ({user['role']})")
+    else:
+        tabs = st.sidebar.tabs(["Login", "Register"])
+        with tabs[0]:
+            st.subheader("Login")
+            with st.form("login_form_sidebar"):
+                email_login = st.text_input("Email", key="login_email")
+                pwd_login = st.text_input("Password", type="password", key="login_pwd")
+                submit_login = st.form_submit_button("Login")
+                if submit_login:
+                    ok, msg = login_user(email_login.strip().lower(), pwd_login)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
                     else:
-                        st.error("Semua field wajib diisi. ❌")
+                        st.error(msg)
+        with tabs[1]:
+            st.subheader("Register")
+            with st.form("register_form_sidebar"):
+                email_reg = st.text_input("Email", key="register_email")
+                name_reg = st.text_input("Nama Lengkap", key="register_name")
+                pwd_reg = st.text_input("Password", type="password", key="register_pwd")
+                submit_reg = st.form_submit_button("Register")
+                if submit_reg:
+                    if not (email_reg and name_reg and pwd_reg):
+                        st.error("Lengkapi semua field.")
+                    else:
+                        ok, msg = register_user(email_reg.strip().lower(), name_reg.strip(), pwd_reg)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+# -------------------------
+# Admin (superuser) panel
+# -------------------------
+def superuser_panel():
+    require_role(["superuser"])
+    st.header("Superuser — Manajemen User & Approval")
+    st.subheader("Semua user")
+    conn = get_db()
+    cur = conn.cursor()
+    df = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn)
+    st.dataframe(df)
+
+    tab1, tab2 = st.tabs(["🕒 User Baru Menunggu Approval", "👥 Semua User"])
+
+    with tab1:
+        st.subheader("User baru menunggu approval")
+        conn1 = get_db()
+        cur1 = conn1.cursor()
+        cur1.execute("SELECT id,email,full_name,role,status,created_at FROM users WHERE status = 'pending'")
+        pendings = cur1.fetchall()
+        if pendings:
+            for idx, p in enumerate(pendings):
+                with st.expander(f"{p['full_name']} — {p['email']}"):
+                    st.markdown(f'''
+<div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);">
+<b>Nama:</b> {p['full_name']}<br>
+<b>Email:</b> {p['email']}<br>
+<b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br>
+<b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br>
+<b>Tanggal Daftar:</b> {p['created_at'][:10]}<br>
+<b>User ID:</b> <code>{p['id']}</code>
+</div>
+''', unsafe_allow_html=True)
+                    # Action buttons for this user
+                    col1, col2, col3 = st.columns([1,1,2])
+                    if 'superuser_panel_action' not in st.session_state:
+                        st.session_state['superuser_panel_action'] = {}
+                    with col1:
+                        if st.button("Approve", key=f"approve_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET status='active' WHERE id = ?", (p['id'],))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.success("User diapprove.")
+                            st.rerun()
+                    with col2:
+                        if st.button("Reject", key=f"reject_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET status='inactive' WHERE id = ?", (p['id'],))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.info("User di-set inactive.")
+                            st.rerun()
+                    with col3:
+                        new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p['role']), key=f"role_{p['id']}_card_{idx}")
+                        if st.button("Update Role", key=f"setrole_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET role=? WHERE id=?", (new_role, p['id']))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.success("Role diupdate.")
+                            st.rerun()
+        else:
+            st.info("Tidak ada user pending.")
+        conn1.close()
+
+    with tab2:
+        st.subheader("Semua user")
+        conn2 = get_db()
+        df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
+        st.dataframe(df2, use_container_width=True)
+        conn2.close()
+    # (No form here, only one form with key 'admin_change' exists below)
+
+    # Only one form, outside the tabs
+    st.markdown("---")
+    st.subheader("Aksi User Management")
+    # Fetch all users for dropdown
+    conn3 = get_db()
+    cur3 = conn3.cursor()
+    cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC")
+    user_rows = cur3.fetchall()
+    conn3.close()
+    user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
+    user_id_map = {f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}": row['id'] for row in user_rows}
+    with st.form("admin_change"):
+        selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
+        uid = user_id_map[selected_user] if selected_user else ""
+        newrole = st.selectbox("Pilih role baru", ["staff","finance","director","superuser"])
+        newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
+        action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"])
+        submit = st.form_submit_button("Apply")
+        if submit:
+            conn3 = get_db()
+            cur3 = conn3.cursor()
+            if not uid:
+                st.error("Masukkan user id.")
+            else:
+                if action == "Update User":
+                    if newpw:
+                        cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
+                    else:
+                        cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
+                    conn3.commit()
+                    st.success("User updated.")
+                elif action == "Approve":
+                    cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,))
+                    conn3.commit()
+                    st.success("User diapprove.")
+                elif action == "Reject":
+                    cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,))
+                    conn3.commit()
+                    st.info("User di-set inactive.")
+            conn3.close()
+
+        # (No form here, only one form with key 'admin_change' exists below)
+
+# -------------------------
+# Common helpers for modules
+# -------------------------
+def upload_file_and_store(file_uploader_obj):
+    """Upload to Google Drive and return (blob,name,size).
+    For Drive metadata, call get_last_upload_meta() after this.
+    Blob is empty to avoid DB bloat; use file_url for downloads.
+    """
+    uploaded = file_uploader_obj
+    if uploaded is None:
+        return None, None, None
+    raw = uploaded.read()
+    name = uploaded.name
+    # Upload to Drive
+    drive_info = _drive_upload(raw, name)
+    file_id = drive_info.get("file_id")
+    file_url = drive_info.get("webContentLink") or drive_info.get("webViewLink")
+    # Audit trail log upload
+    try:
+        user = get_current_user()
+        conn = get_db()
+        cur = conn.cursor()
+        log_id = gen_id("log")
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (log_id, "upload", name, 1, (user.get("full_name") if user else "-"), now, "upload"))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    # Stash meta for caller retrieval
+    st.session_state["__last_upload_meta"] = {"file_id": file_id, "file_url": file_url}
+    # Return empty blob to avoid DB bloat; callers should store name + id/url
+    return b"", name, len(raw)
+
+def get_last_upload_meta() -> Dict[str, str]:
+    return st.session_state.get("__last_upload_meta", {})
+
+def show_file_download(blob, filename, file_url: str = ""):
+    # Prefer Drive link if available
+    if file_url:
+        st.markdown(f"<a href='{file_url}' target='_blank'>Download {filename}</a>", unsafe_allow_html=True)
+    else:
+        data = from_blob(blob)
+        if data:
+            b64 = base64.b64encode(data).decode()
+            href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">Download {filename}</a>'
+            st.markdown(href, unsafe_allow_html=True)
+        else:
+            # Try to find in Drive by filename
+            info = _drive_find_file_by_name(filename)
+            link = info.get("webContentLink") or info.get("webViewLink")
+            if link:
+                st.markdown(f"<a href='{link}' target='_blank'>Download {filename}</a>", unsafe_allow_html=True)
+
+def _initial_full_sync_to_sheets():
+    # Sync essential tables to Sheets if not synced yet
+    if st.session_state.get("__synced_once"):
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Enumerate tables we care about
+        tables = [
+            "users","sop","notulen","surat_masuk","surat_keluar","mou","cash_advance","pmr","cuti","flex","delegasi","mobil","calendar","public_holidays","inventory"
+        ]
+        for t in tables:
+            try:
+                df = pd.read_sql_query(f"SELECT * FROM {t}", conn)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            cols = list(df.columns)
+            _ensure_worksheet(t, cols)
+            for _, r in df.iterrows():
+                row = {c: r[c] for c in cols}
+                for c in list(row.keys()):
+                    if isinstance(row[c], (bytes, bytearray)):
+                        row[c] = ""
+                _sheet_upsert(t, row, key="id" if "id" in cols else cols[0])
+        st.session_state["__synced_once"] = True
+    except Exception:
+        pass
+
+def _hydrate_sqlite_from_sheets():
+    gc, sh = _gs_client_and_sheet()
+    if not sh:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # Worksheets present
+        try:
+            worksheets = sh.worksheets()
+        except Exception:
+            worksheets = []
+        for ws in worksheets:
+            table = ws.title
+            # Only attempt if table exists and is empty
+            try:
+                cur.execute(f"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+                if not cur.fetchone():
+                    continue
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                if cur.fetchone()[0] > 0:
+                    continue
+            except Exception:
+                continue
+            # Read rows
+            try:
+                values = ws.get_all_values()
+            except Exception:
+                continue
+            if not values:
+                continue
+            headers = [h.strip() for h in (values[0] if values else [])]
+            if not headers:
+                continue
+            # Existing DB columns
+            try:
+                cur.execute(f"PRAGMA table_info({table})")
+                db_cols = [r[1] for r in cur.fetchall()]
+            except Exception:
+                continue
+            common = [c for c in headers if c in db_cols]
+            if not common:
+                continue
+            placeholders = ",".join(["?" for _ in common])
+            sql = f"INSERT INTO {table} ({', '.join(common)}) VALUES ({placeholders})"
+            # iterate data rows
+            for row in values[1:]:
+                data = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+                params = [data.get(c, "") for c in common]
+                try:
+                    cur.execute(sql, params)
+                except Exception:
+                    pass
+        conn.commit()
+    except Exception:
+        pass
+
+# -------------------------
+# Modules Implementation (concise)
+# -------------------------
+def inventory_module():
+    # Prepare monthly rekap at the top
+    user = require_login()
+    conn = get_db()
+    cur = conn.cursor()
+    this_month = date.today().strftime("%Y-%m")
+    df_month = pd.read_sql_query(f"SELECT * FROM inventory WHERE substr(updated_at,1,7)=?", conn, params=(this_month,))
+    # --- UI with Tabs (always show tabs, even if df_month is empty) ---
+    tab_labels = []
+    tab_contents = []
+    if user["role"] in ["staff", "superuser"]:
+        st.markdown("# 📦 Inventory")
+        tab_labels.append("➕ Tambah Barang")
+        def staff_tab():
+            with st.form("inv_add"):
+                name = st.text_input("Nama Barang")
+                keterangan_opsi = st.selectbox("Keterangan Tambahan", ["", "dijual", "rusak"], index=0)
+                loc = st.text_input("Tempat Barang")
+                status = st.selectbox("Status", ["Tersedia","Dipinjam","Rusak","Dijual"])
+                # PIC dihapus
+                f = st.file_uploader("Lampiran (opsional)")
+                submitted = st.form_submit_button("Simpan (draft)")
+                if submitted:
+                    if not name:
+                        st.warning("Nama barang wajib diisi.")
+                    else:
+                        full_nama = name
+                        if keterangan_opsi:
+                            full_nama += f" ({keterangan_opsi})"
+                        iid = gen_id("inv")
+                        now = datetime.utcnow().isoformat()
+                        blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
+                        # PIC dihapus, set kosong
+                        pic = ""
+                        cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (iid, full_nama, loc, status, pic, now, '', 0, '', 0, blob, fname))
+                        # Store Drive metadata if available
+                        if f:
+                            meta = get_last_upload_meta()
+                            try:
+                                cur.execute("ALTER TABLE inventory ADD COLUMN file_id TEXT")
+                            except Exception:
+                                pass
+                            try:
+                                cur.execute("ALTER TABLE inventory ADD COLUMN file_url TEXT")
+                            except Exception:
+                                pass
+                            try:
+                                cur.execute("UPDATE inventory SET file_id=?, file_url=? WHERE id=?", (meta.get("file_id"), meta.get("file_url"), iid))
+                            except Exception:
+                                pass
+                        conn.commit()
+                        try:
+                            audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
+                        except Exception:
+                            pass
+                        st.success("Item disimpan sebagai draft. Menunggu review Finance.")
+        tab_contents.append(staff_tab)
+    if user["role"] in ["finance", "superuser"]:
+        tab_labels.append("💰 Review Finance")
+        def finance_tab():
+            st.info("Approve item yang sudah diinput staf.")
+            cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
+            rows = cur.fetchall()
+            for idx, r in enumerate(rows):
+                with st.container():
+                    st.markdown(f"""
+<div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
+<b>📦 {r['name']}</b> <span style='color:#888;'>(ID: {r['id']})</span><br>
+<b>Lokasi:</b> {r['location']}<br>
+<b>Status:</b> {r['status']}<br>
+<b>Penanggung Jawab:</b> {r['pic']}<br>
+<b>Terakhir Update:</b> {r['updated_at']}<br>
+""", unsafe_allow_html=True)
+                    # Download file jika ada, but check for missing keys
+                    file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
+                    file_name = r['file_name'] if 'file_name' in r.keys() else None
+                    if file_blob and file_name:
+                        show_file_download(file_blob, file_name)
+                    st.markdown("**Catatan Finance:**")
+                    note = st.text_area("Tulis catatan atau alasan jika perlu", value=r["finance_note"] or "", key=f"fin_note_{r['id']}_finance_{idx}")
+                    colf1, colf2 = st.columns([1,2])
+                    with colf1:
+                        if st.button("🔎 Review", key=f"ap_fin_{r['id']}_finance_{idx}"):
+                            cur.execute("UPDATE inventory SET finance_note=?, finance_approved=1 WHERE id=?", (note, r["id"]))
+                            conn.commit()
+                            try:
+                                audit_log("inventory", "finance_review", target=r["id"], details=note)
+                            except Exception:
+                                pass
+                            st.success("Finance reviewed. Menunggu persetujuan Director.")
+                    with colf2:
+                        st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
+        tab_contents.append(finance_tab)
+    if user["role"] in ["director", "superuser"]:
+        tab_labels.append("✅ Approval Director")
+        def director_tab():
+            st.info("Approve/Tolak item yang sudah di-approve Finance.")
+            cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0")
+            rows = cur.fetchall()
+            for idx, r in enumerate(rows):
+                updated_str = format_datetime_wib(r['updated_at'])
+                with st.expander(f"[Menunggu Approval Director] {r['name']} ({r['id']})"):
+                    st.markdown(f"""
+                    <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
+                        <b>Nama:</b> {r['name']}<br>
+                        <b>ID:</b> {r['id']}<br>
+                        <b>Lokasi:</b> {r['location']}<br>
+                        <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r['status']}</span><br>
+                        <b>PIC:</b> {r['pic']}<br>
+                        <b>Update Terakhir:</b> {updated_str}<br>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    # Download file jika ada
+                    if r['file_blob'] and r['file_name']:
+                        show_file_download(r['file_blob'], r['file_name'])
+                    st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
+                    note2 = st.text_area("", value=r["director_note"] or "", key=f"dir_note_{r['id']}_director_{idx}", placeholder="Tulis catatan atau alasan jika perlu...", height=80)
+                    colA, colB = st.columns([1,1])
+                    with colA:
+                        if st.button("✅ Approve", key=f"ap_dir_{r['id']}_director_{idx}"):
+                            cur.execute("UPDATE inventory SET director_note=?, director_approved=1 WHERE id=?", (note2, r["id"]))
+                            conn.commit()
+                            try:
+                                audit_log("inventory", "director_approval", target=r["id"], details=f"approve=1; note={note2}")
+                            except Exception:
+                                pass
+                            st.success("Item telah di-approve Director.")
+                    with colB:
+                        if st.button("❌ Tolak", key=f"reject_dir_{r['id']}_director_{idx}"):
+                            cur.execute("UPDATE inventory SET director_note=?, director_approved=-1 WHERE id=?", (note2, r["id"]))
+                            conn.commit()
+                            try:
+                                audit_log("inventory", "director_approval", target=r["id"], details=f"approve=0; note={note2}")
+                            except Exception:
+                                pass
+        tab_contents.append(director_tab)
+
+    # Tab Daftar Inventaris dan Pinjam Barang (selalu tambahkan labelnya)
+    tab_labels.append("📦 Daftar Inventaris")
+    def data_tab():
+        st.subheader("Daftar Inventaris & Pinjam Barang")
+        left_col, right_col = st.columns([2, 1])
+        # --- Kiri: Daftar Inventaris ---
+        with left_col:
+            filter_col1, filter_col2, filter_col3 = st.columns([2,2,2])
+            with filter_col1:
+                filter_nama = st.text_input("Filter Nama Barang", "")
+            with filter_col2:
+                filter_lokasi = st.text_input("Filter Lokasi", "")
+            with filter_col3:
+                filter_status = st.selectbox("Filter Status", ["Semua", "Tersedia", "Dipinjam", "Rusak", "Dijual"], index=0)
+
+            df = pd.read_sql_query("SELECT id, name, location, status, pic, updated_at, file_name, file_blob FROM inventory ORDER BY updated_at DESC", conn)
+            if not df.empty and 'updated_at' in df.columns:
+                df['updated_at'] = df['updated_at'].apply(format_datetime_wib)
+
+            filtered_df = df.copy()
+            if filter_nama:
+                filtered_df = filtered_df[filtered_df['name'].str.contains(filter_nama, case=False, na=False)]
+            if filter_lokasi:
+                filtered_df = filtered_df[filtered_df['location'].str.contains(filter_lokasi, case=False, na=False)]
+            if filter_status != "Semua":
+                filtered_df = filtered_df[filtered_df['status'] == filter_status]
+
+            if filtered_df.empty:
+                st.info("Tidak ada data inventaris sesuai filter.")
+            else:
+                show_df = filtered_df.drop(columns=["file_blob"], errors="ignore")
+                st.dataframe(show_df, use_container_width=True)
+
+                lampiran_list = [
+                    f"{row['name']} - {row['file_name']}" for idx, row in filtered_df.iterrows()
+                    if row['file_blob'] is not None and row['file_name']
+                ]
+                lampiran_dict = {
+                    f"{row['name']} - {row['file_name']}": (row['file_name'], row['file_blob'])
+                    for idx, row in filtered_df.iterrows()
+                    if row['file_blob'] is not None and row['file_name']
+                }
+                if lampiran_list:
+                    selected = st.selectbox("Pilih lampiran untuk diunduh:", lampiran_list)
+                    if selected:
+                        file_name, file_blob = lampiran_dict[selected]
+                        st.download_button(
+                            label=f"⬇️ Download {file_name}",
+                            data=file_blob,
+                            file_name=file_name,
+                            mime="application/octet-stream"
+                        )
+                else:
+                    st.info("Tidak ada lampiran yang tersedia untuk diunduh.")
+
+        # --- Kanan: Pinjam Barang ---
+        with right_col:
+            st.markdown("### 📋 Pinjam Barang")
+            # Filter pinjam barang mengikuti filter kiri
+            pinjam_df = filtered_df.copy()
+            for idx, row in pinjam_df.iterrows():
+                if row['status'] != "Dipinjam":
+                    with st.expander(f"Pinjam: {row['name']} ({row['id']})"):
+                        keperluan = st.text_input(f"Keperluan pinjam untuk {row['name']}", key=f"keperluan_{row['id']}")
+                        tgl_kembali = st.date_input(f"Tanggal Kembali", key=f"tglkembali_{row['id']}", min_value=date.today())
+                        ajukan = st.button(f"Ajukan Pinjam", key=f"ajukan_{row['id']}")
+                        if ajukan:
+                            # Simpan pengajuan: status tetap, approval direset, info pengajuan di pic
+                            cur.execute("UPDATE inventory SET pic=?, finance_approved=0, director_approved=0, updated_at=? WHERE id=?", (f"{user['id']}|{keperluan}|{tgl_kembali}|0|0", datetime.utcnow().isoformat(), row['id']))
+                            conn.commit()
+                            try:
+                                audit_log("inventory", "loan_request", target=row['id'], details=f"keperluan={keperluan}; kembali={tgl_kembali}")
+                            except Exception:
+                                pass
+                            st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
+
+    # Tab Pinjam Barang terpisah (definisi dan penambahan tab di dalam scope agar variabel filter_* tersedia)
+
+
+    # Update tab_labels dan tab_contents
+    # Ganti label tab dengan icon/emoji yang lebih menarik
+    for i, lbl in enumerate(tab_labels):
+        if lbl.lower().startswith("tambah barang") or lbl.lower().startswith("➕ tambah barang"):
+            tab_labels[i] = "➕ Tambah Barang"
+        elif lbl.lower().startswith("review finance") or lbl.lower().startswith("💰 review finance"):
+            tab_labels[i] = "💰 Review Finance"
+        elif lbl.lower().startswith("approval director") or lbl.lower().startswith("✅ approval director"):
+            tab_labels[i] = "✅ Approval Director"
+        elif lbl.lower().startswith("daftar inventaris") or lbl.lower().startswith("📦 daftar inventaris"):
+            tab_labels[i] = "📦 Daftar Inventaris"
+    tab_contents[:] = [tab for tab in tab_contents if tab.__name__ != "download_tab"]
+    # Pastikan urutan tab: ... , 📦 Daftar Inventaris
+    # Hapus data_tab jika sudah ada agar tidak dobel
+    tab_contents = [tab for tab in tab_contents if tab.__name__ != "data_tab"]
+    # Tambahkan sesuai urutan label
+    for lbl in tab_labels:
+        if lbl == "📦 Daftar Inventaris":
+            tab_contents.append(data_tab)
+
+    # Sinkronisasi jumlah tab_labels dan tab_contents
+    if len(tab_labels) > len(tab_contents):
+        tab_labels = tab_labels[:len(tab_contents)]
+    elif len(tab_contents) > len(tab_labels):
+        tab_contents = tab_contents[:len(tab_labels)]
+
+    # Render the tabs dan panggil fungsi sesuai urutan
+    selected = st.tabs(tab_labels)
+    for i, tab_func in enumerate(tab_contents):
+        with selected[i]:
+            tab_func()
+
+def surat_masuk_module():
+    st.header("📥 Surat Masuk")
+    user = get_current_user()
+    # Allow both 'staff' and 'staf' for compatibility
+    allowed_roles = ["staff", "staf", "finance", "director", "superuser"]
+    if not user or user["role"] not in allowed_roles:
+        st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
+        return
+
+    tab1, tab2, tab3 = st.tabs([
+        "📝 Input Draft Surat Masuk",
+        "✅ Approval",
+        "📋 Daftar & Rekap Surat Masuk"
+    ])
+
+    with tab1:
+        st.markdown("### Input Draft Surat Masuk")
+        with st.form("form_surat_masuk", clear_on_submit=True):
+            nomor = st.text_input("Nomor Surat")
+            pengirim = st.text_input("Pengirim")
+            tanggal = st.date_input("Tanggal Surat", value=date.today())
+            perihal = st.text_input("Perihal")
+            file_upload = st.file_uploader("Upload File Surat (wajib)", type=None)
+            status = st.selectbox("Status", ["Diusulkan dibahas ke rapat rutin", "Langsung dilegasikan ke salah satu user", "Selesai"], index=0)
+            follow_up = st.text_area("Tindak Lanjut (Follow Up)")
+            submitted = st.form_submit_button("Catat Surat Masuk")
+
+            if submitted:
+                if not file_upload:
+                    st.error("File surat wajib diupload.")
+                else:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    # Ensure optional columns exist
+                    try:
+                        cur.execute("ALTER TABLE surat_masuk ADD COLUMN director_approved INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE surat_masuk ADD COLUMN rekap INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE surat_masuk ADD COLUMN file_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE surat_masuk ADD COLUMN file_url TEXT")
+                    except Exception:
+                        pass
+                    # Upload ke Drive dan siapkan metadata
+                    blob, file_name, _ = upload_file_and_store(file_upload)
+                    meta = get_last_upload_meta()
+                    file_id = meta.get("file_id")
+                    file_url = meta.get("file_url")
+                    # Simpan data ke DB (indeks otomatis di rekap)
+                    sid = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO surat_masuk (id, nomor, tanggal, pengirim, perihal, file_blob, file_name, status, follow_up)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sid,
+                            nomor,
+                            tanggal.isoformat(),
+                            pengirim,
+                            perihal,
+                            blob,
+                            file_name,
+                            status,
+                            follow_up,
+                        ),
+                    )
+                    # Simpan metadata Drive jika ada
+                    if file_id or file_url:
+                        try:
+                            cur.execute("UPDATE surat_masuk SET file_id=?, file_url=? WHERE id=?", (file_id, file_url, sid))
+                        except Exception:
+                            pass
+                    conn.commit()
+                    try:
+                        audit_log("surat_masuk", "create", target=sid, details=f"{nomor} - {perihal} ({pengirim})")
+                    except Exception:
+                        pass
+                    st.success("Surat masuk berhasil dicatat.")
+
+    with tab2:
+        st.markdown("### Approval Surat Masuk")
+        if user["role"] in ["director", "superuser"]:
+            conn = get_db()
+            cur = conn.cursor()
+            df = pd.read_sql_query("SELECT id, nomor, tanggal, pengirim, perihal, file_name, file_url, status, follow_up, director_approved, rekap FROM surat_masuk ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                if row.get("director_approved", 0) == 0:
+                    with st.expander(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}"):
+                        st.write(f"Pengirim: {row['pengirim']}")
+                        st.write(f"Status: {row['status']}")
+                        st.write(f"Follow Up: {row['follow_up']}")
+                        if row.get('file_url'):
+                            st.markdown(f"[⬇️ Download/Preview Surat]({row['file_url']})")
+                        elif row.get('file_name'):
+                            # Fallback: tampilkan tombol download dari DB/Drive by name
+                            cur.execute("SELECT file_blob, file_name FROM surat_masuk WHERE id= ?", (row['id'],))
+                            f = cur.fetchone()
+                            show_file_download(f['file_blob'] if f else None, row.get('file_name',''))
+                        colA, colB = st.columns(2)
+                        with colA:
+                            if st.button("Approve Surat Masuk", key=f"approve_{row['id']}"):
+                                cur.execute("UPDATE surat_masuk SET director_approved=1 WHERE id= ?", (row['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("surat_masuk", "director_approval", target=row['id'], details="approve=1")
+                                except Exception:
+                                    pass
+                                st.success("Surat masuk di-approve Director.")
+                                st.rerun()
+                        with colB:
+                            if st.button("Reject Surat Masuk", key=f"reject_{row['id']}"):
+                                cur.execute("UPDATE surat_masuk SET director_approved=-1 WHERE id= ?", (row['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("surat_masuk", "director_approval", target=row['id'], details="approve=0")
+                                except Exception:
+                                    pass
+                                st.warning("Surat masuk ditolak Director.")
+                                st.rerun()
+                elif row.get("director_approved", 0) == 1:
+                    st.success(f"Sudah di-approve Director: {row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                elif row.get("director_approved", 0) == -1:
+                    st.error(f"Surat masuk ditolak Director: {row['nomor']} | {row['perihal']} | {row['tanggal']}")
+        else:
+            st.info("Hanya Director atau Superuser yang dapat meng-approve surat masuk.")
+    # Tab Rekap Surat Masuk
+    with tab3:
+        st.markdown("### Daftar & Rekap Surat Masuk")
+        conn = get_db()
+        cur = conn.cursor()
+        df = pd.read_sql_query("SELECT id, nomor, tanggal, pengirim, perihal, file_name, file_url, rekap, director_approved FROM surat_masuk ORDER BY tanggal DESC", conn)
+        # Indeks otomatis
+        if not df.empty:
+            df = df.copy()
+            df['indeks'] = [f"SM-{i+1:04d}" for i in range(len(df))]
+            show_cols = ["indeks","nomor","tanggal","pengirim","perihal","file_name"]
+        else:
+            show_cols = ["nomor","tanggal","pengirim","perihal","file_name"]
+
+        # Tabel rekap dengan tombol download di kolom, styled modern UI
+        rekap_df = df[df['rekap']==1].copy() if 'rekap' in df.columns else df.copy()
+        if not rekap_df.empty:
+            download_links = []
+            for idx, row in rekap_df.iterrows():
+                if row.get('file_url'):
+                    href = f"<a class='rekap-download-btn' href='{row['file_url']}' target='_blank'><span style='font-size:1.1em;'>⬇️</span> Download</a>"
+                else:
+                    href = '<span style="color:#bbb">-</span>'
+                download_links.append(href)
+            rekap_df = rekap_df.reset_index(drop=True)
+            rekap_df['Download'] = download_links
+            # Custom styled HTML table
+            table_html = rekap_df[show_cols + ["Download"]].to_html(escape=False, index=False, classes="rekap-table")
+            st.markdown('''
+<style>
+.rekap-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    font-size: 1.05em;
+    background: #f8fbff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(80,140,255,0.07);
+}
+.rekap-table th {
+    background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+    color: #fff;
+    font-weight: 700;
+    text-align: center;
+    padding: 10px 8px;
+    border: none;
+}
+.rekap-table td {
+    text-align: center;
+    padding: 8px 6px;
+    border-bottom: 1px solid #e3eaff;
+    background: #fff;
+    font-size: 1em;
+}
+.rekap-table tr:last-child td {
+    border-bottom: none;
+}
+.rekap-download-btn {
+    display: inline-block;
+    background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
+    color: #fff !important;
+    padding: 4px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    text-decoration: none;
+    box-shadow: 0 1px 4px rgba(80,140,255,0.10);
+    transition: background 0.2s;
+}
+.rekap-download-btn:hover {
+    background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+    color: #fff !important;
+}
+</style>
+''', unsafe_allow_html=True)
+            st.markdown(table_html, unsafe_allow_html=True)
+        else:
+            st.info("Belum ada surat masuk yang direkap.")
+        # Approval Director: masukan ke rekap
+        if user["role"] in ["director", "superuser"]:
+            for idx, row in df.iterrows():
+                if row.get("rekap", 0) == 0 and row.get("director_approved", 0) == 1:
+                    if st.button("Masukan ke Daftar Rekap Surat", key=f"rekap_{row['id']}"):
+                        cur.execute("UPDATE surat_masuk SET rekap=1 WHERE id= ?", (row['id'],))
+                        conn.commit()
+                        try:
+                            audit_log("surat_masuk", "rekap_add", target=row['id'])
+                        except Exception:
+                            pass
+                        st.success("Surat masuk dimasukan ke rekap.")
+                        st.rerun()
+
+def surat_keluar_module():
+    conn = get_db()
+    cur = conn.cursor()
+    user = require_login()
+
+    st.markdown("# 📤 Surat Keluar")
+    tab1, tab2, tab3 = st.tabs([
+        "📝 Input Draft Surat Keluar",
+        "✅ Approval",
+        "📋 Daftar & Rekap Surat Keluar"
+    ])
+
+    # --- Tab 1: Input Draft oleh Staf ---
+    with tab1:
+        st.markdown("### Input Draft Surat Keluar (Staf)")
+        with st.form("sk_add", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                nomor = st.text_input("Nomor Surat")
+                tanggal = st.date_input("Tanggal", value=date.today())
+            with col2:
+                ditujukan = st.text_input("Ditujukan Kepada")
+                perihal = st.text_input("Perihal")
+            draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True)
+            draft_blob, draft_name, draft_url = None, None, None
+            if draft_type == "Upload File":
+                draft = st.file_uploader("Upload Draft Surat (PDF/DOC)")
+            else:
+                draft = None
+                draft_url = st.text_input("Link Draft Surat (Google Drive, dll)")
+            follow_up = st.text_area("Tindak Lanjut (opsional)")
+            submit = st.form_submit_button("💾 Simpan Draft Surat Keluar")
+            if submit:
+                if draft_type == "Upload File" and not draft:
+                    st.error("File draft surat wajib diupload.")
+                elif draft_type == "Link URL" and not draft_url:
+                    st.error("Link draft surat wajib diisi.")
+                else:
+                    sid = gen_id("sk")
+                    draft_file_id, draft_file_url = None, None
+                    if draft_type == "Upload File":
+                        draft_blob, draft_name, _ = upload_file_and_store(draft)
+                        meta = get_last_upload_meta(); draft_file_id = meta.get("file_id"); draft_file_url = meta.get("file_url")
+                    # Ensure columns for URLs/IDs exist
+                    try:
+                        cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_url TEXT")
+                    except Exception:
+                        pass
+                    cur.execute("""INSERT INTO surat_keluar (id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,draft_blob,draft_name,status,follow_up, draft_url, draft_id)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (sid, '', nomor, tanggal.isoformat(), ditujukan, perihal, user['full_name'], draft_blob, draft_name, "Draft", follow_up, draft_url or draft_file_url, draft_file_id))
+                    conn.commit()
+                    try:
+                        det = f"draft_file={draft_name}" if draft_name else f"draft_url={draft_url}"
+                        audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; {det}")
+                    except Exception:
+                        pass
+                    st.success("✅ Surat keluar (draft) tersimpan.")
+
+    # --- Tab 2: Approval Director ---
+    with tab2:
+        st.markdown("### Approval Surat Keluar (Director)")
+        if user["role"] in ["director","superuser"]:
+            df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_blob, draft_name, draft_url, final_blob, final_url FROM surat_keluar ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['nomor']} | {row['perihal']} | {row['tanggal']} | Status: {row['status']}"):
+                    st.write(f"Ditujukan: {row['ditujukan']}")
+                    st.write(f"Pengirim: {row['pengirim']}")
+                    st.write(f"Follow Up: {row['follow_up']}")
+                    # Preview/download draft
+                    if row['draft_blob'] and row['draft_name']:
+                        st.markdown(f"**Draft Surat (file):** {row['draft_name']}")
+                        show_file_download(row['draft_blob'], row['draft_name'], row.get('draft_url',''))
+                    elif row.get('draft_url'):
+                        st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row['draft_url']})")
+                    # Catatan dan upload final
+                    note = st.text_area("Catatan Director", value="", key=f"note_{row['id']}")
+                    final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"final_{row['id']}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        approve = st.button("✅ Approve & Upload Final", key=f"approve_{row['id']}")
+                    with colB:
+                        disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"disapprove_{row['id']}")
+                    if approve:
+                        if not final:
+                            st.error("File final wajib diupload agar surat keluar tercatat resmi.")
+                        else:
+                            blob, fname, _ = upload_file_and_store(final)
+                            meta = get_last_upload_meta(); fid = meta.get("file_id"); furl = meta.get("file_url")
+                            # Ensure columns
+                            try:
+                                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_id TEXT")
+                            except Exception:
+                                pass
+                            try:
+                                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_url TEXT")
+                            except Exception:
+                                pass
+                            cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, final_id=?, final_url=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
+                                        (blob, fname, fid, furl, note, row['id']))
+                            conn.commit()
+                            try:
+                                audit_log("surat_keluar", "director_approval", target=row['id'], details=f"final={fname}; note={note}")
+                            except Exception:
+                                pass
+                            st.success("Final uploaded & approved.")
+                            st.rerun()
+                    if disapprove:
+                        cur.execute("UPDATE surat_keluar SET status='Draft', director_note=?, director_approved=0 WHERE id=?", (note, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("surat_keluar", "director_disapprove", target=row['id'], details=f"note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Surat dikembalikan ke draft untuk direvisi.")
+                        st.rerun()
+        else:
+            st.info("Hanya Director yang dapat meng-approve dan upload file final.")
+
+    # --- Tab 3: Daftar & Rekap Surat Keluar ---
+    with tab3:
+        st.markdown("### Daftar & Rekap Surat Keluar")
+        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_name, draft_url, final_blob, final_url FROM surat_keluar ORDER BY tanggal DESC", conn)
+        # Indeks otomatis: urutan
+        if not df.empty:
+            df = df.copy()
+            df['indeks'] = [f"SK-{i+1:04d}" for i in range(len(df))]
+        # Kolom file final dapat diunduh
+        def file_final_link(row):
+            if row.get('final_url'):
+                st.markdown(f"<a href='{row['final_url']}' target='_blank'>Download {row.get('final_name','')}</a>", unsafe_allow_html=True)
+            elif row['final_blob'] and row['final_name']:
+                show_file_download(row['final_blob'], row['final_name'])
+        st.dataframe(df[["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"]], use_container_width=True, hide_index=True)
+        st.markdown("#### Download File Final Surat Keluar")
+        for idx, row in df.iterrows():
+            if row.get('final_url') or (row['final_blob'] and row['final_name']):
+                st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                show_file_download(row.get('final_blob'), row.get('final_name',''), row.get('final_url',''))
+        # Rekap Bulanan
+        st.markdown("#### 📊 Rekap Bulanan Surat Keluar")
+        this_month = date.today().strftime("%Y-%m")
+        df_month = pd.DataFrame()
+        if not df.empty:
+            df_month = df[df['tanggal'].str[:7] == this_month]
+    st.write(f"Total surat keluar bulan ini: **{len(df_month)}**")
+    if not df_month.empty:
+            approved = df_month[df_month['director_approved']==1]
+            draft = df_month[df_month['status'].str.lower() == 'draft']
+            percent_final = (len(approved)/len(df_month))*100 if len(df_month) > 0 else 0
+            st.info(f"Approved: {len(approved)} | Masih Draft: {len(draft)} | % Finalisasi: {percent_final:.1f}%")
+            # Perbaiki export Excel
+            import io
+            excel_buffer = io.BytesIO()
+            df_month.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+            st.download_button("⬇️ Download Rekap Bulanan (Excel)", excel_buffer, file_name=f"rekap_suratkeluar_{this_month}.xlsx")
+            st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_suratkeluar_{this_month}.csv")
+
+def mou_module():
+    user = require_login()
+    st.header("🤝 MoU")
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab4 = st.tabs([
+        "📝 Input Draft MoU",
+        "👥 Review Board",
+        "📋 Daftar & Rekap MoU"
+    ])
+
+    # --- Tab 1: Input Draft MoU ---
+    with tab1:
+        st.markdown("### Input Draft MoU (Staf)")
+        jenis_options = [
+            "Programmatic MoU",
+            "Funding MoU / Grant Agreement",
+            "Strategic Partnership MoU",
+            "Capacity Building MoU",
+            "Secondment MoU",
+            "Internship/Volunteer MoU",
+            "Advocacy MoU",
+            "Operational MoU",
+            "Research & Development MoU",
+            "MoU Advokasi Kebijakan Publik",
+            "MoU Operasional",
+        ]
+        with st.form("mou_add", clear_on_submit=True):
+            nomor = st.text_input("Nomor MoU")
+            nama = st.text_input("Nama MoU")
+            pihak = st.text_input("Pihak Terlibat")
+            jenis = st.selectbox("Jenis MoU", jenis_options)
+            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today()+timedelta(days=365))
+            f = st.file_uploader("File Draft MoU (wajib)")
+            submit = st.form_submit_button("Simpan Draft MoU")
+            if submit:
+                if not f:
+                    st.error("File draft MoU wajib diupload.")
+                elif tgl_selesai < tgl_mulai:
+                    st.error("Tanggal selesai tidak boleh sebelum tanggal mulai.")
+                else:
+                    mid = gen_id("mou")
+                    blob, fname, _ = upload_file_and_store(f)
+                    meta = get_last_upload_meta()
+                    # ensure Drive metadata columns exist
+                    try:
+                        cur.execute("ALTER TABLE mou ADD COLUMN file_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE mou ADD COLUMN file_url TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE mou ADD COLUMN final_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE mou ADD COLUMN final_url TEXT")
+                    except Exception:
+                        pass
+                    cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,file_id,file_url,board_note,board_approved,final_blob,final_name,final_id,final_url)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, meta.get("file_id"), meta.get("file_url"), "", 0, None, None, None, None))
+                    conn.commit()
+                    try:
+                        audit_log("mou", "create", target=mid, details=f"{nomor} - {nama} ({jenis})")
+                    except Exception:
+                        pass
+                    st.success("MoU tersimpan (draft).")
+
+    # --- Tab 2: Review Board (opsional) ---
+    with tab2:
+        st.markdown("### Review Board (Opsional)")
+        if user["role"] in ["board","superuser"]:
+            df = pd.read_sql_query("SELECT id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai, board_note, board_approved FROM mou ORDER BY tgl_selesai ASC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['nomor']} | {row['nama']} | {row['tgl_mulai']} - {row['tgl_selesai']}"):
+                    st.write(f"Pihak: {row['pihak']}")
+                    st.write(f"Jenis: {row['jenis']}")
+                    st.write(f"Catatan Board: {row['board_note']}")
+                    note = st.text_area("Catatan Board", value=row['board_note'], key=f"board_note_{row['id']}")
+                    approve = st.checkbox("Approve Board", value=bool(row['board_approved']), key=f"board_approved_{row['id']}")
+                    if st.button("Simpan Review Board", key=f"save_board_{row['id']}"):
+                        cur.execute("UPDATE mou SET board_note=?, board_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
+                        st.success("Review Board disimpan.")
+                        conn.commit()
+                        st.success("Review Board disimpan.")
+                        try:
+                            audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        st.rerun()
+        else:
+            st.info("Hanya Board yang dapat review di sini.")
+
+
+
+    # --- Tab 4: Daftar & Rekap MoU ---
+    with tab4:
+        st.markdown("### Daftar & Rekap MoU")
+        df = pd.read_sql_query("SELECT id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai, file_name, file_url, board_approved FROM mou ORDER BY tgl_selesai ASC", conn)
+        # Status aktif (berdasarkan rentang tanggal)
+        today = pd.to_datetime(date.today())
+        if not df.empty:
+            df = df.copy()
+            df['status_aktif'] = [
+                'Aktif' if pd.to_datetime(row['tgl_mulai']) <= today <= pd.to_datetime(row['tgl_selesai']) else 'Tidak Aktif'
+                for _, row in df.iterrows()
+            ]
+        else:
+            df['status_aktif'] = []
+
+        # Siapkan dataframe untuk tampilan
+        show_df = df[["id", "nomor", "nama", "pihak", "jenis", "tgl_mulai", "tgl_selesai", "file_name", "board_approved", "status_aktif"]].copy() if not df.empty else pd.DataFrame(columns=["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","file_name","board_approved","status_aktif"])
+        if not show_df.empty:
+            show_df['Board Approved'] = show_df['board_approved'].map({0: '❌', 1: '✅'})
+            show_df = show_df.rename(columns={
+                "id": "ID",
+                "nomor": "Nomor",
+                "nama": "Nama",
+                "pihak": "Pihak",
+                "jenis": "Jenis",
+                "tgl_mulai": "Tgl Mulai",
+                "tgl_selesai": "Tgl Selesai",
+                "file_name": "File",
+                "status_aktif": "Status Aktif",
+            })
+
+        left, right = st.columns([3,2])
+        with left:
+            st.subheader("📋 Daftar MoU")
+            cols_order = ["ID","Nomor","Nama","Pihak","Jenis","Tgl Mulai","Tgl Selesai","File","Board Approved","Status Aktif"]
+            disp = show_df[cols_order] if not show_df.empty else show_df
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        with right:
+            st.subheader("⬇️ Download File")
+            if not df.empty:
+                # Hanya tampilkan opsi yang memiliki file
+                opt_map = {f"{r['nomor']} | {r['nama']} — {r['file_name']}": r['id'] for _, r in df.iterrows() if r.get('file_name')}
+                pilihan = st.selectbox("Pilih MoU", [""] + list(opt_map.keys()))
+                if pilihan:
+                    mid = opt_map[pilihan]
+                    row = pd.read_sql_query("SELECT file_name, file_url FROM mou WHERE id=?", conn, params=(mid,))
+                    if not row.empty and row.iloc[0].get("file_url"):
+                        st.markdown(f"<a href='{row.iloc[0]['file_url']}' target='_blank'>Download {row.iloc[0]['file_name']}</a>", unsafe_allow_html=True)
+                    elif not row.empty and row.iloc[0].get("file_name"):
+                        # Fallback: cari berdasarkan nama file di Drive
+                        show_file_download(None, row.iloc[0]["file_name"])    
+                    else:
+                        st.info("File tidak tersedia untuk MoU terpilih.")
+            else:
+                st.info("Belum ada data MoU.")
+
+        # Rekap Bulanan MoU (opsional, ringkas)
+        st.markdown("#### 📅 Rekap Bulanan MoU (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        if not df.empty:
+            df_month = df[(df['tgl_mulai'].astype(str).str[:7] == this_month) | (df['tgl_selesai'].astype(str).str[:7] == this_month)]
+        else:
+            df_month = pd.DataFrame()
+        st.write(f"Total MoU terkait bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_jenis = df_month['jenis'].value_counts()
+            st.write("Rekap per Jenis:")
+            st.dataframe(by_jenis)
+
+def cash_advance_module():
+    user = require_login()
+    st.header("💸 Cash Advance")
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📝 Input Staf",
+        "💰 Review Finance",
+        "✅ Approval Director",
+        "📋 Daftar & Rekap"
+    ])
+
+    # --- Tab 1: Input Staf ---
+    with tab1:
+        st.markdown("### Pengajuan Cash Advance (Staf)")
+        # --- Real-time total calculation ---
+        if 'ca_nominals' not in st.session_state:
+            st.session_state['ca_nominals'] = [0.0]*10
+        items = []
+        nama_program = st.text_input("Nama Program")
+        import re
+        def format_ribuan(val):
+            if val is None or val == "":
+                return ""
+            val_str = str(val)
+            val_str = re.sub(r'[^\d]', '', val_str)
+            if not val_str:
+                return ""
+            return f"{int(val_str):,}".replace(",", ".")
+
+        for i in range(1, 11):
+            col1, col2 = st.columns([3,2])
+            with col1:
+                item = st.text_input(f"Item {i}", key=f"ca_item_{i}")
+            with col2:
+                key_nom = f"ca_nom_{i}"
+                val = st.session_state.get(key_nom, "")
+                val_disp = format_ribuan(val)
+                nominal_str = st.text_input(f"Nominal {i}", value=val_disp, key=key_nom)
+                # Remove non-digit and update session state
+                clean_nom = re.sub(r'[^\d]', '', nominal_str)
+                st.session_state['ca_nominals'][i-1] = float(clean_nom) if clean_nom else 0.0
+            if item:
+                items.append({"item": item, "nominal": float(st.session_state['ca_nominals'][i-1])})
+        total = sum(st.session_state['ca_nominals'])
+        tanggal = st.date_input("Tanggal", value=date.today())
+        # Format total as Rp with thousand separator
+        def format_rp(val):
+            return f"Rp. {val:,.0f}".replace(",", ".")
+        st.info(f"Total: {format_rp(total)}")
+        if st.button("Ajukan Cash Advance"):
+            if not nama_program or not items:
+                st.error("Nama Program dan minimal 1 item wajib diisi.")
+            else:
+                cid = gen_id("ca")
+                cur.execute("INSERT INTO cash_advance (id,divisi,items_json,totals,tanggal,finance_note,finance_approved,director_note,director_approved) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (cid, nama_program, json.dumps(items), total, tanggal.isoformat(), "", 0, "", 0))
+                conn.commit()
+                try:
+                    audit_log("cash_advance", "create", target=cid, details=f"divisi={nama_program}; total={total}")
+                except Exception:
+                    pass
+                st.success("Cash advance diajukan.")
+                st.session_state['ca_nominals'] = [0.0]*10
+
+    # --- Tab 2: Review Finance ---
+    with tab2:
+        st.markdown("### Review & Approval Finance")
+        if user["role"] in ["finance", "superuser"]:
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"):
+                    items = json.loads(row['items_json']) if row['items_json'] else []
+                    # Format nominal columns as Rp
+                    if items:
+                        df_items = pd.DataFrame(items)
+                        if 'nominal' in df_items.columns:
+                            df_items['nominal'] = df_items['nominal'].apply(format_rp)
+                        st.write(df_items)
+                    st.write(f"Catatan: {row['finance_note']}")
+                    note = st.text_area("Catatan Finance", value=row['finance_note'], key=f"fin_note_{row['id']}")
+                    # Opsi upload ToR jika diminta
+                    tor_file = st.file_uploader("Upload File ToR (jika diminta)", key=f"tor_{row['id']}")
+                    # Opsi: Ajukan ke Director atau Kembalikan ke User
+                    colA, colB = st.columns(2)
+                    with colA:
+                        approve = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                    with colB:
+                        return_user = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                    if approve:
+                        # Simpan ToR jika ada
+                        if tor_file:
+                            tor_blob, tor_name, _ = upload_file_and_store(tor_file)
+                            cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=1 WHERE id=?", (note + "\n[ToR diupload: " + tor_name + "]", row['id']))
+                        else:
+                            cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=1 WHERE id=?", (note, row['id']))
+                        conn.commit()
+                        try:
+                            tor_info = f"; ToR={tor_file.name}" if tor_file else ""
+                            audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=1; note={note}{tor_info}")
+                        except Exception:
+                            pass
+                        st.success("Diajukan ke Director.")
+                        st.rerun()
+                    if return_user:
+                        cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=0 WHERE id=?", (note + "\n[Perlu revisi oleh user]", row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Dikembalikan ke user peminta.")
+                        st.rerun()
+        else:
+            st.info("Hanya Finance yang dapat review di sini.")
+
+    # --- Tab 3: Approval Director ---
+    with tab3:
+        st.markdown("### Approval Director Cash Advance")
+        if user["role"] in ["director", "superuser"]:
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {row['totals']:,.0f}"):
+                    items = json.loads(row['items_json']) if row['items_json'] else []
+                    st.write(pd.DataFrame(items))
+                    st.write(f"Finance Approved: {'Ya' if row['finance_approved'] else 'Belum'}")
+                    st.write(f"Catatan Director: {row['director_note']}")
+                    note = st.text_area("Catatan Director", value=row['director_note'], key=f"dir_note_{row['id']}")
+                    approve = st.checkbox("Approve Director", value=bool(row['director_approved']), key=f"dir_approved_{row['id']}")
+                    if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                        cur.execute("UPDATE cash_advance SET director_note=?, director_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("cash_advance", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        st.success("Approval Director disimpan.")
+                        st.rerun()
+        else:
+            st.info("Hanya Director yang dapat approve di sini.")
+
+    # --- Tab 4: Daftar & Rekap ---
+    with tab4:
+        st.markdown("### Daftar & Rekap Cash Advance")
+        df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+        df['status'] = df.apply(lambda x: 'Cair' if x['finance_approved'] and x['director_approved'] else 'Proses', axis=1)
+        # --- FILTER UI ---
+        with st.container():
+            col_div, col_status, col_tgl = st.columns([2,2,3])
+            with col_div:
+                divisi_list = ["Semua"] + sorted(df["divisi"].dropna().unique().tolist())
+                filter_divisi = st.selectbox("Filter Divisi", divisi_list)
+            with col_status:
+                status_list = ["Semua", "Cair", "Proses"]
+                filter_status = st.selectbox("Status", status_list)
+            with col_tgl:
+                min_tgl = df["tanggal"].min() if not df.empty else date.today()
+                max_tgl = df["tanggal"].max() if not df.empty else date.today()
+                filter_tgl = st.date_input("Tanggal", value=(min_tgl, max_tgl) if min_tgl and max_tgl else (date.today(), date.today()))
+
+        dff = df.copy()
+        if filter_divisi != "Semua":
+            dff = dff[dff["divisi"] == filter_divisi]
+        if filter_status != "Semua":
+            dff = dff[dff["status"] == filter_status]
+        if filter_tgl and isinstance(filter_tgl, tuple) and len(filter_tgl) == 2:
+            tgl_start, tgl_end = filter_tgl
+            dff = dff[(pd.to_datetime(dff["tanggal"]) >= pd.to_datetime(tgl_start)) & (pd.to_datetime(dff["tanggal"]) <= pd.to_datetime(tgl_end))]
+
+        st.dataframe(dff)
+        # Rekap Bulanan
+        st.markdown("#### Rekap Bulanan Cash Advance (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        df_month = dff[dff['tanggal'].str[:7] == this_month] if not dff.empty else pd.DataFrame()
+        st.write(f"Jumlah pengajuan bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_div = df_month.groupby('divisi').agg({'id':'count','totals':'sum'}).rename(columns={'id':'jumlah_pengajuan','totals':'total_nominal'})
+            st.write("Rekap per Divisi:")
+            st.dataframe(by_div)
+            approved = df_month[(df_month['finance_approved']==1) & (df_month['director_approved']==1)]
+            pending = df_month[(df_month['finance_approved']==0) | (df_month['director_approved']==0)]
+            st.write(f"Approved (Cair): {len(approved)} | Pending: {len(pending)}")
+
+def pmr_module():
+    user = require_login()
+    st.header("📑 PMR")
+    conn = get_db()
+    cur = conn.cursor()
+    tab_upload, tab_finance, tab_director, tab_rekap = st.tabs([
+        "📝 Upload Laporan Bulanan (Staf)",
+        "💰 Review & Approval Finance",
+        "✅ Approval Director PMR",
+        "📋 Daftar & Rekap PMR"
+    ])
+
+    with tab_upload:
+        st.markdown("### Upload Laporan Bulanan (Staf)")
+        with st.form("pmr_add", clear_on_submit=True):
+            nama = st.text_input("Nama Pegawai")
+            bulan = st.selectbox("Bulan (YYYY-MM)", options=[f"{y}-{m:02d}" for y in range(date.today().year-1, date.today().year+2) for m in range(1,13)])
+            f1 = st.file_uploader("File Laporan 1 (wajib)")
+            f2 = st.file_uploader("File Laporan 2 (opsional)")
+            duplicate = False
+            if nama and bulan:
+                cek = cur.execute("SELECT COUNT(*) FROM pmr WHERE nama=? AND bulan=?", (nama, bulan)).fetchone()[0]
+                if cek > 0:
+                    duplicate = True
+            submit = st.form_submit_button("Submit")
+            if submit:
+                if not nama or not bulan:
+                    st.error("Nama dan Bulan wajib diisi.")
+                elif duplicate:
+                    st.error("Sudah ada laporan bulan ini untuk nama tersebut.")
+                elif not f1:
+                    st.error("Minimal 1 file wajib diupload.")
+                else:
+                    pid = gen_id("pmr")
+                    b1, n1, _ = upload_file_and_store(f1)
+                    meta1 = get_last_upload_meta()
+                    if f2:
+                        b2, n2, _ = upload_file_and_store(f2)
+                        meta2 = get_last_upload_meta()
+                    else:
+                        b2, n2 = None, None
+                        meta2 = {}
+                    now = datetime.utcnow().isoformat()
+                    # Ensure Drive metadata columns
+                    for col in ("file1_id","file1_url","file2_id","file2_url"):
+                        try:
+                            cur.execute(f"ALTER TABLE pmr ADD COLUMN {col} TEXT")
+                        except Exception:
+                            pass
+                    cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file1_id,file1_url,file2_blob,file2_name,file2_id,file2_url,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pid, nama, b1, n1, meta1.get("file_id"), meta1.get("file_url"), b2, n2, meta2.get("file_id"), meta2.get("file_url"), bulan, "", 0, "", 0, now))
+                    conn.commit()
+                    try:
+                        audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={n1}; file2={n2 or '-'}")
+                    except Exception:
+                        pass
+                    st.success("Laporan bulanan berhasil diupload.")
+
+    with tab_finance:
+        st.markdown("### Review & Approval Finance")
+        st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Superuser yang dapat mengakses.")
+        if user["role"] in ["finance", "superuser"]:
+            df_fin = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, finance_note, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
+            for idx, row in df_fin.iterrows():
+                with st.expander(f"{row['nama']} | {row['bulan']}"):
+                    st.write(f"File 1: {row['file1_name']}")
+                    if row['file2_name']:
+                        st.write(f"File 2: {row['file2_name']}")
+                    st.write(f"Catatan: {row['finance_note']}")
+                    note = st.text_area("Catatan Finance", value=row['finance_note'], key=f"fin_note_{row['id']}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        ajukan = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                    with colB:
+                        kembalikan = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                    if ajukan:
+                        cur.execute("UPDATE pmr SET finance_note=?, finance_approved=1 WHERE id=?", (note, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "finance_review", target=row['id'], details=f"approve=1; note={note}")
+                        except Exception:
+                            pass
+                        st.success("Diajukan ke Director.")
+                        st.rerun()
+                    if kembalikan:
+                        cur.execute("UPDATE pmr SET finance_note=?, finance_approved=0 WHERE id=?", (note+"\n[Perlu revisi oleh user]", row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Dikembalikan ke user peminta.")
+                        st.rerun()
+        else:
+            st.info("Hanya Finance yang dapat review di sini.")
+
+    with tab_director:
+        st.markdown("### Approval Director PMR")
+        st.caption("Director melakukan approval akhir dan memberi catatan. Hanya Director/Superuser yang dapat mengakses.")
+        if user["role"] in ["director", "superuser"]:
+            df_dir = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, director_note, director_approved, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
+            for idx, row in df_dir.iterrows():
+                with st.expander(f"{row['nama']} | {row['bulan']}"):
+                    st.write(f"File 1: {row['file1_name']}")
+                    if row['file2_name']:
+                        st.write(f"File 2: {row['file2_name']}")
+                    st.write(f"Finance Approved: {'Ya' if row['finance_approved'] else 'Belum'}")
+                    st.write(f"Catatan: {row['director_note']}")
+                    note = st.text_area("Catatan Director", value=row['director_note'], key=f"dir_note_{row['id']}")
+                    approve = st.checkbox("Approve Director", value=bool(row['director_approved']), key=f"dir_approved_{row['id']}")
+                    if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                        cur.execute("UPDATE pmr SET director_note=?, director_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        st.success("Approval Director disimpan.")
+                        st.rerun()
+        else:
+            st.info("Hanya Director yang dapat approve di sini.")
+
+    with tab_rekap:
+        if user["role"] in ["finance", "director", "superuser"]:
+            st.markdown("### Daftar & Rekap PMR")
+            df = pd.read_sql_query("SELECT id, nama, bulan, tanggal_submit, finance_approved, director_approved, file1_name, file1_url, file2_name, file2_url FROM pmr ORDER BY tanggal_submit DESC", conn)
+            bulan_list = sorted(df['bulan'].unique(), reverse=True) if not df.empty else []
+            filter_bulan = st.selectbox("Pilih Bulan", bulan_list, index=0 if bulan_list else None, key="rekap_bulan")
+            if filter_bulan:
+                df_month = df[df['bulan'] == filter_bulan]
+            else:
+                df_month = pd.DataFrame()
+            st.write(f"Total laporan bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                df_month_disp = df_month.copy()
+                df_month_disp['Status'] = df_month_disp.apply(lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else ('Proses Finance' if not x['finance_approved'] else 'Proses Director'), axis=1)
+                def make_download_link(row, idx):
+                    name_col = f"file{idx}_name"; url_col = f"file{idx}_url"
+                    name = row.get(name_col)
+                    url = row.get(url_col)
+                    if name and url:
+                        return f"<a href='{url}' target='_blank'>{name}</a>"
+                    elif name:
+                        # fallback: try by filename in Drive
+                        return f"<a href='{_drive_find_file_by_name(name).get('webViewLink','')}' target='_blank'>{name}</a>" if _drive_find_file_by_name(name).get('webViewLink') else name
+                    return "-"
+                df_month_disp['Download File 1'] = df_month_disp.apply(lambda r: make_download_link(r, 1), axis=1)
+                df_month_disp['Download File 2'] = df_month_disp.apply(lambda r: make_download_link(r, 2), axis=1)
+                show_cols = ["nama","bulan","tanggal_submit","Status","Download File 1","Download File 2"]
+                st.markdown(df_month_disp[show_cols].to_html(escape=False, index=False), unsafe_allow_html=True)
+        else:
+            st.info("Hanya Finance/Director yang dapat melihat rekap PMR.")
+
+ 
+
+def delegasi_module():
+    user = require_login()
+    st.header("🗂️ Delegasi Tugas & Monitoring")
+    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Alur: Pemberi tugas membuat → PIC update status/upload bukti → Director monitor → Sinkron kalender & peringatan tenggat.</div>", unsafe_allow_html=True)
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab3, tab4 = st.tabs(["🆕 Buat Tugas", "📝 Update Status/Bukti", "👀 Monitoring Director", "📅 Rekap & Filter"])
+
+    # Tab 1: Buat Tugas
+    with tab1:
+        st.markdown("### 🆕 Buat Tugas Baru (Pemberi Tugas)")
+        with st.form("del_add"):
+            judul = st.text_input("Judul Tugas")
+            deskripsi = st.text_area("Deskripsi")
+            pic = st.text_input("Penanggung Jawab (PIC)")
+            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+            if st.form_submit_button("Buat Tugas"):
+                if not (judul and deskripsi and pic):
+                    st.warning("Semua field wajib diisi.")
+                elif tgl_selesai < tgl_mulai:
+                    st.warning("Tanggal selesai tidak boleh sebelum mulai.")
+                else:
+                    did = gen_id("del")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
+                        (did, judul, deskripsi, pic, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
+                    conn.commit()
+                    try:
+                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    st.success("Tugas berhasil dibuat.")
+
+    # Tab 2: Update Status & Upload Bukti (PIC)
+    with tab2:
+        st.markdown("### 📝 PIC Update Status & Upload Bukti")
+        tugas_pic = pd.read_sql_query("SELECT * FROM delegasi WHERE pic=? ORDER BY tgl_selesai ASC", conn, params=(user["full_name"],))
+        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_pic")
+        if filter_status != "Semua":
+            tugas_pic = tugas_pic[tugas_pic["status"] == filter_status]
+        for idx, row in tugas_pic.iterrows():
+            with st.expander(f"{row['judul']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | Status: {row['status']}"):
+                st.write(f"Deskripsi: {row['deskripsi']}")
+                st.write(f"Tenggat: {row['tgl_mulai']} s/d {row['tgl_selesai']}")
+                status = st.selectbox("Status", ["Belum Selesai", "Proses", "Selesai"], index=["Belum Selesai", "Proses", "Selesai"].index(row["status"]), key=f"status_{row['id']}")
+                file_bukti = st.file_uploader("Upload Bukti (wajib jika selesai)", key=f"bukti_{row['id']}")
+                if st.button("Update Status", key=f"update_{row['id']}"):
+                    if status == "Selesai" and not file_bukti:
+                        st.error("Status 'Selesai' wajib upload file dokumentasi!")
+                    else:
+                        blob, fname, _ = upload_file_and_store(file_bukti) if file_bukti else (None, None, None)
+                        meta = get_last_upload_meta() if file_bukti else {}
+                        # Ensure columns for Drive metadata
+                        for col in ("file_id","file_url"):
+                            try:
+                                cur.execute(f"ALTER TABLE delegasi ADD COLUMN {col} TEXT")
+                            except Exception:
+                                pass
+                        now = datetime.utcnow().isoformat()
+                        if status == "Selesai":
+                            cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, file_id=?, file_url=?, tanggal_update=? WHERE id=?",
+                                (status, blob, fname, meta.get("file_id"), meta.get("file_url"), now, row["id"]))
+                        else:
+                            cur.execute("UPDATE delegasi SET status=?, tanggal_update=? WHERE id=?",
+                                (status, now, row["id"]))
+                        conn.commit()
+                        try:
+                            det = f"status={status}" + (f"; bukti={fname}" if fname else "")
+                            audit_log("delegasi", "update", target=row['id'], details=det)
+                        except Exception:
+                            pass
+                        st.success("Status tugas diperbarui.")
+
+    # Tab 3: Monitoring Director
+    with tab3:
+        st.markdown("### 👀 Monitoring Director")
+        if user["role"] in ["director", "superuser"]:
+            df_all = pd.read_sql_query("SELECT id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,file_name,file_url,tanggal_update FROM delegasi ORDER BY tgl_selesai ASC", conn)
+            filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_dir")
+            if filter_status != "Semua":
+                df_all = df_all[df_all["status"] == filter_status]
+            st.dataframe(df_all)
+            for idx, row in df_all.iterrows():
+                with st.expander(f"{row['judul']} | {row['pic']} | Status: {row['status']}"):
+                    st.write(f"Deskripsi: {row['deskripsi']}")
+                    st.write(f"Tenggat: {row['tgl_mulai']} s/d {row['tgl_selesai']}")
+                    st.write(f"Update terakhir: {row['tanggal_update']}")
+                    if row["status"] == "Selesai" and row["file_name"]:
+                        if row.get("file_url"):
+                            st.markdown(f"<a href='{row['file_url']}' target='_blank'>Download {row['file_name']}</a>", unsafe_allow_html=True)
+                        else:
+                            show_file_download(row.get("file_blob"), row["file_name"])
+                    st.write(f"Status: {row['status']}")
+
+    # Tab 4: Rekap Bulanan & Statistik
+    with tab4:
+        st.markdown("### 📅 Rekap Bulanan Delegasi & Filter")
+        df = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status,tanggal_update FROM delegasi ORDER BY tgl_selesai ASC", conn)
+        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_rekap")
+        if filter_status != "Semua":
+            df = df[df["status"] == filter_status]
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df[df['tgl_mulai'].str[:7] == this_month] if not df.empty else pd.DataFrame()
+        if not df_month.empty:
+            st.download_button("Download Rekap Bulanan (Excel)", df_month.to_excel(index=False, engine='openpyxl'), file_name=f"rekap_delegasi_{this_month}.xlsx")
+            st.download_button("Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_delegasi_{this_month}.csv")
+            by_pic = df_month['pic'].value_counts().head(5)
+            st.write("Top 5 PIC:")
+            st.dataframe(by_pic)
+            status_count = df_month['status'].value_counts().to_dict()
+            st.write("Status:", status_count)
+        st.write(f"Total tugas bulan ini: {len(df_month)}")
+        # Preview warna tenggat
+        st.subheader("⏰ Status Tenggat (preview warna)")
+        rows = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi", conn)
+        def color_for_deadline(end_str):
+            end = datetime.fromisoformat(end_str).date()
+            today = date.today()
+            d = (end - today).days
+            if d < 0:
+                return "Merah"
+            if d <= 3:
+                return "Oranye"
+            if d <= 7:
+                return "Kuning"
+            return "Hijau"
+        rows["color"] = rows["tgl_selesai"].apply(color_for_deadline)
+        st.dataframe(rows)
+def flex_module():
+    user = require_login()
+    st.header("⏰ Flex Time")
+    conn = get_db()
+    cur = conn.cursor()
+    # Cek kolom tabel flex
+    cur.execute("PRAGMA table_info(flex)")
+    flex_cols = [row[1] for row in cur.fetchall()]
+    required_cols = ["alasan","catatan_finance","approval_finance","catatan_director","approval_director"]
+    missing = [c for c in required_cols if c not in flex_cols]
+    if missing:
+        st.error(f"Struktur tabel flex belum sesuai. Kolom berikut belum ada: {', '.join(missing)}.\n\nSilakan backup data, drop tabel flex, lalu jalankan ulang aplikasi agar tabel otomatis dibuat ulang.")
+        return
+    tabs = st.tabs([
+        "📝 Input Staf",
+        "💰 Review Finance",
+        "✅ Approval Director",
+        "📋 Daftar Flex"
+    ])
+
+    # --- Tab 1: Input Staf ---
+    with tabs[0]:
+        st.subheader(":bust_in_silhouette: Ajukan Flex Time")
+        with st.form("flex_add_form"):
+            nama = st.text_input("Nama")
+            tanggal = st.date_input("Tanggal")
+            jam_mulai = st.time_input("Jam Mulai")
+            jam_selesai = st.time_input("Jam Selesai")
+            alasan = st.text_area("Alasan")
+            submit = st.form_submit_button("Ajukan")
+            if submit:
+                # Validasi jam tidak overlap
+                q = "SELECT * FROM flex WHERE tanggal=? AND ((jam_mulai <= ? AND jam_selesai > ?) OR (jam_mulai < ? AND jam_selesai >= ?) OR (jam_mulai >= ? AND jam_selesai <= ?)) AND approval_director=1"
+                params = (tanggal.isoformat(), jam_mulai.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat(), jam_selesai.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat())
+                overlap = pd.read_sql_query(q, conn, params=params)
+                if not nama or not alasan:
+                    st.warning("Nama dan alasan wajib diisi.")
+                elif jam_mulai >= jam_selesai:
+                    st.warning("Jam selesai harus setelah jam mulai.")
+                elif not overlap.empty:
+                    st.error("Jam flex time bentrok/overlap dengan pengajuan lain yang sudah disetujui.")
+                else:
+                    fid = gen_id("flex")
+                    cur.execute("INSERT INTO flex (id, nama, tanggal, jam_mulai, jam_selesai, alasan, catatan_finance, approval_finance, catatan_director, approval_director) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (fid, nama, tanggal.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat(), alasan, '', 0, '', 0))
+                    conn.commit()
+                    try:
+                        audit_log("flex", "create", target=fid, details=f"{nama} {tanggal} {jam_mulai}-{jam_selesai}; alasan={alasan}")
+                    except Exception:
+                        pass
+                    st.success("Flex time diajukan.")
+
+    # --- Tab 2: Review Finance ---
+    with tabs[1]:
+        st.subheader(":money_with_wings: Review Finance")
+        df_fin = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=0 ORDER BY tanggal DESC", conn)
+        if df_fin.empty:
+            st.info("Tidak ada pengajuan flex time yang perlu direview.")
+        else:
+            for idx, row in df_fin.iterrows():
+                with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
+                    st.write(f"Alasan: {row['alasan']}")
+                    catatan = st.text_area("Catatan Finance", value=row['catatan_finance'] or "", key=f"catatan_fin_{row['id']}")
+                    approve = st.button("Approve", key=f"approve_fin_{row['id']}")
+                    reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
+                    if approve or reject:
+                        cur.execute("UPDATE flex SET catatan_finance=?, approval_finance=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        st.success("Status review finance diperbarui.")
+                        st.experimental_rerun()
+
+    # --- Tab 3: Approval Director ---
+    with tabs[2]:
+        st.subheader("👨‍💼 Approval Director")
+        df_dir = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=1 AND approval_director=0 ORDER BY tanggal DESC", conn)
+        if df_dir.empty:
+            st.info("Tidak ada pengajuan flex time yang menunggu approval director.")
+        else:
+            for idx, row in df_dir.iterrows():
+                with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
+                    st.write(f"Alasan: {row['alasan']}")
+                    st.write(f"Catatan Finance: {row['catatan_finance']}")
+                    catatan = st.text_area("Catatan Director", value=row['catatan_director'] or "", key=f"catatan_dir_{row['id']}")
+                    approve = st.button("Approve", key=f"approve_dir_{row['id']}")
+                    reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
+                    if approve or reject:
+                        cur.execute("UPDATE flex SET catatan_director=?, approval_director=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        st.success("Status approval director diperbarui.")
+                        st.experimental_rerun()
+
+    # --- Tab 4: Daftar Flex ---
+    with tabs[3]:
+        st.subheader(":clipboard: Daftar Flex Time")
+        df = pd.read_sql_query("SELECT * FROM flex ORDER BY tanggal DESC, jam_mulai ASC", conn)
+        if df.empty:
+            st.info("Belum ada data flex time.")
+        else:
+            df['status'] = df.apply(lambda r: '✅ Disetujui' if r['approval_director']==1 else ('❌ Ditolak' if r['approval_finance']==-1 or r['approval_director']==-1 else ('🕒 Proses')), axis=1)
+            df['jam_mulai'] = df['jam_mulai'].str[:5]
+            df['jam_selesai'] = df['jam_selesai'].str[:5]
+            st.dataframe(df[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], use_container_width=True)
+        # Rekap Bulanan
+        st.markdown("#### Rekap Bulanan Flex Time (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df[df['tanggal'].str[:7] == this_month] if not df.empty else pd.DataFrame()
+        st.write(f"Total pengajuan flex bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_pegawai = df_month.groupby('nama').agg({'id':'count'}).rename(columns={'id':'jumlah_pengajuan'})
+            st.write("Rekap per Pegawai:")
+            st.dataframe(by_pegawai)
+
+# Modul Mobil Kantor
+def kalender_pemakaian_mobil_kantor():
+    user = require_login()
+    st.header("🚗 Kalender & Booking Mobil Kantor")
+    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Input/edit/hapus hanya oleh Finance, view oleh semua user, cek bentrok jadwal, sinkron ke Kalender Bersama.</div>", unsafe_allow_html=True)
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab3 = st.tabs(["📝 Input/Edit/Hapus (Finance)", "📋 Daftar Booking & Filter", "📅 Rekap Bulanan & Bentrok"])
+
+    # Tab 1: Input/Edit/Hapus (Finance)
+    with tab1:
+        st.markdown("### 📝 Input/Edit/Hapus Jadwal Mobil (Finance)")
+        if user["role"] in ["finance", "superuser"]:
+            with st.form("form_mobil"):  
+                nama_pengguna = st.text_input("Nama")
+                divisi = st.text_input("Divisi")
+                tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+                tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+                tujuan = st.text_input("Tujuan")
+                kendaraan = st.text_input("Kendaraan")
+                driver = st.text_input("Driver")
+                status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
+                finance_note = st.text_area("Catatan")
+                submitted = st.form_submit_button("Simpan Jadwal Mobil")
+                if submitted:
+                    mid = gen_id("mobil")
+                    cur.execute("""
+                        INSERT INTO mobil (id, nama_pengguna, divisi, tgl_mulai, tgl_selesai, tujuan, kendaraan, driver, status, finance_note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        mid, nama_pengguna, divisi, tgl_mulai.isoformat(), tgl_selesai.isoformat(), tujuan, kendaraan, driver, status, finance_note
+                    ))
+                    conn.commit()
+                    try:
+                        audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
+                    except Exception:
+                        pass
+                    st.success("Jadwal mobil berhasil disimpan.")
+            # Edit/hapus jadwal
+            df_edit = pd.read_sql_query("SELECT * FROM mobil ORDER BY tgl_mulai ASC", conn)
+            st.markdown("#### Edit/Hapus Jadwal Mobil")
+            for idx, row in df_edit.iterrows():
+                with st.expander(f"{row['nama_pengguna']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | {row['kendaraan']} | Status: {row['status']}"):
+                    st.write(f"Tujuan: {row['tujuan']}, Driver: {row['driver']}, Catatan: {row['finance_note']}")
+                    if st.button("Hapus Jadwal", key=f"hapus_mobil_{row['id']}"):
+                        cur.execute("DELETE FROM mobil WHERE id=?", (row["id"],))
+                        conn.commit()
+                        try:
+                            audit_log("mobil", "delete", target=row['id'], details=f"kendaraan={row['kendaraan']}; tujuan={row['tujuan']}")
+                        except Exception:
+                            pass
+                        st.success("Jadwal dihapus.")
+                        st.experimental_rerun()
+
+    # Tab 2: Daftar Booking & Filter (semua user)
+    with tab2:
+        st.markdown("### 📋 Daftar Booking Mobil & Filter")
+        df = pd.read_sql_query("SELECT id,nama_pengguna,divisi,tgl_mulai,tgl_selesai,tujuan,kendaraan,driver,status FROM mobil ORDER BY tgl_mulai ASC", conn)
+        filter_status = st.selectbox("Filter Status", ["Semua", "Menunggu Approve", "Disetujui", "Ditolak"], key="filter_status_mobil")
+        filter_kendaraan = st.text_input("Filter Kendaraan (opsional)", "", key="filter_kendaraan_mobil")
+        if filter_status != "Semua":
+            df = df[df["status"] == filter_status]
+        if filter_kendaraan:
+            df = df[df["kendaraan"].str.contains(filter_kendaraan, case=False, na=False)]
+        st.dataframe(df)
+
+    # Tab 3: Rekap Bulanan & Bentrok
+    with tab3:
+        st.markdown("### 📅 Rekap Bulanan Mobil Kantor & Cek Bentrok")
+        df = pd.read_sql_query("SELECT * FROM mobil ORDER BY tgl_mulai ASC", conn)
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df[df['tgl_mulai'].str[:7] == this_month] if not df.empty else pd.DataFrame()
+        st.write(f"Total booking bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_kendaraan = df_month['kendaraan'].value_counts()
+            st.write("Top Kendaraan Dipakai:")
+            st.dataframe(by_kendaraan)
+        # Cek bentrok jadwal mobil kantor (kendaraan sama, tanggal overlap)
+        st.markdown("#### 🚨 Cek Bentrok Jadwal Mobil Kantor")
+        if not df.empty:
+            df_sorted = df.sort_values(["kendaraan", "tgl_mulai"])
+            overlaps = []
+            for kendaraan, group in df_sorted.groupby("kendaraan"):
+                prev_end = None
+                for idx, row in group.iterrows():
+                    start = pd.to_datetime(row["tgl_mulai"])
+                    end = pd.to_datetime(row["tgl_selesai"])
+                    if prev_end and start <= prev_end:
+                        overlaps.append((kendaraan, row["tgl_mulai"], row["tgl_selesai"]))
+                    prev_end = max(prev_end, end) if prev_end else end
+            if overlaps:
+                st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
+            else:
+                st.success("Tidak ada bentrok jadwal mobil kantor bulan ini.")
+
+def calendar_module():
+
+    user = require_login()
+    st.header("📅 Kalender Bersama (Auto Integrasi)")
+    conn = get_db()
+    cur = conn.cursor()
+
+    tab1, tab2 = st.tabs(["➕ Tambah Libur Nasional", "📆 Kalender & Rekap"])
+
+    # Tab 1: Tambah Libur Nasional (khusus Director/Superuser)
+    with tab1:
+        st.subheader("Tambah Libur Nasional (Director)")
+        if user["role"] in ["director", "superuser"]:
+            with st.form("add_libur_nasional"):
+                judul = st.text_input("Judul Libur Nasional")
+                tgl_mulai = st.date_input("Tgl Mulai")
+                tgl_selesai = st.date_input("Tgl Selesai")
+                sumber = st.text_input("Sumber / Dasar Penetapan (opsional)")
+                if st.form_submit_button("Tambah Libur Nasional"):
+                    cid = gen_id("cal")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("INSERT INTO calendar (id,jenis,judul,nama_divisi,tgl_mulai,tgl_selesai,deskripsi,file_blob,file_name,is_holiday,sumber,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (cid, "Libur Nasional", judul, "-", tgl_mulai.isoformat(), tgl_selesai.isoformat(), sumber, None, None, 1, sumber, user["full_name"], now))
+                    cur.execute("INSERT INTO public_holidays (tahun,tanggal,nama,keterangan,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?)",
+                        (tgl_mulai.year, tgl_mulai.isoformat(), judul, sumber or "", user["full_name"], now))
+                    conn.commit()
+                    try:
+                        audit_log("calendar", "add_holiday", target=cid, details=f"{judul} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    st.success("Libur Nasional ditambahkan.")
+        else:
+            st.info("Hanya Director yang bisa menambah Libur Nasional.")
+
+    # Tab 2: Kalender Gabungan & Rekap
+    with tab2:
+        # --- AUTO INTEGRASI EVENT ---
+        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
+        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
+        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
+        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai, kendaraan FROM mobil WHERE status='Disetujui'", conn)
+        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", conn)
+
+        # Gabungkan semua event
+        df_all = pd.concat([
+            df_cuti,
+            df_flex,
+            df_delegasi,
+            df_rapat,
+            df_mobil.drop(columns=["kendaraan"], errors="ignore"),
+            df_libur
+        ], ignore_index=True)
+
+        # Cek overlap mobil kantor (tidak boleh overlap untuk kendaraan yang sama)
+        if not df_mobil.empty:
+            df_mobil_sorted = df_mobil.sort_values(["kendaraan", "tgl_mulai"])
+            overlaps = []
+            for kendaraan, group in df_mobil_sorted.groupby("kendaraan"):
+                prev_end = None
+                for idx, row in group.iterrows():
+                    start = pd.to_datetime(row["tgl_mulai"])
+                    end = pd.to_datetime(row["tgl_selesai"])
+                    if prev_end and start <= prev_end:
+                        overlaps.append((kendaraan, row["tgl_mulai"], row["tgl_selesai"]))
+                    prev_end = max(prev_end, end) if prev_end else end
+            if overlaps:
+                st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
+
+        # -------------------------
+        # Filter UI
+        # -------------------------
+        st.subheader("🔎 Filter Kalender")
+        if not df_all.empty:
+            # Siapkan kolom bantu untuk filter tanggal overlap
+            df_all = df_all.copy()
+            df_all["tgl_mulai_dt"] = pd.to_datetime(df_all["tgl_mulai"], errors="coerce")
+            df_all["tgl_selesai_dt"] = pd.to_datetime(df_all["tgl_selesai"], errors="coerce")
+
+            min_date = df_all["tgl_mulai_dt"].min()
+            max_date = df_all["tgl_selesai_dt"].max()
+            # Default rentang: bulan ini jika ada, fallback ke min/max
+            today = date.today()
+            month_start = today.replace(day=1)
+            next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            month_end = next_month - timedelta(days=1)
+            default_start = month_start if pd.notna(min_date) else today
+            default_end = month_end if pd.notna(max_date) else today
+
+            col_a, col_b = st.columns([2, 2])
+            with col_a:
+                jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
+                jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options)
+            with col_b:
+                date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end))
+
+            col_c, col_d = st.columns([2, 2])
+            with col_c:
+                filter_div = st.text_input("Filter Divisi (nama_divisi)", "")
+            with col_d:
+                filter_judul = st.text_input("Cari Judul", "")
+
+            # Terapkan filter
+            dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                start_d, end_d = date_range
+                if start_d and end_d:
+                    # Event overlap jika mulai <= end_d dan selesai >= start_d
+                    dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
+            if filter_div:
+                dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
+            if filter_judul:
+                dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
+
+            # Tampilkan hasil
+            st.subheader("📆 Tampilkan Kalender (Gabungan) — Hasil Filter")
+            if not dff.empty:
+                dff = dff.sort_values("tgl_mulai")
+                show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
+                st.dataframe(dff[show_cols], use_container_width=True)
+                # Download CSV hasil filter
+                csv_bytes = dff[show_cols].to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download CSV (Hasil Filter)", data=csv_bytes, file_name=f"kalender_gabungan_filtered_{today.isoformat()}.csv", mime="text/csv")
+            else:
+                st.info("Tidak ada event sesuai filter.")
+
+            # Rekap Bulanan Kalender (berdasarkan hasil filter)
+            st.markdown("#### 📅 Rekap Bulanan Kalender (Otomatis) — Berdasar Filter")
+            this_month = date.today().strftime("%Y-%m")
+            df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
+            st.write(f"Total event bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                by_jenis = df_month['jenis'].value_counts()
+                st.write("Rekap per Jenis Event:")
+                st.dataframe(by_jenis)
+        else:
+            st.info("Belum ada event pada kalender.")
+
+ 
+
+def notulen_module():
+    user = require_login()
+    st.header("🗒️ Notulen Rapat Rutin")
+    conn = get_db()
+    cur = conn.cursor()
+    # Introspeksi awal kolom dan tanggal utama
+    cur.execute("PRAGMA table_info(notulen)")
+    nt_cols = [row[1] for row in cur.fetchall()]
+    nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
+
+    tab_upload, tab_list, tab_rekap = st.tabs(["🆕 Upload Notulen", "📋 Daftar Notulen", "📅 Rekap Bulanan Notulen"])
+
+    # --- Tab 1: Upload ---
+    with tab_upload:
+        st.subheader("🆕 Upload Notulen (staf upload, Director approve final)")
+        with st.form("not_add", clear_on_submit=True):
+            judul = st.text_input("Judul Rapat")
+            if nt_date_col == "tanggal_rapat":
+                tgl = st.date_input("Tanggal Rapat", value=date.today())
+            else:
+                tgl = None
+                st.caption("Tanggal upload akan dicatat otomatis.")
+            f = st.file_uploader("File Notulen (PDF/DOC/IMG)")
+            follow_up = st.text_area("Catatan Follow Up (opsional)") if "follow_up" in nt_cols else None
+            deadline = st.date_input("Deadline / Tindak Lanjut", value=date.today()) if "deadline" in nt_cols else None
+            submit = st.form_submit_button("💾 Upload Notulen")
+            if submit:
+                if not judul or not f:
+                    st.warning("Judul dan file wajib diisi.")
+                else:
+                    nid = gen_id("not")
+                    blob, fname, _ = upload_file_and_store(f)
+                    meta = get_last_upload_meta()
+                    # ensure columns for Drive metadata
+                    try:
+                        cur.execute("ALTER TABLE notulen ADD COLUMN file_id TEXT")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute("ALTER TABLE notulen ADD COLUMN file_url TEXT")
+                    except Exception:
+                        pass
+                    cols = ["id", "judul", "file_blob", "file_name", "file_id", "file_url"]
+                    vals = [nid, judul, blob, fname, meta.get("file_id"), meta.get("file_url")]
+                    if nt_date_col == "tanggal_rapat":
+                        cols.append("tanggal_rapat"); vals.append(tgl.isoformat())
+                    elif nt_date_col == "tanggal_upload":
+                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                    if "follow_up" in nt_cols:
+                        cols.append("follow_up"); vals.append(follow_up or "")
+                    if "deadline" in nt_cols and deadline:
+                        cols.append("deadline"); vals.append(deadline.isoformat())
+                    if "uploaded_by" in nt_cols:
+                        cols.append("uploaded_by"); vals.append(user.get("full_name") or user.get("email"))
+                    if "director_note" in nt_cols:
+                        cols.append("director_note"); vals.append("")
+                    if "director_approved" in nt_cols:
+                        cols.append("director_approved"); vals.append(0)
+                    placeholders = ", ".join(["?" for _ in cols])
+                    cur.execute(f"INSERT INTO notulen ({', '.join(cols)}) VALUES ({placeholders})", vals)
+                    conn.commit()
+                    try:
+                        audit_log("notulen", "upload", target=nid, details=f"{judul} {tgl or ''}; file={fname}")
+                    except Exception:
+                        pass
+                    st.success("Notulen berhasil diupload. Menunggu approval Director.")
+
+    # --- Tab 2: Daftar ---
+    with tab_list:
+        st.subheader("📋 Daftar Notulen")
+        # Build SELECT dinamis
+        cur.execute("PRAGMA table_info(notulen)")
+        nt_cols = [row[1] for row in cur.fetchall()]
+        nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
+        select_cols = ["id", "judul"]
+        if nt_date_col: select_cols.append(nt_date_col)
+        for extra in ["uploaded_by", "deadline", "director_approved", "file_name"]:
+            if extra in nt_cols:
+                select_cols.append(extra)
+        order_clause = f" ORDER BY {nt_date_col} DESC" if nt_date_col else " ORDER BY id DESC"
+        df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM notulen" + order_clause, conn)
+
+        # Filter UI
+        c1, c2, c3 = st.columns([2,2,3])
+        with c1:
+            q = st.text_input("Cari Judul", "")
+        with c2:
+            status_sel = st.selectbox("Status", ["Semua","Approved","Belum"]) if "director_approved" in df.columns else "Semua"
+        with c3:
+            if nt_date_col and not df.empty:
+                min_d = pd.to_datetime(df[nt_date_col]).min().date()
+                max_d = pd.to_datetime(df[nt_date_col]).max().date()
+                dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
+            else:
+                dr = None
+
+        dff = df.copy()
+        if q:
+            dff = dff[dff["judul"].astype(str).str.contains(q, case=False, na=False)]
+        if status_sel != "Semua" and "director_approved" in dff.columns:
+            dff = dff[dff["director_approved"] == (1 if status_sel == "Approved" else 0)]
+        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and nt_date_col and nt_date_col in dff.columns:
+            s, e = dr
+            dff = dff[(pd.to_datetime(dff[nt_date_col]) >= pd.to_datetime(s)) & (pd.to_datetime(dff[nt_date_col]) <= pd.to_datetime(e))]
+
+        if not dff.empty:
+            show = dff.copy()
+            if "director_approved" in show.columns:
+                show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
+            cols_show = ["judul"]
+            if nt_date_col: cols_show.append(nt_date_col)
+            for c in ["uploaded_by", "deadline", "file_name", "Status"]:
+                if c in show.columns:
+                    cols_show.append(c)
+            st.dataframe(show[cols_show], use_container_width=True)
+
+            # Download file terpilih
+            if "id" in show.columns and "file_name" in show.columns:
+                opsi = {f"{r['judul']} — {r.get(nt_date_col, '')}" + (f" ({r['file_name']})" if r.get('file_name') else ""): r['id'] for _, r in show.iterrows()}
+                if opsi:
+                    pilih = st.selectbox("Pilih notulen untuk diunduh", [""] + list(opsi.keys()))
+                    if pilih:
+                        nid = opsi[pilih]
+                        row = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=?", conn, params=(nid,)).iloc[0]
+                        show_file_download(row.get("file_blob"), row.get("file_name"), row.get("file_url"))
+
+            # Approval Director inline
+            if user["role"] in ["director", "superuser"] and "director_approved" in nt_cols:
+                st.markdown("#### ✅ Approval Director (Pending)")
+                pend = pd.read_sql_query(
+                    f"SELECT id, judul" + (f", {nt_date_col}" if nt_date_col else "") + ", file_name, director_note FROM notulen WHERE director_approved=0" + (f" ORDER BY {nt_date_col} DESC" if nt_date_col else ""),
+                    conn
+                )
+                if pend.empty:
+                    st.info("Tidak ada notulen menunggu approval.")
+                else:
+                    for _, r in pend.iterrows():
+                        title = f"{r['judul']}" + (f" | {r[nt_date_col]}" if nt_date_col and r.get(nt_date_col) else "")
+                        with st.expander(title):
+                            st.write(f"File: {r.get('file_name') or '-'}")
+                            rr = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=?", conn, params=(r['id'],))
+                            if not rr.empty:
+                                rr0 = rr.iloc[0]
+                                show_file_download(rr0.get("file_blob"), rr0.get("file_name"), rr0.get("file_url"))
+                            note = st.text_area("Catatan Director (opsional)", value=r.get("director_note") or "", key=f"nt_note_{r['id']}")
+                            if st.button("Approve Notulen", key=f"nt_approve_{r['id']}"):
+                                if "director_note" in nt_cols:
+                                    cur.execute("UPDATE notulen SET director_approved=1, director_note=? WHERE id=?", (note, r['id']))
+                                else:
+                                    cur.execute("UPDATE notulen SET director_approved=1 WHERE id=?", (r['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("notulen", "director_approval", target=r['id'], details=f"note={note}")
+                                except Exception:
+                                    pass
+                                st.success("Notulen approved.")
+                                st.rerun()
+        else:
+            st.info("Belum ada notulen.")
+
+    # --- Tab 3: Rekap ---
+    with tab_rekap:
+        st.subheader("📅 Rekap Bulanan Notulen (Otomatis)")
+        cur.execute("PRAGMA table_info(notulen)")
+        nt_cols = [row[1] for row in cur.fetchall()]
+        nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
+        select_cols = ["id", "judul"]
+        if nt_date_col: select_cols.append(nt_date_col)
+        df_all = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM notulen", conn)
+        this_month = date.today().strftime("%Y-%m")
+        if not df_all.empty and (nt_date_col and nt_date_col in df_all.columns):
+            df_month = df_all[df_all[nt_date_col].astype(str).str[:7] == this_month]
+        else:
+            df_month = pd.DataFrame()
+        st.write(f"Total notulen bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            if nt_date_col:
+                st.dataframe(df_month[["judul", nt_date_col]], use_container_width=True)
+            else:
+                st.dataframe(df_month[["judul"]], use_container_width=True)
+            try:
+                st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False).encode("utf-8"), file_name=f"rekap_notulen_{this_month}.csv")
+            except Exception:
+                pass
+
+# -------------------------
+# User Setting Module
+# -------------------------
+def user_setting_module():
+    user = require_login()
+    st.header("⚙️ User Setting")
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Ambil data user terkini dari DB
+    cur.execute("SELECT id, email, full_name, role, status, last_login FROM users WHERE id = ?", (user["id"],))
+    me = cur.fetchone()
+    if not me:
+        st.error("User tidak ditemukan di database.")
+        return
+
+        # Kartu ringkas profil (rapi & ringkas)
+        email = me["email"] or "-"
+        nama = me["full_name"] or "-"
+        role = me["role"] or "-"
+        status = me["status"] or "-"
+        st.markdown(
+                f"""
+                <div style='background:#f8fafc;border:1px solid #e5efff;border-radius:12px;padding:12px 16px;margin-bottom:12px;'>
+                    <div style='display:flex;gap:24px;flex-wrap:wrap;'>
+                        <div style='min-width:260px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Email</div>
+                            <div style='font-weight:600;font-size:16px'>{email}</div>
+                        </div>
+                        <div style='min-width:220px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Nama</div>
+                            <div style='font-weight:600;font-size:16px'>{nama}</div>
+                        </div>
+                        <div style='min-width:160px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Role</div>
+                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{role}</div>
+                        </div>
+                        <div style='min-width:140px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Status</div>
+                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{status}</div>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+        )
+
+    tab_profile, tab_admin = st.tabs(["👤 Profil Saya", "🔐 Admin (Director)"])
+
+    # --- Tab 1: Profil Saya ---
+    with tab_profile:
+        st.subheader("Ubah Profil")
+        with st.form("change_name_form"):
+            new_name = st.text_input("Nama Lengkap", value=me["full_name"] or "")
+            save_name = st.form_submit_button("Simpan Nama")
+            if save_name:
+                if not new_name.strip():
+                    st.warning("Nama tidak boleh kosong.")
+                else:
+                    cur.execute("UPDATE users SET full_name=? WHERE id=?", (new_name.strip(), me["id"]))
+                    conn.commit()
+                    # Update session juga
+                    st.session_state["user"]["full_name"] = new_name.strip()
+                    try:
+                        audit_log("user_setting", "update_profile", target=me["email"], details=f"Ubah nama menjadi '{new_name.strip()}'")
+                    except Exception:
+                        pass
+                    st.success("Nama berhasil diperbarui.")
 
         st.markdown("---")
-        st.subheader("Daftar Karyawan")
-        employees_df_master = get_employees()
-        if not employees_df_master.empty:
-            st.dataframe(employees_df_master, use_container_width=True, hide_index=True)
+        st.subheader("Ubah Password")
+        with st.form("change_password_form"):
+            old_pw = st.text_input("Password Lama", type="password")
+            new_pw = st.text_input("Password Baru", type="password")
+            new_pw2 = st.text_input("Ulangi Password Baru", type="password")
+            change_pw = st.form_submit_button("Ganti Password")
+            if change_pw:
+                # Validasi
+                if not old_pw or not new_pw or not new_pw2:
+                    st.warning("Semua field password wajib diisi.")
+                elif new_pw != new_pw2:
+                    st.warning("Konfirmasi password baru tidak cocok.")
+                elif len(new_pw) < 6:
+                    st.warning("Password baru minimal 6 karakter.")
+                else:
+                    # Cek password lama
+                    cur.execute("SELECT password_hash FROM users WHERE id=?", (me["id"],))
+                    row = cur.fetchone()
+                    if not row or row["password_hash"] != hash_password(old_pw):
+                        st.error("Password lama tidak sesuai.")
+                    else:
+                        cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_pw), me["id"]))
+                        conn.commit()
+                        try:
+                            audit_log("user_setting", "change_password", target=me["email"], details="Ganti password sendiri")
+                        except Exception:
+                            pass
+                        st.success("Password berhasil diganti.")
 
-            st.markdown("---")
-            with st.expander("Kelola Data Karyawan"):
-                selected_employee_name = st.selectbox("Pilih Nama Karyawan", employees_df_master['nama_karyawan'].tolist(), key='master_edit_select')
-                
-                selected_row = employees_df_master[employees_df_master['nama_karyawan'] == selected_employee_name].iloc[0]
-                
-                with st.form("edit_employee_form"):
+    # --- Tab 2: Admin (Director) ---
+    with tab_admin:
+        st.subheader("Admin User (Khusus Director/Superuser)")
+        if (st.session_state.get("user", {}).get("role") not in ["director", "superuser"]):
+            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
+        else:
+            # Cek kolom untuk sorting
+            cur.execute("PRAGMA table_info(users)")
+            user_cols = {r[1] for r in cur.fetchall()}
+            order_col = "created_at" if "created_at" in user_cols else "email"
+
+            # Daftar user ringkas & filter
+            with st.expander("Cari & Pilih User", expanded=True):
+                keyword = st.text_input("Cari user (email/nama)", value="")
+                if keyword:
+                    dfu = pd.read_sql_query(
+                        f"SELECT id,email,full_name,role,status,last_login FROM users WHERE email LIKE ? OR full_name LIKE ? ORDER BY {order_col} DESC",
+                        conn, params=(f"%{keyword}%", f"%{keyword}%")
+                    )
+                else:
+                    dfu = pd.read_sql_query(f"SELECT id,email,full_name,role,status,last_login FROM users ORDER BY {order_col} DESC", conn)
+                st.dataframe(dfu, use_container_width=True, hide_index=True)
+
+                # Pilih user target
+                options = [f"{r['id']} | {r['email']} | {r['full_name']} | {r['role']} | {r['status']}" for _, r in dfu.iterrows()] if not dfu.empty else []
+                selected = st.selectbox("Pilih user", ["-"] + options)
+                target_id = None
+                if selected and selected != "-":
+                    target_id = selected.split(" | ")[0]
+
+            if target_id:
+                cur.execute("SELECT id,email,full_name,role,status FROM users WHERE id=?", (target_id,))
+                target = cur.fetchone()
+                if not target:
+                    st.error("User target tidak ditemukan.")
+                else:
+                    st.markdown(f"**Target:** {target['email']} · {target['full_name']} · {target['role']} · {target['status']}")
                     col1, col2 = st.columns(2)
                     with col1:
-                        edit_nama = st.text_input("Nama", value=selected_row['nama_karyawan'])
+                        st.markdown("##### Reset Password User")
+                        with st.form("admin_reset_pw"):
+                            npw = st.text_input("Password Baru", type="password")
+                            npw2 = st.text_input("Ulangi Password Baru", type="password")
+                            do_reset = st.form_submit_button("Reset Password")
+                            if do_reset:
+                                if len(npw) < 6:
+                                    st.warning("Password minimal 6 karakter.")
+                                elif npw != npw2:
+                                    st.warning("Konfirmasi password tidak cocok.")
+                                else:
+                                    cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(npw), target["id"]))
+                                    conn.commit()
+                                    try:
+                                        audit_log("user_setting", "reset_password", target=target["email"], details=f"Oleh {me['email']}")
+                                    except Exception:
+                                        pass
+                                    st.success("Password user berhasil direset.")
                     with col2:
-                        edit_bagian = st.text_input("Bagian", value=selected_row['bagian'])
-                    
-                    # Perbaikan: Menggunakan float() untuk memastikan nilai numerik
-                    gaji_pokok_value = float(selected_row['gaji_pokok']) if pd.notna(selected_row['gaji_pokok']) else 0.0
-                    # Mengubah label untuk mencerminkan gaji per hari
-                    edit_gaji = st.number_input("Gaji Pokok per Hari", value=gaji_pokok_value, min_value=0.0)
-                    
-                    col_btn1, col_btn2 = st.columns(2)
-                    with col_btn1:
-                        if st.form_submit_button("Simpan Perubahan"):
-                            if update_employee(selected_employee_name, edit_nama, edit_bagian, edit_gaji):
-                                st.success("Data karyawan berhasil diperbarui! ✅")
-                                st.rerun()
-                            else:
-                                st.error("Gagal memperbarui data. Nama karyawan mungkin sudah ada.")
-                    with col_btn2:
-                        if st.form_submit_button("Hapus Karyawan"):
-                            if delete_employee(selected_employee_name):
-                                st.success("Karyawan berhasil dihapus. 🗑️")
-                                st.rerun()
-                            else:
-                                st.error("Gagal menghapus karyawan.")
-        else:
-            st.info("Belum ada data karyawan.")
+                        st.markdown("##### Hapus User")
+                        st.caption("Aksi permanen. Tidak dapat dibatalkan.")
+                        with st.form("admin_delete_user"):
+                            confirm_mail = st.text_input("Ketik email user untuk konfirmasi")
+                            confirm_yes = st.checkbox("Saya yakin ingin menghapus user ini")
+                            do_delete = st.form_submit_button("Hapus User", disabled=(target["id"] == me["id"]))
+                            if do_delete:
+                                if target["id"] == me["id"]:
+                                    st.error("Tidak dapat menghapus akun sendiri.")
+                                elif target["role"] == "superuser" and me["role"] != "superuser":
+                                    st.error("Hanya Superuser yang boleh menghapus Superuser.")
+                                elif confirm_mail.strip().lower() != (target["email"] or "").lower():
+                                    st.error("Konfirmasi email tidak cocok.")
+                                elif not confirm_yes:
+                                    st.error("Centang konfirmasi terlebih dahulu.")
+                                else:
+                                    cur.execute("DELETE FROM users WHERE id=?", (target["id"],))
+                                    conn.commit()
+                                    try:
+                                        audit_log("user_setting", "delete_user", target=target["email"], details=f"Oleh {me['email']}")
+                                    except Exception:
+                                        pass
+                                    st.success("User berhasil dihapus. Silakan refresh daftar di atas.")
 
-    with tab_process:
-        st.subheader("Proses Penggajian Bulanan")
-        employees_df = get_employees()
-        if employees_df.empty:
-            st.warning("Tambahkan data karyawan terlebih dahulu di tab 'Master Karyawan'. ⚠️")
-        else:
-            # Gsheets doesn't have an ID column by default. We'll simulate it for this session.
-            employees_df['id'] = range(1, len(employees_df) + 1)
-            employee_options = employees_df.apply(lambda row: f"{int(row['id'])} - {row['nama_karyawan']} ({row['bagian']})", axis=1).tolist()
-            selected_employee_str = st.selectbox("Pilih Karyawan", employee_options)
-            
-            if selected_employee_str:
-                employee_id = int(selected_employee_str.split(' - ')[0])
-                selected_employee_data = employees_df[employees_df['id'] == employee_id].iloc[0]
-                
-                with st.form("payroll_form"):
-                    st.write(f"**Nama:** {selected_employee_data['nama_karyawan']}")
-                    st.write(f"**Bagian:** {selected_employee_data['bagian']}")
+# -------------------------
+# Dashboard
+# -------------------------
+def dashboard():
+    user = require_login()
+    st.title("🏠 Dashboard WIJNA")
+    conn = get_db()
+    cur = conn.cursor()
 
-                    selected_date = st.date_input("Pilih Tanggal Gaji", value=datetime.now().date())
-                    gaji_bulan = selected_date.strftime('%B %Y')
+    # Notification Approval (count items needing approval)
+    q_pending = 0
+    services = [
+        ("inventory","finance_approved=0 OR director_approved=0"),
+        ("cash_advance","finance_approved=0 OR director_approved=0"),
+        ("pmr","finance_approved=0 OR director_approved=0"),
+        ("cuti","finance_approved=0 OR director_approved=0"),
+        ("surat_keluar","director_approved=0"),
+        ("mou","director_approved=0"),
+        ("sop","director_approved=0"),
+        ("notulen","director_approved=0"),
+    ]
+    notif_items = []
+    import sqlite3
+    for table, cond in services:
+        try:
+            cur.execute(f"SELECT COUNT(*) as c FROM {table} WHERE {cond}")
+            c = cur.fetchone()["c"]
+            if c > 0:
+                notif_items.append((table, c))
+                q_pending += c
+        except sqlite3.OperationalError as e:
+            st.error(f"Tabel '{table}' belum memiliki kolom yang diperlukan: {e}")
+            continue
 
-                    st.markdown("### Pendapatan")
-                    
-                    gaji_per_hari = selected_employee_data['gaji_pokok']
-                    st.number_input("Gaji Pokok per Hari", value=gaji_per_hari, disabled=True)
-                    
-                    # Menambahkan input untuk jumlah hari kerja
-                    hari_kerja = st.number_input("Jumlah Hari Masuk", min_value=0, value=25)
-                    
-                    # Perhitungan gaji pokok berdasarkan hari kerja
-                    gaji_pokok_dihitung = gaji_per_hari * hari_kerja
-                    st.write(f"Gaji Pokok (Total): Rp {gaji_pokok_dihitung:,.2f}")
+    # --- Stat Cards Section (Always Show at Top) ---
+    st.markdown("""
+<style>
+.stat-card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+    padding: 1.5rem;
+    transition: box-shadow 0.2s;
+    margin-bottom: 0.5rem;
+}
+.stat-card:hover {
+                box-shadow: 0 6px 18px rgba(0,0,0,0.13);
+        }
+        .stat-flex {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+        }
+        .stat-label {
+                font-size: 1rem;
+                color: #666;
+                font-weight: 500;
+                margin-bottom: 0.2rem;
+        }
+        .stat-value {
+                font-size: 2.2rem;
+                font-weight: bold;
+                margin-bottom: 0.1rem;
+        }
+        .stat-delta {
+                font-size: 1rem;
+                color: #888;
+        }
+        .stat-iconbox {
+                width: 48px; height: 48px;
+                border-radius: 12px;
+                display: flex; align-items: center; justify-content: center;
+        }
+        .stat-iconbox.orange { background: #fff7ed; }
+        .stat-iconbox.blue { background: #e6f0fa; }
+        .stat-iconbox.purple { background: #f3e8ff; }
+        .stat-icon.orange { color: #fb923c; }
+        .stat-icon.blue { color: #2563eb; }
+        .stat-icon.purple { color: #a21caf; }
+        .stat-value.orange { color: #fb923c; }
+        .stat-value.blue { color: #2563eb; }
+        .stat-value.purple { color: #a21caf; }
+        </style>
+        """, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">Approval Menunggu</div> 
+                    <div class=\"stat-value orange\">{q_pending}</div> 
+                    <div class=\"stat-delta\">Menunggu persetujuan</div> 
+                </div> 
+                <div class=\"stat-iconbox orange\"> 
+                    <svg class=\"stat-icon orange\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <circle cx=\"12\" cy=\"12\" r=\"10\"/>
+                                        <polyline points=\"12,6 12,12 16,14\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+        """, unsafe_allow_html=True)
+    cur.execute("SELECT COUNT(*) as c FROM surat_masuk WHERE status='Belum Dibahas'")
+    sm_unprocessed = cur.fetchone()["c"]
+    with col2:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">Surat Belum Dibahas</div> 
+                    <div class=\"stat-value blue\">{sm_unprocessed}</div> 
+                    <div class=\"stat-delta\">Belum diproses</div> 
+                </div> 
+                <div class=\"stat-iconbox blue\"> 
+                    <svg class=\"stat-icon blue\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"4\"/>
+                                        <path d=\"M9 9h6v6H9z\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+        """, unsafe_allow_html=True)
+    cur.execute("SELECT COUNT(*) as c FROM mou WHERE date(tgl_selesai) <= date('now','+7 day')")
+    mou_due7 = cur.fetchone()["c"]
+    with col3:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">MoU ≤ 7 hari jatuh tempo</div> 
+                    <div class=\"stat-value purple\">{mou_due7}</div> 
+                    <div class=\"stat-delta\">Segera ditindaklanjuti</div> 
+                </div> 
+                <div class=\"stat-iconbox purple\"> 
+                    <svg class=\"stat-icon purple\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/>
+                                        <polyline points=\"14,2 14,8 20,8\"/>
+                                        <line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/>
+                                        <line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                    lembur = st.number_input("Lembur", min_value=0.0)
-                    lembur_minggu = st.number_input("Lembur Minggu", min_value=0.0)
-                    uang_makan = st.number_input("Uang Makan", min_value=0.0)
-                    
-                    total_pendapatan = gaji_pokok_dihitung + lembur + lembur_minggu + uang_makan
-                    st.markdown(f"**Total Pendapatan (1):** **Rp {total_pendapatan:,.2f}**")
-                    
-                    st.markdown("### Potongan")
-                    pot_absen_finger = st.number_input("Potongan Absen Finger", min_value=0.0)
-                    ijin_hr = st.number_input("Ijin HR", min_value=0.0)
-                    
-                    total_setelah_potongan1 = total_pendapatan - pot_absen_finger - ijin_hr
-                    st.markdown(f"**Total Setelah Potongan Absen (2):** **Rp {total_setelah_potongan1:,.2f}**")
-                    
-                    st.markdown("### Potongan Lain-lain")
-                    simpanan_wajib = st.number_input("Simpanan Wajib", min_value=0.0)
-                    potongan_koperasi = st.number_input("Potongan Koperasi", min_value=0.0)
-                    kasbon = st.number_input("Kasbon", min_value=0.0)
+    st.markdown("""
+    <style>
+    .wijna-section-card {
+        background: #f8fafc;
+        border-radius: 14px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+        padding: 1.2rem 1.5rem 1.2rem 1.5rem;
+        margin-bottom: 1.2rem;
+    }
+    .wijna-section-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #2563eb;
+        margin-bottom: 0.5rem;
+    }
+    .wijna-section-desc {
+        color: #64748b;
+        font-size: 1rem;
+        margin-bottom: 0.7rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-                    gaji_akhir = total_setelah_potongan1 - simpanan_wajib - potongan_koperasi - kasbon
-                    
-                    st.markdown(f"### **TOTAL GAJI AKHIR:** **Rp {gaji_akhir:,.2f}**")
-                    
-                    keterangan = st.text_area("Keterangan", help="Opsional")
-                    
-                    submitted = st.form_submit_button("💾 Simpan Gaji")
-                    if submitted:
-                        if add_payroll_record(employee_id, gaji_bulan, gaji_pokok_dihitung, lembur, lembur_minggu, uang_makan, pot_absen_finger, ijin_hr, simpanan_wajib, potongan_koperasi, kasbon, gaji_akhir, keterangan):
-                            st.success(f"Penggajian untuk {selected_employee_data['nama_karyawan']} berhasil dicatat. ✅")
-                            st.rerun()
-                        else:
-                            st.error("Gagal menyimpan data gaji.")
+    # --- GRID 2x2 RINGKASAN ---
+    grid1, grid2 = st.columns(2)
+    with grid1:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">🌴 Cuti & Flex — Ringkasan</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Rekap pengajuan cuti dan total durasi per pegawai.</div>', unsafe_allow_html=True)
+        df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) as total_pengajuan, SUM(durasi) as total_durasi FROM cuti GROUP BY nama", conn)
+        for col in df_cuti.columns:
+            if 'tanggal' in col or 'tgl' in col:
+                df_cuti[col] = df_cuti[col].apply(format_datetime_wib)
+        st.dataframe(df_cuti, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    with tab_history:
-        st.subheader("Riwayat Penggajian")
-        
-        st.markdown("### Unduh Semua Slip Gaji (PDF)")
-        payroll_df_all = get_data_from_gsheets('payroll')
-        if not payroll_df_all.empty:
-            payroll_months = payroll_df_all['gaji_bulan'].unique().tolist()
-            selected_month = st.selectbox("Pilih Bulan Gaji", payroll_months)
-            
-            if st.button(f"Unduh Slip Gaji {selected_month}"):
-                payslip_data = get_payroll_records_by_month(selected_month)
-                if not payslip_data.empty:
-                    pdf_file = generate_payslips_pdf(payslip_data)
-                    st.download_button(
-                        label="Unduh PDF 📥",
-                        data=pdf_file,
-                        file_name=f"slip_gaji_{selected_month.replace(' ', '_')}.pdf",
-                        mime="application/pdf"
-                    )
-                else:
-                    st.error("Data penggajian tidak ditemukan untuk bulan tersebut. ❌")
-        else:
-            st.info("Tidak ada riwayat penggajian untuk diunduh.")
+    with grid2:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">🗂️ Delegasi Tugas — Aktif</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Daftar delegasi tugas yang sedang berjalan.</div>', unsafe_allow_html=True)
+        df_del = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", conn)
+        for col in df_del.columns:
+            if 'tanggal' in col or 'tgl' in col:
+                df_del[col] = df_del[col].apply(format_datetime_wib)
+        st.dataframe(df_del, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader("Tabel Riwayat Penggajian")
-        payroll_df = get_payroll_records()
-        if not payroll_df.empty:
-            month_mapping = {
-                'January': 'Januari', 'February': 'Februari', 'March': 'Maret',
-                'April': 'April', 'May': 'Mei', 'June': 'Juni',
-                'July': 'Juli', 'August': 'Agustus', 'September': 'September',
-                'October': 'Oktober', 'November': 'November', 'December': 'Desember'
-            }
-            
-            payroll_df['tanggal_waktu'] = pd.to_datetime(payroll_df['tanggal_waktu'])
-            payroll_df['tanggal_waktu'] = payroll_df['tanggal_waktu'].dt.strftime('%d %B %Y')
-            
-            for en, idn in month_mapping.items():
-                payroll_df['tanggal_waktu'] = payroll_df['tanggal_waktu'].str.replace(en, idn)
-            
-            st.dataframe(payroll_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("Belum ada riwayat penggajian.")
-
-# --- Login & Main App Logic ---
-def login_page():
-    st.title("Login Sistem Kontrol Stok")
-    with st.form("login_form"):
-        st.subheader("Silakan Masuk")
-        username = st.text_input("Nama Pengguna")
-        password = st.text_input("Kata Sandi", type="password")
-        submitted = st.form_submit_button("Login")
-        if submitted:
-            success, role = check_login(username, password)
-            if success:
-                st.session_state['logged_in'] = True
-                st.session_state['role'] = role
-                st.session_state['page'] = 'Dashboard'
-                st.success(f"Berhasil Login sebagai **{role.upper()}**! ✅")
-                st.rerun()
+    grid3, grid4 = st.columns(2)
+    with grid3:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">📅 Kalender Bersama (30 Hari)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Event & hari libur 30 hari ke depan (cuti, flex, delegasi, rapat, mobil kantor, libur nasional).</div>', unsafe_allow_html=True)
+        today = date.today()
+        end_30 = today + timedelta(days=30)
+        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
+        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
+        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
+        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'", conn)
+        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", conn)
+        df_all = pd.concat([
+            df_cuti, df_flex, df_delegasi, df_rapat, df_mobil, df_libur
+        ], ignore_index=True)
+        if not df_all.empty:
+            df_all['tgl_mulai'] = pd.to_datetime(df_all['tgl_mulai'])
+            df_all['tgl_selesai'] = pd.to_datetime(df_all['tgl_selesai'])
+            mask = (df_all['tgl_selesai'] >= pd.to_datetime(today)) & (df_all['tgl_mulai'] <= pd.to_datetime(end_30))
+            df_30 = df_all.loc[mask].copy()
+            df_30 = df_30.sort_values('tgl_mulai')
+            if not df_30.empty:
+                def label_color(jenis):
+                    color_map = {
+                        'Cuti': '#f59e42',
+                        'Flex Time': '#38bdf8',
+                        'Delegasi': '#a78bfa',
+                        'Rapat': '#f472b6',
+                        'Mobil Kantor': '#34d399',
+                        'Libur Nasional': '#ef4444',
+                    }
+                    return f"<span style='background:{color_map.get(jenis,'#ddd')};color:#fff;padding:2px 10px;border-radius:8px;font-size:0.95em'>{jenis}</span>"
+                st.markdown("<ul style='padding-left:1.2em'>", unsafe_allow_html=True)
+                for _, row in df_30.iterrows():
+                    jenis_lbl = label_color(row['jenis'])
+                    tgl = row['tgl_mulai'].strftime('%d-%m-%Y')
+                    tgl2 = row['tgl_selesai'].strftime('%d-%m-%Y')
+                    tgl_str = tgl if tgl == tgl2 else f"{tgl} s/d {tgl2}"
+                    st.markdown(f"<li><b>{row['judul']}</b> {jenis_lbl} <span style='color:#2563eb'>({tgl_str})</span></li>", unsafe_allow_html=True)
+                st.markdown("</ul>", unsafe_allow_html=True)
             else:
-                st.error("Nama pengguna atau kata sandi salah. ❌")
-
-def main():
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = False
-        st.session_state['page'] = 'Login'
-    
-    st.sidebar.title("PT. BERKAT KARYA ANUGERAH")
-    st.sidebar.markdown("---")
-
-    if st.session_state['logged_in']:
-        if 'sheets_checked' not in st.session_state:
-            check_and_create_worksheets()
-            st.session_state['sheets_checked'] = True
-            
-        role = st.session_state['role']
-
-        # Menu yang tersedia untuk setiap peran
-        if role == 'owner':
-            if st.sidebar.button("Dashboard 📈", use_container_width=True): st.session_state['page'] = "Dashboard"
-            if st.sidebar.button("Master Barang 📦", use_container_width=True): st.session_state['page'] = "Master Barang"
-            if st.sidebar.button("Barang Masuk 📥", use_container_width=True): st.session_state['page'] = "Barang Masuk"
-            if st.sidebar.button("Transaksi Keluar 🧾", use_container_width=True): st.session_state['page'] = "Transaksi Keluar"
-            if st.sidebar.button("Monitoring Stok 📊", use_container_width=True): st.session_state['page'] = "Monitoring Stok"
-            if st.sidebar.button("Penggajian 💰", use_container_width=True): st.session_state['page'] = "Penggajian"
-            if st.sidebar.button("Panduan Pengguna ℹ️", use_container_width=True): st.session_state['page'] = "Panduan Pengguna"
-        
-        elif role == 'adm kasir':
-            if st.sidebar.button("Dashboard 📈", use_container_width=True): st.session_state['page'] = "Dashboard"
-            if st.sidebar.button("Transaksi Keluar 🧾", use_container_width=True): st.session_state['page'] = "Transaksi Keluar"
-            if st.sidebar.button("Monitoring Stok 📊", use_container_width=True): st.session_state['page'] = "Monitoring Stok"
-            if st.sidebar.button("Panduan Pengguna ℹ️", use_container_width=True): st.session_state['page'] = "Panduan Pengguna"
-
-        elif role == 'adm gudang':
-            if st.sidebar.button("Dashboard 📈", use_container_width=True): st.session_state['page'] = "Dashboard"
-            if st.sidebar.button("Master Barang 📦", use_container_width=True): st.session_state['page'] = "Master Barang"
-            if st.sidebar.button("Barang Masuk 📥", use_container_width=True): st.session_state['page'] = "Barang Masuk"
-            if st.sidebar.button("Transaksi Keluar 🧾", use_container_width=True): st.session_state['page'] = "Transaksi Keluar"
-            if st.sidebar.button("Monitoring Stok 📊", use_container_width=True): st.session_state['page'] = "Monitoring Stok"
-            if st.sidebar.button("Panduan Pengguna ℹ️", use_container_width=True): st.session_state['page'] = "Panduan Pengguna"
-        
-        st.sidebar.markdown("---")
-        if st.sidebar.button("Logout 🚪", use_container_width=True):
-            st.session_state.clear()
-            st.session_state['logged_in'] = False
-            st.session_state['page'] = 'Login'
-            st.rerun()
-        
-        # Perbarui pemanggilan fungsi berdasarkan peran
-        if st.session_state['page'] == "Dashboard":
-            show_dashboard()
-        elif st.session_state['page'] == "Master Barang" and role in ['owner', 'adm gudang']:
-            show_master_barang()
-        elif st.session_state['page'] == "Barang Masuk" and role in ['owner', 'adm gudang']:
-            show_input_masuk()
-        elif st.session_state['page'] == "Transaksi Keluar" and role in ['owner', 'adm kasir', 'adm gudang']:
-            show_transaksi_keluar_invoice_page()
-        elif st.session_state['page'] == "Monitoring Stok" and role in ['owner', 'adm kasir', 'adm gudang']:
-            show_monitoring_stok()
-        elif st.session_state['page'] == "Penggajian" and role == 'owner':
-            show_payroll_page()
-        elif st.session_state['page'] == "Panduan Pengguna" and role in ['owner', 'adm kasir', 'adm gudang']:
-            show_user_guide()
+                st.info("Tidak ada event 30 hari ke depan.")
         else:
-            # Fallback untuk memastikan halaman tidak kosong jika pengguna tidak memiliki akses
-            st.error("Anda tidak memiliki akses ke menu ini. Silakan pilih menu lain dari sidebar.")
+            st.info("Tidak ada event 30 hari ke depan.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with grid4:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">📊 Rekap Bulanan (Ringkasan)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Rekap otomatis tersedia di tabel <b>rekap_monthly_*</b> (trigger scheduler belum diimplementasikan).</div>', unsafe_allow_html=True)
+        df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance LIMIT 10", conn)
+        for col in df_ca_rekap.columns:
+            if 'tanggal' in col or 'tgl' in col or 'updated' in col:
+                df_ca_rekap[col] = df_ca_rekap[col].apply(format_datetime_wib)
+        st.write("Cash Advance Rekap (sample)")
+        st.dataframe(df_ca_rekap, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+
+# -------------------------
+# Main app flow
+# -------------------------
+def main():
+    ensure_db()
+    # Prepare Google Sheets / Drive backend if configured
+    try:
+        check_and_create_worksheets()
+    except Exception:
+        pass
+    try:
+        _hydrate_sqlite_from_sheets()
+    except Exception:
+        pass
+    try:
+        _initial_full_sync_to_sheets()
+    except Exception:
+        pass
+    # --- Sidebar Logo ---
+    user = get_current_user()
+    if not user:
+        # --- Full page login/register, no sidebar ---
+        st.markdown("""
+            <style>
+            [data-testid="stSidebar"], .stSidebar {display: none !important;}
+            .center-login {
+                max-width: 400px;
+                margin: 5% auto 0 auto;
+                background: #fff;
+                border-radius: 12px;
+                box-shadow: 0 2px 16px rgba(80,140,255,0.10);
+                padding: 2.5rem 2.5rem 2rem 2.5rem;
+            }
+            .center-login h2 {text-align:center; color:#2563eb; margin-bottom:1.5rem;}
+            .center-login .stTextInput>div>input, .center-login .stTextInput>div>textarea {
+                border-radius: 6px; border: 1px solid #b3d1ff;
+            }
+            .center-login .stButton>button {
+                width: 100%; margin-top: 1rem; font-weight: 600;
+            }
+            .center-login .stTabs {
+                margin-bottom: 1.5rem;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        st.markdown('<div class="center-login">', unsafe_allow_html=True)
+        st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=160)
+        st.markdown("<h2>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
+        tabs = st.tabs(["Login", "Register"])
+        with tabs[0]:
+            email = st.text_input("Email", key="login_email", placeholder="Masukkan email Anda")
+            pwd = st.text_input("Password", type="password", key="login_pw", placeholder="Masukkan password Anda")
+            if st.button("Login", key="login_btn"):
+                if not email or not pwd:
+                    st.warning("Email dan password wajib diisi.")
+                else:
+                    ok, msg = login_user(email.strip().lower(), pwd)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        with tabs[1]:
+            r_email = st.text_input("Email (register)", key="r_email2")
+            r_name = st.text_input("Nama lengkap", key="r_name2")
+            r_pw = st.text_input("Password", type="password", key="r_pw2")
+            if st.button("Register", key="register_btn"):
+                if not (r_email and r_name and r_pw):
+                    st.error("Lengkapi semua field.")
+                else:
+                    ok, msg = register_user(r_email.strip().lower(), r_name.strip(), r_pw)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.stop()
+
+    # --- Sidebar/menu for logged in user ---
+    logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+    st.sidebar.image(logo_path, use_container_width=True)
+    # Backend status
+    if GSHEETS_SPREADSHEET_URL:
+        st.sidebar.caption("Backend: Google Sheets ✓")
+    if DRIVE_FOLDER_ID:
+        st.sidebar.caption(f"Files: Google Drive folder {DRIVE_FOLDER_ID}")
+    st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
+    auth_sidebar()
+
+    menu = [
+        ("Dashboard", "🏠 Dashboard"),
+        ("Inventory", "📦 Inventory"),
+        ("Surat Masuk", "📥 Surat Masuk"),
+        ("Surat Keluar", "📤 Surat Keluar"),
+        ("MoU", "🤝 MoU"),
+        ("Cash Advance", "💸 Cash Advance"),
+        ("PMR", "📑 PMR"),
+        ("Cuti", "🌴 Cuti"),
+        ("Flex Time", "⏰ Flex Time"),
+        ("Delegasi", "📝 Delegasi"),
+        ("Mobil Kantor", "🚗 Mobil Kantor"),
+        ("Kalender Bersama", "📅 Kalender Bersama"),
+        ("SOP", "📚 SOP"),
+        ("Notulen", "🗒️ Notulen"),
+        ("User Setting", "⚙️ User Setting"),
+        ("Audit Trail", "🕵️ Audit Trail"),
+        ("Superuser Panel", "🔑 Superuser Panel")
+    ]
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Dashboard"
+
+    # CSS agar tombol navigasi seragam dan rapi
+    st.sidebar.markdown(
+        """
+        <style>
+        .wijna-nav-btn > button {
+            width: 100% !important;
+            min-height: 42px !important;
+            font-size: 1.05rem !important;
+            margin-bottom: 6px !important;
+            border-radius: 6px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Navigasi Modul")
+    nav_cols = st.sidebar.columns(2)
+    for idx, (key, label) in enumerate(menu):
+        col = nav_cols[idx % 2]
+        with col:
+            btn = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            if btn:
+                st.session_state["page"] = key
+                st.rerun()
+
+    # --- Logout button at the very bottom ---
+    if user:
+        st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
+        if st.sidebar.button("Logout", key="sidebar_logout", use_container_width=True):
+            logout()
+            st.rerun()
+
+    choice = st.session_state["page"]
+
+    # route
+    if choice == "Dashboard":
+        if user:
+            dashboard()
+        else:
+            st.title("Selamat datang — silakan login/register di sidebar")
+    elif choice == "Inventory":
+        inventory_module()
+    elif choice == "Surat Masuk":
+        surat_masuk_module()
+    elif choice == "Surat Keluar":
+        surat_keluar_module()
+    elif choice == "MoU":
+        mou_module()
+    elif choice == "Cash Advance":
+        cash_advance_module()
+    elif choice == "PMR":
+        pmr_module()
+    elif choice == "Cuti":
+        user = require_login()
+        st.header("🌴 Pengajuan & Approval Cuti")
+        st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
+        conn = get_db()
+        cur = conn.cursor()
+        tab1, tab2, tab3 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
+        # Tab 1: Ajukan Cuti
+        with tab1:
+            st.markdown("### 📝 Ajukan Cuti")
+            nama = user["full_name"]
+            tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
+            alasan = st.text_area("Alasan Cuti")
+            durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
+            cur.execute("SELECT kuota_tahunan, cuti_terpakai FROM cuti WHERE nama=? ORDER BY tgl_mulai DESC LIMIT 1", (nama,))
+            row = cur.fetchone()
+            kuota_tahunan = row["kuota_tahunan"] if row else 12
+            cuti_terpakai = row["cuti_terpakai"] if row else 0
+            sisa_kuota = kuota_tahunan - cuti_terpakai
+            st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
+            st.write(f"Durasi cuti diajukan: {durasi} hari")
+            if durasi > 0 and sisa_kuota < durasi:
+                st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
+            if st.button("Ajukan Cuti"):
+                if not alasan or durasi <= 0:
+                    st.warning("Lengkapi data dan pastikan tanggal benar.")
+                elif sisa_kuota < durasi:
+                    st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
+                else:
+                    cid = gen_id("cuti")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("""
+                        INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
+                    """, (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, "Menunggu Review Finance"))
+                    conn.commit()
+                    st.success("Pengajuan cuti berhasil diajukan.")
+                    # Audit trail
+                    try:
+                        audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
+                    except Exception:
+                        pass
+        # Tab 2: Review Finance
+        with tab2:
+            st.markdown("### Review & Approval Finance")
+            if user["role"] in ["finance", "superuser"]:
+                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=0 ORDER BY tgl_mulai DESC", conn)
+                for idx, row in df.iterrows():
+                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                        st.write(f"Alasan: {row['status']}")
+                        note = st.text_area("Catatan Finance", value=row["finance_note"] or "", key=f"fin_note_{row['id']}")
+                        approve = st.checkbox("Approve", value=bool(row["finance_approved"]), key=f"fin_appr_{row['id']}")
+                        if st.button("Simpan Review", key=f"fin_save_{row['id']}"):
+                            status = "Menunggu Approval Director" if approve else "Ditolak Finance"
+                            cur.execute("UPDATE cuti SET finance_note=?, finance_approved=?, status=? WHERE id=?", (note, int(approve), status, row["id"]))
+                            conn.commit()
+                            st.success("Review Finance disimpan.")
+                            # Audit trail
+                            try:
+                                audit_log("cuti", "finance_review", target=row["id"], details=f"approve={bool(approve)}; status={status}")
+                            except Exception:
+                                pass
+                            st.rerun()
+            else:
+                st.info("Hanya Finance/Superuser yang dapat review di sini.")
+        # Tab 3: Approval Director & Rekap
+        with tab3:
+            st.markdown("### Approval Director & Rekap Cuti")
+            if user["role"] in ["director", "superuser"]:
+                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 ORDER BY tgl_mulai DESC", conn)
+                for idx, row in df.iterrows():
+                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                        st.write(f"Alasan: {row['status']}")
+                        note = st.text_area("Catatan Director", value=row["director_note"] or "", key=f"dir_note_{row['id']}")
+                        approve = st.checkbox("Approve", value=bool(row["director_approved"]), key=f"dir_appr_{row['id']}")
+                        if st.button("Simpan Approval", key=f"dir_save_{row['id']}"):
+                            if approve:
+                                cur.execute("SELECT cuti_terpakai, durasi, kuota_tahunan FROM cuti WHERE id=?", (row["id"],))
+                                r = cur.fetchone()
+                                baru_terpakai = (r["cuti_terpakai"] or 0) + (r["durasi"] or 0)
+                                sisa = (r["kuota_tahunan"] or 12) - baru_terpakai
+                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=?, cuti_terpakai=?, sisa_kuota=? WHERE id=?",
+                                    (note, int(approve), "Disetujui Director", baru_terpakai, sisa, row["id"]))
+                            else:
+                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=? WHERE id=?",
+                                    (note, int(approve), "Ditolak Director", row["id"]))
+                            conn.commit()
+                            st.success("Approval Director disimpan.")
+                            # Audit trail
+                            try:
+                                audit_log("cuti", "director_approval", target=row["id"], details=f"approve={bool(approve)}")
+                            except Exception:
+                                pass
+                            st.rerun()
+            # Rekap semua pengajuan cuti
+            st.markdown("#### Rekap Pengajuan Cuti")
+            df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    elif choice == "Flex Time":
+        flex_module()
+    elif choice == "Delegasi":
+        delegasi_module()
+    elif choice == "Mobil Kantor":
+        kalender_pemakaian_mobil_kantor()
+    elif choice == "Kalender Bersama":
+        calendar_module()
+    elif choice == "SOP":
+        sop_module()
+    elif choice == "Notulen":
+        notulen_module()
+    elif choice == "User Setting":
+        user_setting_module()
+    elif choice == "Audit Trail":
+        audit_trail_module()
+    elif choice == "Superuser Panel":
+        superuser_panel()
+def audit_trail_module():
+    user = require_login()
+    st.header("🕵️ Audit Trail / Log Aktivitas")
+    conn = get_db()
+    cur = conn.cursor()
+    # Filter
+    st.markdown("#### Filter Audit Trail")
+    # Cek kolom di file_log
+    cur.execute("PRAGMA table_info(file_log)")
+    cols = [row[1] for row in cur.fetchall()]
+    # Build user list
+    user_fields = []
+    if "uploaded_by" in cols:
+        user_fields.append("uploaded_by")
+    if "deleted_by" in cols:
+        user_fields.append("deleted_by")
+    user_fields.append("file_name")
+    user_union = " UNION ".join([f"SELECT DISTINCT {f} as user FROM file_log" for f in user_fields])
+    users = [r[0] for r in cur.execute(user_union).fetchall() if r[0]]
+    actions = ["All", "Upload", "Delete", "Login", "Other"]
+    selected_user = st.selectbox("User", ["All"] + users)
+    selected_action = st.selectbox("Action", actions)
+    date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=30))
+    date_max = st.date_input("Sampai tanggal", value=date.today())
+    # Query
+    query = "SELECT * FROM file_log WHERE 1=1"
+    params = []
+    if selected_user != "All":
+        user_cond = []
+        if "uploaded_by" in cols:
+            user_cond.append("uploaded_by=?")
+            params.append(selected_user)
+        if "deleted_by" in cols:
+            user_cond.append("deleted_by=?")
+            params.append(selected_user)
+        user_cond.append("file_name=?")
+        params.append(selected_user)
+        query += " AND (" + " OR ".join(user_cond) + ")"
+    if selected_action != "All":
+        if selected_action == "Upload" and "uploaded_by" in cols:
+            query += " AND uploaded_by IS NOT NULL AND uploaded_by != ''"
+        elif selected_action == "Delete" and "deleted_by" in cols:
+            query += " AND deleted_by IS NOT NULL AND deleted_by != ''"
+        elif selected_action == "Login":
+            query += " AND modul='auth'"
+        else:
+            query += " AND modul NOT IN ('auth')"
+    # Tentukan kolom tanggal utama untuk filter
+    date_cols = [c for c in ["tanggal_upload", "tanggal_hapus"] if c in cols]
+    date_col = None
+    if date_cols:
+        # Gunakan COALESCE jika dua-duanya ada
+        if len(date_cols) == 2:
+            date_expr = f"COALESCE({date_cols[0]}, {date_cols[1]}, '')"
+        else:
+            date_expr = date_cols[0]
+        date_col = date_expr
     else:
-        login_page()
-
+        # Fallback: cari kolom string lain (misal alasan, id, versi)
+        fallback = [c for c in ["alasan", "id", "versi"] if c in cols]
+        if fallback:
+            date_col = fallback[0]
+        else:
+            date_col = None
+    if date_col:
+        query += f" AND ({date_col} >= ? AND {date_col} <= ?)"
+        params += [date_min.isoformat(), (date_max + timedelta(days=1)).isoformat()]
+    df = pd.read_sql_query(query, conn, params=params)
+    # Tampilkan hasil
+    if not df.empty:
+        # Tambah kolom tanggal utama untuk sort/tampil
+        if set(["tanggal_upload","tanggal_hapus"]).issubset(set(df.columns)):
+            df["tanggal_utama"] = df["tanggal_upload"].fillna("")
+            df.loc[df["tanggal_utama"]=="", "tanggal_utama"] = df["tanggal_hapus"].fillna("")
+        elif "tanggal_upload" in df.columns:
+            df["tanggal_utama"] = df["tanggal_upload"]
+        elif "tanggal_hapus" in df.columns:
+            df["tanggal_utama"] = df["tanggal_hapus"]
+        else:
+            df["tanggal_utama"] = ""
+        # Sort terbaru dulu
+        try:
+            df = df.sort_values(by="tanggal_utama", ascending=False)
+        except Exception:
+            pass
+        st.dataframe(df, use_container_width=True)
+        # Download
+        try:
+            st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), file_name="audit_trail.csv")
+        except Exception:
+            pass
+    else:
+        st.info("Belum ada log yang tercatat untuk filter yang dipilih.")
+# jangan dihapus
 if __name__ == "__main__":
+    ensure_db()
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
