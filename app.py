@@ -26,7 +26,8 @@ SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
-st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
+ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
+st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout="centered")
 
 
 # --- 2. FUNGSI KONEKSI & AUTENTIKASI ---
@@ -860,7 +861,7 @@ def _users_delete_row(ws, row_idx: int):
 
 def dashboard():
     st.title("🏠 Dashboard")
-    st.write("Selamat datang di WIJNA Manajemen System.")
+    st.write("Selamat datang di WIJNA Management System.")
 
 
 def inventory_module():
@@ -2174,7 +2175,7 @@ def main():
         """, unsafe_allow_html=True)
         st.markdown('<div class="center-login">', unsafe_allow_html=True)
         st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=160)
-        st.markdown("<h2>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
+        st.markdown("<h2>WIJNA Management System</h2>", unsafe_allow_html=True)
         tabs = st.tabs(["Login", "Register"])
         with tabs[0]:
             email = st.text_input("Email", key="login_email", placeholder="Masukkan email Anda")
@@ -2208,7 +2209,7 @@ def main():
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     st.sidebar.image(logo_path, use_container_width=True)
-    st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
+    st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Management System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
     menu = [
