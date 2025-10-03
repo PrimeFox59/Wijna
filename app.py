@@ -11,7 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import os
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 # --- 1. KONFIGURASI APLIKASI ---
 # PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
@@ -19,6 +19,7 @@ GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1"
 USERS_SHEET_NAME = "users"
 CUTI_SHEET_NAME = "cuti"
 AUDIT_SHEET_NAME = "audit_log"
+INVENTORY_SHEET_NAME = "inventory"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
@@ -194,6 +195,14 @@ def ensure_core_sheets():
         # Audit log sheet
         audit_headers = ["timestamp", "actor", "module", "action", "target", "details"]
         ensure_sheet_with_headers(spreadsheet, AUDIT_SHEET_NAME, audit_headers)
+
+        # Inventory sheet
+        inv_headers = [
+            "id", "name", "location", "status", "pic", "updated_at",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "file_id", "file_name", "file_link"
+        ]
+        ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
     except Exception as e:
         st.error(f"Gagal memastikan sheet inti tersedia: {e}")
 
@@ -525,8 +534,362 @@ def dashboard():
 
 
 def inventory_module():
-    st.header("📦 Inventory")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.markdown("# 📦 Inventory")
+
+    # Helpers for inventory sheet
+    def _inv_ws():
+        return _get_ws(INVENTORY_SHEET_NAME)
+
+    def _inv_read_df():
+        ws = _inv_ws()
+        inv_headers = [
+            "id", "name", "location", "status", "pic", "updated_at",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "file_id", "file_name", "file_link"
+        ]
+        try:
+            df = pd.DataFrame(ws.get_all_records(expected_headers=inv_headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
+        return ws, df
+
+    def _inv_append(row: dict):
+        ws = _inv_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        ws.append_row(values)
+
+    def _inv_update_by_id(iid: str, updates: dict):
+        ws = _inv_ws()
+        headers = ws.row_values(1)
+        id_cell = ws.find(iid)
+        if not id_cell:
+            raise ValueError("ID tidak ditemukan")
+        row_idx = id_cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            col_idx = headers.index(k) + 1
+            a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+            ws.update(a1, [[v]])
+
+    def format_datetime_wib(ts: str) -> str:
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", ""))
+            dt_wib = dt + timedelta(hours=7)
+            return dt_wib.strftime("%Y-%m-%d %H:%M") + " WIB"
+        except Exception:
+            return str(ts)
+
+    def upload_file_to_drive(file) -> tuple[str, str, str]:
+        """Upload to Drive and return (file_id, file_name, web_view_link)."""
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            file_metadata = {
+                'name': file.name,
+                'parents': [GDRIVE_FOLDER_ID]
+            }
+            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or 'application/octet-stream', resumable=True)
+            resp = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, webViewLink',
+                supportsAllDrives=True
+            ).execute()
+            # Set permission anyone with link can view (optional, comment if not desired)
+            try:
+                service.permissions().create(fileId=resp['id'], body={
+                    'role': 'reader', 'type': 'anyone'
+                }, supportsAllDrives=True).execute()
+            except Exception:
+                pass
+            return resp.get('id', ''), file.name, resp.get('webViewLink', '')
+        except Exception as e:
+            st.warning(f"Gagal upload lampiran ke Drive: {e}")
+            return "", "", ""
+
+    def drive_download_button(file_id: str, file_name: str, key: str):
+        if not file_id or not file_name:
+            return
+        try:
+            service = get_gdrive_service()
+            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+            fh = io.BytesIO()
+            fh.write(request.execute())
+            fh.seek(0)
+            st.download_button(
+                label=f"⬇️ Download {file_name}",
+                data=fh.getvalue(),
+                file_name=file_name,
+                mime="application/octet-stream",
+                key=key
+            )
+        except Exception as e:
+            st.caption(f"Tidak dapat download lampiran: {e}")
+
+    # Prepare monthly rekap
+    _, df_all = _inv_read_df()
+    this_month = date.today().strftime("%Y-%m")
+    df_month = df_all.copy()
+    if not df_month.empty and 'updated_at' in df_month.columns:
+        df_month = df_month[df_month['updated_at'].astype(str).str[:7] == this_month]
+
+    tab_labels = []
+    tab_contents = []
+
+    # Staff tab: tambah barang
+    if user.get("role") in ["staff", "superuser"]:
+        tab_labels.append("➕ Tambah Barang")
+
+        def staff_tab():
+            with st.form("inv_add"):
+                name = st.text_input("Nama Barang")
+                keterangan_opsi = st.selectbox("Keterangan Tambahan", ["", "dijual", "rusak"], index=0)
+                loc = st.text_input("Tempat Barang")
+                status = st.selectbox("Status", ["Tersedia","Dipinjam","Rusak","Dijual"])
+                f = st.file_uploader("Lampiran (opsional)")
+                submitted = st.form_submit_button("Simpan (draft)")
+                if submitted:
+                    if not name:
+                        st.warning("Nama barang wajib diisi.")
+                    else:
+                        full_nama = name if not keterangan_opsi else f"{name} ({keterangan_opsi})"
+                        iid = gen_id("inv")
+                        now = datetime.utcnow().isoformat()
+                        file_id, file_name, file_link = upload_file_to_drive(f) if f else ("", "", "")
+                        pic = ""  # PIC removed per spec
+                        _inv_append({
+                            "id": iid,
+                            "name": full_nama,
+                            "location": loc,
+                            "status": status,
+                            "pic": pic,
+                            "updated_at": now,
+                            "finance_note": "",
+                            "finance_approved": 0,
+                            "director_note": "",
+                            "director_approved": 0,
+                            "file_id": file_id,
+                            "file_name": file_name,
+                            "file_link": file_link
+                        })
+                        try:
+                            audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
+                        except Exception:
+                            pass
+                        st.success("Item disimpan sebagai draft. Menunggu review Finance.")
+                        st.rerun()
+
+        tab_contents.append(staff_tab)
+
+    # Finance review tab
+    if user.get("role") in ["finance", "superuser"]:
+        tab_labels.append("💰 Review Finance")
+
+        def finance_tab():
+            st.info("Approve item yang sudah diinput staf.")
+            _, df = _inv_read_df()
+            if not df.empty and 'finance_approved' in df.columns:
+                df['finance_approved'] = pd.to_numeric(df['finance_approved'], errors='coerce').fillna(0).astype(int)
+            rows = df[df.get('finance_approved', 0) == 0]
+            for idx, r in rows.iterrows():
+                st.markdown(f"""
+<div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
+<b>📦 {r.get('name')}</b> <span style='color:#888;'>(ID: {r.get('id')})</span><br>
+<b>Lokasi:</b> {r.get('location')}<br>
+<b>Status:</b> {r.get('status')}<br>
+<b>Penanggung Jawab:</b> {r.get('pic','')}<br>
+<b>Terakhir Update:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
+""", unsafe_allow_html=True)
+                file_id = r.get('file_id')
+                file_name = r.get('file_name')
+                if file_id and file_name:
+                    drive_download_button(file_id, file_name, key=f"dl_fin_{r.get('id')}_{idx}")
+                st.markdown("**Catatan Finance:**")
+                note = st.text_area("Tulis catatan atau alasan jika perlu", value=r.get("finance_note") or "", key=f"fin_note_{r.get('id')}_{idx}")
+                colf1, colf2 = st.columns([1,2])
+                with colf1:
+                    if st.button("🔎 Review", key=f"ap_fin_{r.get('id')}_{idx}"):
+                        try:
+                            _inv_update_by_id(r.get('id'), {"finance_note": note, "finance_approved": 1})
+                            try:
+                                audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
+                            except Exception:
+                                pass
+                            st.success("Finance reviewed. Menunggu persetujuan Director.")
+                        except Exception as e:
+                            st.error(f"Gagal menyimpan: {e}")
+                        st.rerun()
+                with colf2:
+                    st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
+
+        tab_contents.append(finance_tab)
+
+    # Director approval tab
+    if user.get("role") in ["director", "superuser"]:
+        tab_labels.append("✅ Approval Director")
+
+        def director_tab():
+            st.info("Approve/Tolak item yang sudah di-approve Finance.")
+            _, df = _inv_read_df()
+            if not df.empty:
+                df['finance_approved'] = pd.to_numeric(df.get('finance_approved', 0), errors='coerce').fillna(0).astype(int)
+                df['director_approved'] = pd.to_numeric(df.get('director_approved', 0), errors='coerce').fillna(0).astype(int)
+            rows = df[(df.get('finance_approved', 0) == 1) & (df.get('director_approved', 0) == 0)]
+            for idx, r in rows.iterrows():
+                with st.expander(f"[Menunggu Approval Director] {r.get('name')} ({r.get('id')})"):
+                    st.markdown(f"""
+                    <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
+                        <b>Nama:</b> {r.get('name')}<br>
+                        <b>ID:</b> {r.get('id')}<br>
+                        <b>Lokasi:</b> {r.get('location')}<br>
+                        <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r.get('status')}</span><br>
+                        <b>PIC:</b> {r.get('pic','')}<br>
+                        <b>Update Terakhir:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if r.get('file_id') and r.get('file_name'):
+                        drive_download_button(r.get('file_id'), r.get('file_name'), key=f"dl_dir_{r.get('id')}_{idx}")
+                    st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
+                    note2 = st.text_area("", value=r.get("director_note") or "", key=f"dir_note_{r.get('id')}_{idx}", placeholder="Tulis catatan atau alasan jika perlu...", height=80)
+                    colA, colB = st.columns([1,1])
+                    with colA:
+                        if st.button("✅ Approve", key=f"ap_dir_{r.get('id')}_{idx}"):
+                            try:
+                                _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": 1})
+                                try:
+                                    audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=1; note={note2}")
+                                except Exception:
+                                    pass
+                                st.success("Item telah di-approve Director.")
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+                            st.rerun()
+                    with colB:
+                        if st.button("❌ Tolak", key=f"reject_dir_{r.get('id')}_{idx}"):
+                            try:
+                                _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": -1})
+                                try:
+                                    audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=0; note={note2}")
+                                except Exception:
+                                    pass
+                                st.success("Item ditolak Director.")
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+                            st.rerun()
+
+        tab_contents.append(director_tab)
+
+    # Daftar Inventaris + Pinjam
+    tab_labels.append("📦 Daftar Inventaris")
+
+    def data_tab():
+        st.subheader("Daftar Inventaris & Pinjam Barang")
+        left_col, right_col = st.columns([2, 1])
+        with left_col:
+            filter_col1, filter_col2, filter_col3 = st.columns([2,2,2])
+            with filter_col1:
+                filter_nama = st.text_input("Filter Nama Barang", "")
+            with filter_col2:
+                filter_lokasi = st.text_input("Filter Lokasi", "")
+            with filter_col3:
+                filter_status = st.selectbox("Filter Status", ["Semua", "Tersedia", "Dipinjam", "Rusak", "Dijual"], index=0)
+
+            _, df = _inv_read_df()
+            if not df.empty and 'updated_at' in df.columns:
+                df['updated_at'] = df['updated_at'].apply(format_datetime_wib)
+
+            filtered_df = df.copy()
+            if filter_nama:
+                filtered_df = filtered_df[filtered_df.get('name','').astype(str).str.contains(filter_nama, case=False, na=False)]
+            if filter_lokasi:
+                filtered_df = filtered_df[filtered_df.get('location','').astype(str).str.contains(filter_lokasi, case=False, na=False)]
+            if filter_status != "Semua":
+                filtered_df = filtered_df[filtered_df.get('status','') == filter_status]
+
+            if filtered_df.empty:
+                st.info("Tidak ada data inventaris sesuai filter.")
+            else:
+                show_df = filtered_df.drop(columns=["file_link"], errors="ignore")
+                st.dataframe(show_df, use_container_width=True)
+
+                lampiran_list = [
+                    f"{row.get('name')} - {row.get('file_name')}" for _, row in filtered_df.iterrows()
+                    if row.get('file_id') and row.get('file_name')
+                ]
+                lampiran_dict = {
+                    f"{row.get('name')} - {row.get('file_name')}": (row.get('file_name'), row.get('file_id'))
+                    for _, row in filtered_df.iterrows()
+                    if row.get('file_id') and row.get('file_name')
+                }
+                if lampiran_list:
+                    selected = st.selectbox("Pilih lampiran untuk diunduh:", lampiran_list)
+                    if selected:
+                        file_name, file_id = lampiran_dict[selected]
+                        drive_download_button(file_id, file_name, key=f"dl_sel_{hash(selected)}")
+                else:
+                    st.info("Tidak ada lampiran yang tersedia untuk diunduh.")
+
+        with right_col:
+            st.markdown("### 📋 Pinjam Barang")
+            _, df2 = _inv_read_df()
+            filtered_df2 = df2.copy()
+            if filter_nama:
+                filtered_df2 = filtered_df2[filtered_df2.get('name','').astype(str).str.contains(filter_nama, case=False, na=False)]
+            if filter_lokasi:
+                filtered_df2 = filtered_df2[filtered_df2.get('location','').astype(str).str.contains(filter_lokasi, case=False, na=False)]
+            if filter_status != "Semua":
+                filtered_df2 = filtered_df2[filtered_df2.get('status','') == filter_status]
+
+            for idx, row in filtered_df2.iterrows():
+                if row.get('status') != "Dipinjam":
+                    with st.expander(f"Pinjam: {row.get('name')} ({row.get('id')})"):
+                        keperluan = st.text_input(f"Keperluan pinjam untuk {row.get('name')}", key=f"keperluan_{row.get('id')}")
+                        tgl_kembali = st.date_input("Tanggal Kembali", key=f"tglkembali_{row.get('id')}", min_value=date.today())
+                        ajukan = st.button("Ajukan Pinjam", key=f"ajukan_{row.get('id')}")
+                        if ajukan:
+                            try:
+                                info_pic = f"{user.get('email')}|{keperluan}|{tgl_kembali}|0|0"
+                                _inv_update_by_id(row.get('id'), {
+                                    "pic": info_pic,
+                                    "finance_approved": 0,
+                                    "director_approved": 0,
+                                    "updated_at": datetime.utcnow().isoformat()
+                                })
+                                try:
+                                    audit_log("inventory", "loan_request", target=row.get('id'), details=f"keperluan={keperluan}; kembali={tgl_kembali}")
+                                except Exception:
+                                    pass
+                                st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
+                            except Exception as e:
+                                st.error(f"Gagal mengajukan pinjam: {e}")
+
+    # Build tab labels and contents
+    # Ensure display names
+    for i, lbl in enumerate(tab_labels):
+        if lbl.lower().startswith("tambah barang") or lbl.lower().startswith("➕ tambah barang"):
+            tab_labels[i] = "➕ Tambah Barang"
+        elif lbl.lower().startswith("review finance") or lbl.lower().startswith("💰 review finance"):
+            tab_labels[i] = "💰 Review Finance"
+        elif lbl.lower().startswith("approval director") or lbl.lower().startswith("✅ approval director"):
+            tab_labels[i] = "✅ Approval Director"
+        elif lbl.lower().startswith("daftar inventaris") or lbl.lower().startswith("📦 daftar inventaris"):
+            tab_labels[i] = "📦 Daftar Inventaris"
+
+    # Ensure Daftar Inventaris tab exists once and last
+    tab_contents = [tab for tab in tab_contents if tab.__name__ != "data_tab"]
+    tab_contents.append(data_tab)
+    if "📦 Daftar Inventaris" not in tab_labels:
+        tab_labels.append("📦 Daftar Inventaris")
+
+    # Render tabs
+    selected = st.tabs(tab_labels)
+    for i, tab_func in enumerate(tab_contents):
+        with selected[i]:
+            tab_func()
 
 
 def surat_masuk_module():
