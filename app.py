@@ -22,6 +22,7 @@ CUTI_SHEET_NAME = "cuti"
 AUDIT_SHEET_NAME = "audit_log"
 INVENTORY_SHEET_NAME = "inventory"
 SURAT_MASUK_SHEET_NAME = "surat_masuk"
+SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
@@ -254,6 +255,16 @@ def ensure_core_sheets():
             "created_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, sm_headers)
+
+        # Surat Keluar sheet
+        sk_headers = [
+            "id", "nomor", "tanggal", "ditujukan", "perihal", "pengirim",
+            "status", "follow_up", "director_note", "director_approved",
+            "draft_file_id", "draft_name", "draft_link",
+            "final_file_id", "final_name", "final_link",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, sk_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -1404,8 +1415,284 @@ def surat_masuk_module():
 
 
 def surat_keluar_module():
+    user = require_login()
     st.header("📤 Surat Keluar")
-    st.info("Module coming soon (Sheets + Drive)")
+
+    # Headers and worksheet helpers
+    def _sk_headers():
+        return [
+            "id", "nomor", "tanggal", "ditujukan", "perihal", "pengirim",
+            "status", "follow_up", "director_note", "director_approved",
+            "draft_file_id", "draft_name", "draft_link",
+            "final_file_id", "final_name", "final_link",
+            "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _sk_ws():
+        try:
+            return _get_ws(SURAT_KELUAR_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            spreadsheet = get_spreadsheet()
+            return ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, _sk_headers())
+
+    def _sk_read_df():
+        ws = _sk_ws()
+        headers = _sk_headers()
+        try:
+            df = pd.DataFrame(_cached_get_all_records(SURAT_KELUAR_SHEET_NAME, headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
+        # Ensure columns
+        for h in headers:
+            if h not in df.columns:
+                df[h] = 0 if h in ("director_approved",) else ""
+        df["director_approved"] = pd.to_numeric(df.get("director_approved"), errors="coerce").fillna(0).astype(int)
+        return ws, df
+
+    def _sk_append(row: dict):
+        ws = _sk_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
+
+    def _sk_update_by_id(sid: str, updates: dict):
+        ws = _sk_ws()
+        headers = ws.row_values(1)
+        id_cell = ws.find(sid)
+        if not id_cell:
+            raise ValueError("ID tidak ditemukan")
+        row_idx = id_cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+
+    # Drive helpers
+    def _upload_to_drive(file) -> tuple[str, str, str]:
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
+            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
+            resp = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+            try:
+                service.permissions().create(
+                    fileId=resp["id"],
+                    body={"role": "reader", "type": "anyone"},
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception:
+                pass
+            return resp.get("id", ""), file.name, resp.get("webViewLink", "")
+        except Exception as e:
+            st.warning(f"Gagal upload ke Drive: {e}")
+            return "", "", ""
+
+    def _download_button(file_id: str, file_name: str, key: str):
+        if not file_id or not file_name:
+            return
+        try:
+            service = get_gdrive_service()
+            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+            fh = io.BytesIO()
+            fh.write(request.execute())
+            fh.seek(0)
+            st.download_button(
+                label=f"⬇️ Download {file_name}",
+                data=fh.getvalue(),
+                file_name=file_name,
+                mime="application/octet-stream",
+                key=key,
+            )
+        except Exception as e:
+            st.caption(f"Tidak dapat download: {e}")
+
+    tab1, tab2, tab3 = st.tabs([
+        "📝 Input Draft Surat Keluar",
+        "✅ Approval",
+        "📋 Daftar & Rekap Surat Keluar",
+    ])
+
+    # Tab 1: Input Draft
+    with tab1:
+        st.markdown("### Input Draft Surat Keluar (Staf)")
+        with st.form("sk_add", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                nomor = st.text_input("Nomor Surat")
+                tanggal = st.date_input("Tanggal", value=date.today())
+            with col2:
+                ditujukan = st.text_input("Ditujukan Kepada")
+                perihal = st.text_input("Perihal")
+            draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True)
+            draft_file = None
+            draft_link = None
+            if draft_type == "Upload File":
+                draft_file = st.file_uploader("Upload Draft Surat (PDF/DOC)")
+            else:
+                draft_link = st.text_input("Link Draft Surat (Google Drive, dll)")
+            follow_up = st.text_area("Tindak Lanjut (opsional)")
+            submit = st.form_submit_button("💾 Simpan Draft Surat Keluar")
+            if submit:
+                if draft_type == "Upload File" and not draft_file:
+                    st.error("File draft surat wajib diupload.")
+                elif draft_type == "Link URL" and not draft_link:
+                    st.error("Link draft surat wajib diisi.")
+                else:
+                    sid = gen_id("sk")
+                    now = datetime.utcnow().isoformat()
+                    draft_file_id, draft_name, draft_web = "", "", ""
+                    if draft_type == "Upload File":
+                        draft_file_id, draft_name, draft_web = _upload_to_drive(draft_file)
+                        if not draft_file_id:
+                            st.error("Gagal mengupload draft ke Drive.")
+                            st.stop()
+                    _sk_append({
+                        "id": sid,
+                        "nomor": nomor,
+                        "tanggal": tanggal.isoformat(),
+                        "ditujukan": ditujukan,
+                        "perihal": perihal,
+                        "pengirim": user.get("full_name") or user.get("email"),
+                        "status": "Draft",
+                        "follow_up": follow_up,
+                        "director_note": "",
+                        "director_approved": 0,
+                        "draft_file_id": draft_file_id,
+                        "draft_name": draft_name,
+                        "draft_link": draft_link or draft_web,
+                        "final_file_id": "",
+                        "final_name": "",
+                        "final_link": "",
+                        "created_at": now,
+                        "updated_at": now,
+                        "submitted_by": user.get("email"),
+                    })
+                    audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; draft={'file:'+draft_name if draft_name else 'url:'+str(draft_link)}")
+                    st.success("✅ Surat keluar (draft) tersimpan.")
+                    st.experimental_rerun()
+
+    # Tab 2: Approval Director
+    with tab2:
+        st.markdown("### Approval Surat Keluar (Director)")
+        role = str(user.get("role", "")).lower()
+        if role in ["director", "superuser"]:
+            _, df = _sk_read_df()
+            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
+                with st.expander(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')} | Status: {row.get('status','')}"):
+                    st.write(f"Ditujukan: {row.get('ditujukan','')}")
+                    st.write(f"Pengirim: {row.get('pengirim','')}")
+                    st.write(f"Follow Up: {row.get('follow_up','')}")
+                    if row.get("draft_file_id") and row.get("draft_name"):
+                        st.markdown(f"**Draft Surat (file):** {row.get('draft_name')}")
+                        _download_button(row.get("draft_file_id"), row.get("draft_name"), key=f"dl_sk_draft_{row.get('id')}_{idx}")
+                    elif row.get("draft_link"):
+                        st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row.get('draft_link')})")
+                    note = st.text_area("Catatan Director", value=str(row.get("director_note","")), key=f"sk_note_{row.get('id')}")
+                    final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"sk_final_{row.get('id')}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        approve = st.button("✅ Approve & Upload Final", key=f"sk_approve_{row.get('id')}")
+                    with colB:
+                        disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"sk_disapprove_{row.get('id')}")
+                    if approve:
+                        if not final:
+                            st.error("File final wajib diupload agar surat keluar tercatat resmi.")
+                        else:
+                            fid, fname, flink = _upload_to_drive(final)
+                            if not fid:
+                                st.error("Gagal mengupload final ke Drive.")
+                            else:
+                                _sk_update_by_id(row.get("id"), {
+                                    "final_file_id": fid,
+                                    "final_name": fname,
+                                    "final_link": flink,
+                                    "director_note": note,
+                                    "director_approved": 1,
+                                    "status": "Final",
+                                    "updated_at": datetime.utcnow().isoformat(),
+                                })
+                                audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
+                                st.success("Final uploaded & approved.")
+                                st.experimental_rerun()
+                    if disapprove:
+                        _sk_update_by_id(row.get("id"), {
+                            "status": "Draft",
+                            "director_note": note,
+                            "director_approved": 0,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        })
+                        audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
+                        st.warning("Surat dikembalikan ke draft untuk direvisi.")
+                        st.experimental_rerun()
+        else:
+            st.info("Hanya Director yang dapat meng-approve dan upload file final.")
+
+    # Tab 3: Daftar & Rekap
+    with tab3:
+        st.markdown("### Daftar & Rekap Surat Keluar")
+        _, df = _sk_read_df()
+        if not df.empty:
+            df = df.copy().sort_values(by="tanggal", ascending=False).reset_index(drop=True)
+            # Kode referensi tampilan
+            df["indeks"] = [f"SK-{i+1:04d}" for i in range(len(df))]
+            st.dataframe(df[[c for c in ["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"] if c in df.columns]], use_container_width=True, hide_index=True)
+            st.markdown("#### Download File Final Surat Keluar")
+            for idx, row in df.iterrows():
+                if row.get("final_file_id") and row.get("final_name"):
+                    st.write(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}")
+                    _download_button(row.get("final_file_id"), row.get("final_name"), key=f"dl_sk_final_{row.get('id')}_{idx}")
+        else:
+            st.info("Belum ada surat keluar.")
+
+        # Rekap Bulanan
+        st.markdown("#### 📊 Rekap Bulanan Surat Keluar")
+        this_month = date.today().strftime("%Y-%m")
+        df_month = pd.DataFrame()
+        if not df.empty:
+            df_month = df[df["tanggal"].astype(str).str[:7] == this_month]
+        st.write(f"Total surat keluar bulan ini: **{len(df_month)}**")
+        if not df_month.empty:
+            approved = df_month[df_month["director_approved"] == 1]
+            draft = df_month[df_month["status"].astype(str).str.lower() == "draft"]
+            percent_final = (len(approved) / len(df_month)) * 100 if len(df_month) > 0 else 0
+            st.info(f"Approved: {len(approved)} | Masih Draft: {len(draft)} | % Finalisasi: {percent_final:.1f}%")
+            # Export Excel/CSV
+            export_cols = [c for c in ["nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name","director_approved"] if c in df_month.columns]
+            xbuf = io.BytesIO()
+            try:
+                df_month[export_cols].to_excel(xbuf, index=False, engine="openpyxl")
+            except Exception:
+                # Fallback without engine name if not available in env
+                df_month[export_cols].to_excel(xbuf, index=False)
+            xbuf.seek(0)
+            st.download_button("⬇️ Download Rekap Bulanan (Excel)", xbuf, file_name=f"rekap_suratkeluar_{this_month}.xlsx")
+            st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month[export_cols].to_csv(index=False), file_name=f"rekap_suratkeluar_{this_month}.csv")
 
 
 def mou_module():
