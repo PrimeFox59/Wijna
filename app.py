@@ -21,6 +21,7 @@ USERS_SHEET_NAME = "users"
 CUTI_SHEET_NAME = "cuti"
 AUDIT_SHEET_NAME = "audit_log"
 INVENTORY_SHEET_NAME = "inventory"
+SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
 st.set_page_config(page_title="Secure App", page_icon="🔐", layout="centered")
@@ -243,6 +244,16 @@ def ensure_core_sheets():
             "file_id", "file_name", "file_link", "loan_info"
         ]
         ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
+
+        # Surat Masuk sheet
+        sm_headers = [
+            "id", "nomor", "tanggal", "pengirim", "perihal",
+            "file_id", "file_name", "file_link",
+            "status", "follow_up",
+            "director_approved", "rekap",
+            "created_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, sm_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -1111,8 +1122,280 @@ def inventory_module():
 
 
 def surat_masuk_module():
+    user = require_login()
     st.header("📥 Surat Masuk")
-    st.info("Module coming soon (Sheets + Drive)")
+
+    # Helpers for Surat Masuk sheet
+    def _sm_ws():
+        return _get_ws(SURAT_MASUK_SHEET_NAME)
+
+    def _sm_headers():
+        return [
+            "id", "nomor", "tanggal", "pengirim", "perihal",
+            "file_id", "file_name", "file_link",
+            "status", "follow_up",
+            "director_approved", "rekap",
+            "created_at", "submitted_by"
+        ]
+
+    def _sm_read_df():
+        ws = _sm_ws()
+        headers = _sm_headers()
+        try:
+            df = pd.DataFrame(_cached_get_all_records(SURAT_MASUK_SHEET_NAME, headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
+        for h in headers:
+            if h not in df.columns:
+                df[h] = 0 if h in ("director_approved", "rekap") else ""
+        # Normalize numeric flags
+        df["director_approved"] = pd.to_numeric(df.get("director_approved"), errors="coerce").fillna(0).astype(int)
+        df["rekap"] = pd.to_numeric(df.get("rekap"), errors="coerce").fillna(0).astype(int)
+        return ws, df
+
+    def _sm_append(row: dict):
+        ws = _sm_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
+
+    def _sm_update_by_id(sid: str, updates: dict):
+        ws = _sm_ws()
+        headers = ws.row_values(1)
+        id_cell = ws.find(sid)
+        if not id_cell:
+            raise ValueError("ID tidak ditemukan")
+        row_idx = id_cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+
+    # Drive helpers
+    def _upload_surat_to_drive(file) -> tuple[str, str, str]:
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
+            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
+            resp = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+            try:
+                service.permissions().create(
+                    fileId=resp["id"],
+                    body={"role": "reader", "type": "anyone"},
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception:
+                pass
+            return resp.get("id", ""), file.name, resp.get("webViewLink", "")
+        except Exception as e:
+            st.warning(f"Gagal upload surat ke Drive: {e}")
+            return "", "", ""
+
+    def _download_button(file_id: str, file_name: str, key: str):
+        if not file_id or not file_name:
+            return
+        try:
+            service = get_gdrive_service()
+            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+            fh = io.BytesIO()
+            fh.write(request.execute())
+            fh.seek(0)
+            st.download_button(
+                label=f"⬇️ Download {file_name}",
+                data=fh.getvalue(),
+                file_name=file_name,
+                mime="application/octet-stream",
+                key=key,
+            )
+        except Exception as e:
+            st.caption(f"Tidak dapat download surat: {e}")
+
+    # Authorization: who can input/approve
+    role = str(user.get("role", "")).lower()
+    allowed_submit = role in ["staff", "staf", "finance", "director", "superuser"]
+
+    tab1, tab2, tab3 = st.tabs([
+        "📝 Input Draft Surat Masuk",
+        "✅ Approval",
+        "📋 Daftar & Rekap Surat Masuk",
+    ])
+
+    # Tab 1: Input
+    with tab1:
+        st.markdown("### Input Draft Surat Masuk")
+        if not allowed_submit:
+            st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
+        else:
+            with st.form("form_surat_masuk", clear_on_submit=True):
+                nomor = st.text_input("Nomor Surat")
+                pengirim = st.text_input("Pengirim")
+                tanggal = st.date_input("Tanggal Surat", value=date.today())
+                perihal = st.text_input("Perihal")
+                file_upload = st.file_uploader("Upload File Surat (wajib)", type=None)
+                status = st.selectbox(
+                    "Status",
+                    [
+                        "Diusulkan dibahas ke rapat rutin",
+                        "Langsung dilegasikan ke salah satu user",
+                        "Selesai",
+                    ],
+                    index=0,
+                )
+                follow_up = st.text_area("Tindak Lanjut (Follow Up)")
+                submitted = st.form_submit_button("Catat Surat Masuk")
+
+                if submitted:
+                    if not file_upload:
+                        st.error("File surat wajib diupload.")
+                    else:
+                        fid, fname, flink = _upload_surat_to_drive(file_upload)
+                        if not fid:
+                            st.error("Gagal mengupload file ke Drive.")
+                        else:
+                            sid = gen_id("sm")
+                            now = datetime.utcnow().isoformat()
+                            _sm_append(
+                                {
+                                    "id": sid,
+                                    "nomor": nomor,
+                                    "tanggal": tanggal.isoformat(),
+                                    "pengirim": pengirim,
+                                    "perihal": perihal,
+                                    "file_id": fid,
+                                    "file_name": fname,
+                                    "file_link": flink,
+                                    "status": status,
+                                    "follow_up": follow_up,
+                                    "director_approved": 0,
+                                    "rekap": 0,
+                                    "created_at": now,
+                                    "submitted_by": user.get("email"),
+                                }
+                            )
+                            audit_log(
+                                "surat_masuk",
+                                "create",
+                                target=sid,
+                                details=f"{nomor} - {perihal} ({pengirim})",
+                            )
+                            st.success("Surat masuk berhasil dicatat.")
+                            st.experimental_rerun()
+
+    # Tab 2: Approval (Director/Superuser)
+    with tab2:
+        st.markdown("### Approval Surat Masuk")
+        if role in ["director", "superuser"]:
+            _, df = _sm_read_df()
+            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
+                if int(row.get("director_approved", 0)) == 0:
+                    with st.expander(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"):
+                        st.write(f"Pengirim: {row.get('pengirim','')}")
+                        st.write(f"Status: {row.get('status','')}")
+                        st.write(f"Follow Up: {row.get('follow_up','')}")
+                        if row.get("file_link"):
+                            st.markdown(f"[Link Surat]({row.get('file_link')})")
+                        if row.get("file_id") and row.get("file_name"):
+                            _download_button(row.get("file_id"), row.get("file_name"), key=f"dl_sm_{row.get('id')}_{idx}")
+                        colA, colB = st.columns(2)
+                        with colA:
+                            if st.button("Approve Surat Masuk", key=f"approve_{row.get('id')}"):
+                                _sm_update_by_id(row.get("id"), {"director_approved": 1})
+                                audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
+                                st.success("Surat masuk di-approve Director.")
+                                st.experimental_rerun()
+                        with colB:
+                            if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
+                                _sm_update_by_id(row.get("id"), {"director_approved": -1})
+                                audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
+                                st.warning("Surat masuk ditolak Director.")
+                                st.experimental_rerun()
+                elif int(row.get("director_approved", 0)) == 1:
+                    st.success(
+                        f"Sudah di-approve Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
+                    )
+                elif int(row.get("director_approved", 0)) == -1:
+                    st.error(
+                        f"Surat masuk ditolak Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
+                    )
+        else:
+            st.info("Hanya Director atau Superuser yang dapat meng-approve surat masuk.")
+
+    # Tab 3: Daftar & Rekap
+    with tab3:
+        st.markdown("### Daftar & Rekap Surat Masuk")
+        _, df = _sm_read_df()
+        if not df.empty:
+            df_show = df.copy()
+            # Indeks otomatis
+            df_show = df_show.sort_values(by="tanggal", ascending=False).reset_index(drop=True)
+            df_show["indeks"] = [f"SM-{i+1:04d}" for i in range(len(df_show))]
+            show_cols = [
+                c
+                for c in ["indeks", "nomor", "tanggal", "pengirim", "perihal", "file_name"]
+                if c in df_show.columns
+            ]
+        else:
+            df_show = df
+            show_cols = [c for c in ["nomor", "tanggal", "pengirim", "perihal", "file_name"] if c in df.columns]
+
+        # Rekap only
+        rekap_df = df[df.get("rekap", 0) == 1].copy() if not df.empty else df.copy()
+        if not rekap_df.empty:
+            # Build download links column via buttons below table
+            st.dataframe(rekap_df[show_cols], use_container_width=True, hide_index=True)
+            # Optional: quick download selector
+            files = [
+                f"{r.get('nomor','')}: {r.get('file_name','')}" for _, r in rekap_df.iterrows() if r.get("file_id") and r.get("file_name")
+            ]
+            mapping = {
+                f"{r.get('nomor','')}: {r.get('file_name','')}": (r.get("file_id"), r.get("file_name"))
+                for _, r in rekap_df.iterrows()
+                if r.get("file_id") and r.get("file_name")
+            }
+            if files:
+                pick = st.selectbox("Pilih surat untuk diunduh:", files, key="rekap_pick")
+                if pick:
+                    fid, fname = mapping.get(pick, ("", ""))
+                    _download_button(fid, fname, key=f"dl_rekap_{hash(pick)}")
+        else:
+            st.info("Belum ada surat masuk yang direkap.")
+
+        # Add to rekap (Director/Superuser only)
+        if role in ["director", "superuser"] and not df.empty:
+            st.markdown("#### Masukan ke Daftar Rekap Surat")
+            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
+                if int(row.get("rekap", 0)) == 0 and int(row.get("director_approved", 0)) == 1:
+                    if st.button("Masukan ke Daftar Rekap Surat", key=f"rekap_{row.get('id')}"):
+                        _sm_update_by_id(row.get("id"), {"rekap": 1})
+                        audit_log("surat_masuk", "rekap_add", target=row.get("id"))
+                        st.success("Surat masuk dimasukan ke rekap.")
+                        st.experimental_rerun()
 
 
 def surat_keluar_module():
@@ -1251,7 +1534,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"role": new_role, "active": 1 if new_active else 0})
                             audit_log("users", "admin_update", target=sel_user, details=f"role={new_role}; active={int(new_active)}")
                             st.success("Perubahan disimpan.")
-                            st.rerun()
+                            st.experimental_rerun()
                     except Exception as e:
                         st.error(f"Gagal menyimpan: {e}")
             with colB:
@@ -1262,7 +1545,7 @@ def user_setting_module():
                             _users_update_row(ws, row_idx, {"active": 0})
                             audit_log("users", "admin_deactivate", target=sel_user)
                             st.success("User dinonaktifkan.")
-                            st.rerun()
+                            st.experimental_rerun()
                     except Exception as e:
                         st.error(f"Gagal: {e}")
             with colC:
@@ -1276,7 +1559,7 @@ def user_setting_module():
                                 _users_delete_row(ws, row_idx)
                                 audit_log("users", "admin_delete", target=sel_user)
                                 st.success("User dihapus.")
-                                st.rerun()
+                                st.experimental_rerun()
                         except Exception as e:
                             st.error(f"Gagal menghapus: {e}")
     else:
@@ -1668,4 +1951,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
