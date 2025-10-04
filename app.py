@@ -25,7 +25,7 @@ INVENTORY_SHEET_NAME = "inventory"
 SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
-ADMIN_EMAIL_RECIPIENT = "primetroyxs@gmail.com"  # Email tujuan notifikasi
+ADMIN_EMAIL_RECIPIENT = "adinugroho@wijna.org"  # Email tujuan notifikasi
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 # Use centered layout on login screen; switch to wide after user logs in.
 _layout_mode = "wide" if st.session_state.get("user") else "centered"
@@ -2606,3 +2606,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
