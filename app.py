@@ -1248,8 +1248,292 @@ def _users_delete_row(ws, row_idx: int):
 
 
 def dashboard():
-    st.title("🏠 Dashboard")
-    st.write("Selamat datang di WIJNA Management System.")
+    st.title("🏠 Dashboard Monitoring")
+    st.caption("Ringkasan cepat status operasional & approvals. Gunakan tombol refresh bila data baru saja berubah.")
+    col_refresh, col_time = st.columns([1,3])
+    with col_refresh:
+        if st.button("🔄 Refresh Data", type="secondary"):
+            try:
+                _invalidate_data_cache()
+            except Exception:
+                pass
+            st.experimental_rerun()
+    with col_time:
+        st.write(f"Waktu (WIB): {now_wib_iso()}")
+
+    # Helper generic loader
+    def _load_sheet(name: str, expected: list[str] | None = None) -> pd.DataFrame:
+        try:
+            ws = _get_ws(name)
+            if expected:
+                try:
+                    records = _cached_get_all_records(name, expected)
+                except Exception:
+                    records = ws.get_all_records()
+            else:
+                records = ws.get_all_records()
+            df = pd.DataFrame(records)
+            if expected:
+                for h in expected:
+                    if h not in df.columns:
+                        df[h] = ""
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    today = date.today()
+    this_month = today.strftime("%Y-%m")
+
+    # 1) Approvals needed across modules
+    st.markdown("### ✅ Approval Menunggu")
+    approvals = []
+    # Inventory
+    inv = _load_sheet(INVENTORY_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'INVENTORY_SHEET_NAME' in globals() else pd.DataFrame()
+    if not inv.empty:
+        finance_pending = (inv['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in inv.columns else 0
+        director_pending = (inv['director_approved'].astype(str) == '0').sum() if 'director_approved' in inv.columns else 0
+        if finance_pending: approvals.append(("Inventory (Finance)", finance_pending, "Inventory"))
+        if director_pending: approvals.append(("Inventory (Director)", director_pending, "Inventory"))
+    # Surat Masuk
+    sm = _load_sheet(SURAT_MASUK_SHEET_NAME, ["director_approved","id"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sm.empty and 'director_approved' in sm.columns:
+        pending = (sm['director_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("Surat Masuk (Director)", pending, "Surat Masuk"))
+    # Surat Keluar
+    sk = _load_sheet(SURAT_KELUAR_SHEET_NAME, ["director_approved","id"]) if 'SURAT_KELUAR_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sk.empty and 'director_approved' in sk.columns:
+        pending = (sk['director_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("Surat Keluar (Director)", pending, "Surat Keluar"))
+    # MoU
+    mou = _load_sheet(MOU_SHEET_NAME, ["board_approved","id"]) if 'MOU_SHEET_NAME' in globals() else pd.DataFrame()
+    if not mou.empty and 'board_approved' in mou.columns:
+        pending = (mou['board_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("MoU (Board)", pending, "MoU"))
+    # Cash Advance
+    ca = _load_sheet(CASH_ADVANCE_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'CASH_ADVANCE_SHEET_NAME' in globals() else pd.DataFrame()
+    if not ca.empty:
+        fp = (ca['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in ca.columns else 0
+        dp = (ca['director_approved'].astype(str) == '0').sum() if 'director_approved' in ca.columns else 0
+        if fp: approvals.append(("Cash Advance (Finance)", fp, "Cash Advance"))
+        if dp: approvals.append(("Cash Advance (Director)", dp, "Cash Advance"))
+    # PMR
+    pmr = _load_sheet(PMR_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'PMR_SHEET_NAME' in globals() else pd.DataFrame()
+    if not pmr.empty:
+        fp = (pmr['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in pmr.columns else 0
+        dp = (pmr['director_approved'].astype(str) == '0').sum() if 'director_approved' in pmr.columns else 0
+        if fp: approvals.append(("PMR (Finance)", fp, "PMR"))
+        if dp: approvals.append(("PMR (Director)", dp, "PMR"))
+    # Flex
+    flex = _load_sheet(FLEX_SHEET_NAME, ["approval_finance","approval_director","id"]) if 'FLEX_SHEET_NAME' in globals() else pd.DataFrame()
+    if not flex.empty:
+        fp = (flex['approval_finance'].astype(str) == '0').sum() if 'approval_finance' in flex.columns else 0
+        dp = (flex['approval_director'].astype(str) == '0').sum() if 'approval_director' in flex.columns else 0
+        if fp: approvals.append(("Flex (Finance)", fp, "Flex Time"))
+        if dp: approvals.append(("Flex (Director)", dp, "Flex Time"))
+    # Notulen
+    notulen = _load_sheet(NOTULEN_SHEET_NAME, ["director_approved","id"]) if 'NOTULEN_SHEET_NAME' in globals() else pd.DataFrame()
+    if not notulen.empty and 'director_approved' in notulen.columns:
+        pend = (notulen['director_approved'].astype(str) == '0').sum()
+        if pend: approvals.append(("Notulen (Director)", pend, "Notulen"))
+    # SOP
+    sop = _load_sheet(SOP_SHEET_NAME, ["director_approved","id"]) if 'SOP_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sop.empty and 'director_approved' in sop.columns:
+        pend = (sop['director_approved'].astype(str) == '0').sum()
+        if pend: approvals.append(("SOP (Director)", pend, "SOP"))
+    # Cuti
+    cuti = _load_sheet(CUTI_SHEET_NAME, ["finance_approved","director_approved","status","id"]) if 'CUTI_SHEET_NAME' in globals() else pd.DataFrame()
+    if not cuti.empty:
+        fp = (cuti['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in cuti.columns else 0
+        dp = (cuti['director_approved'].astype(str) == '0').sum() if 'director_approved' in cuti.columns else 0
+        if fp: approvals.append(("Cuti (Finance)", fp, "Cuti"))
+        if dp: approvals.append(("Cuti (Director)", dp, "Cuti"))
+
+    if approvals:
+        # Show as metric grid
+        for i in range(0, len(approvals), 4):
+            row = approvals[i:i+4]
+            cols = st.columns(len(row))
+            for c, (label, count, page_key) in zip(cols, row):
+                with c:
+                    st.metric(label, count)
+                    if st.button(f"➡️ Buka", key=f"go_{label}"):
+                        st.session_state['page'] = page_key
+                        st.experimental_rerun()
+    else:
+        st.info("Tidak ada approval pending.")
+
+    st.markdown("---")
+    # 2) Status Surat & MoU (mendekati jatuh tempo)
+    st.markdown("### ✉️ Surat & 🤝 MoU")
+    col_surat, col_mou = st.columns(2)
+    with col_surat:
+        if not sm.empty and 'director_approved' in sm.columns:
+            pending_rows = sm[sm['director_approved'].astype(str) == '0']
+            st.write(f"Surat Masuk pending: {len(pending_rows)}")
+            if not pending_rows.empty:
+                show = pending_rows.head(5).copy()
+                cols_show = [c for c in ['nomor','perihal','tanggal'] if c in show.columns]
+                if cols_show:
+                    safe_dataframe(show[cols_show], index=False, height=180)
+        else:
+            st.write("Tidak ada data surat masuk / kolom tidak lengkap.")
+    with col_mou:
+        if not mou.empty and 'tgl_selesai' in mou.columns:
+            try:
+                mou['tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
+                soon = mou[mou['tgl_selesai_dt'].notna() & (mou['tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['tgl_selesai_dt'] <= pd.Timestamp.today() + pd.Timedelta(days=30))]
+                soon = soon.sort_values('tgl_selesai_dt')
+                st.write(f"MoU hampir jatuh tempo (≤30 hari): {len(soon)}")
+                if not soon.empty:
+                    show = soon[['nomor','nama','tgl_selesai']].head(5)
+                    safe_dataframe(show, index=False, height=180)
+            except Exception:
+                st.write("Gagal parsing tanggal MoU.")
+        else:
+            st.write("Tidak ada data MoU / kolom tgl_selesai tidak tersedia.")
+
+    st.markdown("---")
+    # 3) Cuti & Flex
+    st.markdown("### 🌴 Cuti & ⏰ Flex")
+    col_cuti, col_flex = st.columns([2,1])
+    with col_cuti:
+        if not cuti.empty and 'nama' in cuti.columns:
+            latest_cuti = cuti.copy()
+            if 'created_at' in latest_cuti.columns:
+                latest_cuti['_created'] = pd.to_datetime(latest_cuti['created_at'], errors='coerce')
+                latest_cuti = latest_cuti.sort_values('_created')
+            # Ambil sisa_kuota terakhir per nama
+            if 'sisa_kuota' in latest_cuti.columns:
+                sisa = latest_cuti.groupby('nama')['sisa_kuota'].last().reset_index()
+                st.write("Sisa Kuota (terakhir tercatat):")
+                safe_dataframe(sisa.rename(columns={'sisa_kuota':'sisa'}), index=False, height=220)
+        else:
+            st.write("Data cuti tidak tersedia.")
+    with col_flex:
+        if not flex.empty:
+            total_pending_fin = (flex['approval_finance'].astype(str) == '0').sum() if 'approval_finance' in flex.columns else 0
+            total_pending_dir = (flex['approval_director'].astype(str) == '0').sum() if 'approval_director' in flex.columns else 0
+            approved_month = 0
+            if 'approval_director' in flex.columns and 'tanggal' in flex.columns:
+                try:
+                    approved_month = ( (flex['approval_director'].astype(str) == '1') & (flex['tanggal'].astype(str).str[:7] == this_month) ).sum()
+                except Exception:
+                    pass
+            st.metric("Flex Pending (Finance)", total_pending_fin)
+            st.metric("Flex Pending (Director)", total_pending_dir)
+            st.metric("Flex Approved Bulan Ini", approved_month)
+        else:
+            st.write("Data flex tidak tersedia.")
+
+    st.markdown("---")
+    # 4) Delegasi Tugas Aktif
+    st.markdown("### 🗂️ Delegasi Tugas Aktif")
+    delegasi = _load_sheet(DELEGASI_SHEET_NAME, ["judul","pic","status","tgl_selesai","id"]) if 'DELEGASI_SHEET_NAME' in globals() else pd.DataFrame()
+    if not delegasi.empty:
+        active = delegasi[delegasi['status'].astype(str).str.lower().isin(["", "proses", "progress", "ongoing", "open", "aktif"])]
+        if not active.empty:
+            try:
+                active['deadline_dt'] = pd.to_datetime(active['tgl_selesai'], errors='coerce')
+            except Exception:
+                active['deadline_dt'] = pd.NaT
+            def _color(row):
+                dl = row.get('deadline_dt')
+                if pd.isna(dl):
+                    return '⬜'
+                if dl.date() < today:
+                    return '🔴'
+                if dl.date() <= today + timedelta(days=3):
+                    return '🟠'
+                return '🟢'
+            view = []
+            for _, r in active.head(10).iterrows():
+                view.append({
+                    'judul': r.get('judul'),
+                    'pic': r.get('pic'),
+                    'deadline': r.get('tgl_selesai'),
+                    'status': r.get('status'),
+                    'indikator': _color(r)
+                })
+            safe_dataframe(pd.DataFrame(view), index=False, height=260)
+        else:
+            st.info("Tidak ada tugas aktif.")
+    else:
+        st.write("Data delegasi tidak tersedia.")
+
+    st.markdown("---")
+    # 5) Rekap Bulanan (counts)
+    st.markdown("### 📊 Rekap Bulanan (Jumlah Item)")
+    def _monthly_count(df: pd.DataFrame, date_fields: list[str]) -> int:
+        if df.empty:
+            return 0
+        for f in date_fields:
+            if f in df.columns:
+                return (df[f].astype(str).str[:7] == this_month).sum()
+        return 0
+    rekap_data = [
+        ("Cash Advance", _monthly_count(ca, ["tanggal","created_at"])),
+        ("PMR", _monthly_count(pmr, ["bulan","tanggal_submit"])),
+        ("Inventory Update", _monthly_count(inv, ["updated_at"])),
+        ("Surat Masuk", _monthly_count(sm, ["tanggal","created_at"])),
+        ("Surat Keluar", _monthly_count(sk, ["tanggal","created_at"])),
+        ("Notulen", _monthly_count(notulen, ["tanggal_rapat","tanggal_upload","created_at"])),
+        ("SOP", _monthly_count(sop, ["tanggal_terbit","tanggal_upload","created_at"]))
+    ]
+    cols = st.columns(4)
+    for i, (label, val) in enumerate(rekap_data):
+        with cols[i % 4]:
+            st.metric(label, val)
+
+    st.markdown("---")
+    # 6) Kalender Bersama (upcoming events & mobil booking)
+    st.markdown("### 📅 Kalender & Event Mendatang (14 hari)")
+    cal = _load_sheet(CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"]) if 'CALENDAR_SHEET_NAME' in globals() else pd.DataFrame()
+    mobil = _load_sheet(MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"]) if 'MOBIL_SHEET_NAME' in globals() else pd.DataFrame()
+    horizon_end = today + timedelta(days=14)
+    upcoming_rows = []
+    if not cal.empty:
+        try:
+            cal['_mulai'] = pd.to_datetime(cal['tgl_mulai'], errors='coerce')
+            cal['_selesai'] = pd.to_datetime(cal['tgl_selesai'], errors='coerce')
+            filt = cal[cal['_mulai'].notna() & (cal['_mulai'].dt.date >= today) & (cal['_mulai'].dt.date <= horizon_end)]
+            for _, r in filt.iterrows():
+                upcoming_rows.append({
+                    'jenis': r.get('jenis'),
+                    'judul': r.get('judul'),
+                    'mulai': r.get('tgl_mulai'),
+                    'selesai': r.get('tgl_selesai'),
+                    'kategori': 'Libur Nasional' if str(r.get('is_holiday')) == '1' else 'Event'
+                })
+        except Exception:
+            pass
+    if not mobil.empty:
+        try:
+            mobil['_mulai'] = pd.to_datetime(mobil['tgl_mulai'], errors='coerce')
+            mobil['_selesai'] = pd.to_datetime(mobil['tgl_selesai'], errors='coerce')
+            filt2 = mobil[mobil['_mulai'].notna() & (mobil['_mulai'].dt.date >= today) & (mobil['_mulai'].dt.date <= horizon_end)]
+            for _, r in filt2.iterrows():
+                upcoming_rows.append({
+                    'jenis': 'Mobil',
+                    'judul': f"{r.get('kendaraan')} - {r.get('tujuan')}",
+                    'mulai': r.get('tgl_mulai'),
+                    'selesai': r.get('tgl_selesai'),
+                    'kategori': 'Mobil Kantor'
+                })
+        except Exception:
+            pass
+    if upcoming_rows:
+        up_df = pd.DataFrame(upcoming_rows)
+        up_df = up_df.sort_values('mulai')
+        safe_dataframe(up_df.head(25), index=False, height=320)
+        try:
+            st.download_button("⬇️ Export Upcoming (CSV)", up_df.to_csv(index=False).encode('utf-8'), file_name=f"upcoming_events_{today.isoformat()}.csv")
+        except Exception:
+            pass
+    else:
+        st.info("Tidak ada event mendatang 14 hari ke depan.")
+
+    st.markdown("---")
+    st.caption("Selesai memuat ringkasan dashboard.")
 
 
 def inventory_module():
