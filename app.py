@@ -25,12 +25,13 @@ INVENTORY_SHEET_NAME = "inventory"
 SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 CONFIG_SHEET_NAME = "config"
+MOU_SHEET_NAME = "mou"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
 # khusus (misal selalu kirim ke tim IT), isi dengan alamat distribution list.
 ADMIN_EMAIL_RECIPIENT = ""
-ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser"]
+ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser", "board"]
 
 # Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
 # Catatan: superuser selalu otomatis ditambahkan oleh helper.
@@ -520,6 +521,17 @@ def ensure_core_sheets():
         # Config sheet for dynamic notification mappings
         config_headers = ["module", "action", "roles", "active", "updated_at", "updated_by"]
         ensure_sheet_with_headers(spreadsheet, CONFIG_SHEET_NAME, config_headers)
+
+        # MoU sheet
+        mou_headers = [
+            "id", "nomor", "nama", "pihak", "jenis",
+            "tgl_mulai", "tgl_selesai",
+            "draft_file_id", "draft_file_name", "draft_file_link",
+            "board_note", "board_approved",
+            "final_file_id", "final_file_name", "final_file_link",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -2125,8 +2137,271 @@ def surat_keluar_module():
 
 
 def mou_module():
+    """Module Manajemen MoU menggunakan Google Sheets + Google Drive.
+    Sheet: MOU_SHEET_NAME dengan kolom:
+      id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai,
+      draft_file_id, draft_file_name, draft_file_link,
+      board_note, board_approved,
+      final_file_id, final_file_name, final_file_link,
+      created_at, updated_at, submitted_by
+    """
+    user = require_login()
     st.header("🤝 MoU")
-    st.info("Module coming soon (Sheets + Drive)")
+
+    # Helpers
+    def _mou_ws():
+        return _get_ws(MOU_SHEET_NAME)
+
+    def _mou_headers():
+        return [
+            "id", "nomor", "nama", "pihak", "jenis",
+            "tgl_mulai", "tgl_selesai",
+            "draft_file_id", "draft_file_name", "draft_file_link",
+            "board_note", "board_approved",
+            "final_file_id", "final_file_name", "final_file_link",
+            "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _mou_read_df():
+        ws = _mou_ws()
+        headers = _mou_headers()
+        try:
+            df = pd.DataFrame(_cached_get_all_records(MOU_SHEET_NAME, headers))
+        except Exception:
+            df = pd.DataFrame(ws.get_all_records())
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        # Normalize board_approved
+        df['board_approved'] = pd.to_numeric(df.get('board_approved'), errors='coerce').fillna(0).astype(int)
+        return ws, df
+
+    def _mou_append(row: dict):
+        ws = _mou_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                break
+            except gspread.exceptions.APIError as e:
+                if '429' in str(e):
+                    time.sleep(1 + i)
+                    continue
+                raise
+        st.cache_data.clear()
+
+    def _mou_update_by_id(mid: str, updates: dict):
+        ws = _mou_ws()
+        headers = ws.row_values(1)
+        id_cell = ws.find(mid)
+        if not id_cell:
+            raise ValueError("ID MoU tidak ditemukan")
+        row_idx = id_cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, v)
+                    break
+                except gspread.exceptions.APIError as e:
+                    if '429' in str(e):
+                        time.sleep(1 + i)
+                        continue
+                    raise
+        st.cache_data.clear()
+
+    def _upload_file(file) -> tuple[str, str, str]:
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            folder_id = GDRIVE_FOLDER_ID
+            file_metadata = {"name": file.name, "parents": [folder_id]}
+            created = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink, name").execute()
+            fid = created.get("id", "")
+            link = created.get("webViewLink", "")
+            name = created.get("name", file.name)
+            return fid, name, link
+        except Exception as e:
+            st.error(f"Upload gagal: {e}")
+            return "", "", ""
+
+    tab1, tab2, tab3 = st.tabs([
+        "📝 Input Draft MoU",
+        "👥 Review Board",
+        "📋 Daftar & Rekap MoU"
+    ])
+
+    jenis_options = [
+        "Programmatic MoU",
+        "Funding MoU / Grant Agreement",
+        "Strategic Partnership MoU",
+        "Capacity Building MoU",
+        "Secondment MoU",
+        "Internship/Volunteer MoU",
+        "Advocacy MoU",
+        "Operational MoU",
+        "Research & Development MoU",
+        "MoU Advokasi Kebijakan Publik",
+        "MoU Operasional",
+    ]
+
+    # TAB 1: Input Draft
+    with tab1:
+        st.markdown("### Input Draft MoU (Staf)")
+        with st.form("mou_add", clear_on_submit=True):
+            nomor = st.text_input("Nomor MoU")
+            nama = st.text_input("Nama MoU")
+            pihak = st.text_input("Pihak Terlibat")
+            jenis = st.selectbox("Jenis MoU", jenis_options)
+            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today() + timedelta(days=365))
+            draft_file = st.file_uploader("File Draft MoU (wajib)")
+            submit = st.form_submit_button("Simpan Draft MoU")
+            if submit:
+                if not draft_file:
+                    st.error("File draft MoU wajib diupload.")
+                elif tgl_selesai < tgl_mulai:
+                    st.error("Tanggal selesai tidak boleh sebelum tanggal mulai.")
+                else:
+                    mid = gen_id("mou")
+                    fid, fname, flink = _upload_file(draft_file)
+                    now = datetime.utcnow().isoformat()
+                    row = {
+                        "id": mid,
+                        "nomor": nomor,
+                        "nama": nama,
+                        "pihak": pihak,
+                        "jenis": jenis,
+                        "tgl_mulai": tgl_mulai.isoformat(),
+                        "tgl_selesai": tgl_selesai.isoformat(),
+                        "draft_file_id": fid,
+                        "draft_file_name": fname,
+                        "draft_file_link": flink,
+                        "board_note": "",
+                        "board_approved": 0,
+                        "final_file_id": "",
+                        "final_file_name": "",
+                        "final_file_link": "",
+                        "created_at": now,
+                        "updated_at": now,
+                        "submitted_by": user.get("email", "")
+                    }
+                    _mou_append(row)
+                    try:
+                        audit_log("mou", "create", target=mid, details=f"{nomor} - {nama} ({jenis})")
+                        notify_event("mou", "create", "MoU Draft Baru", f"Draft MoU baru dibuat: {nomor} - {nama}")
+                    except Exception:
+                        pass
+                    st.success("MoU tersimpan (draft).")
+                    st.experimental_rerun()
+
+    # TAB 2: Review Board
+    with tab2:
+        st.markdown("### Review Board (Opsional)")
+        if user.get("role") in ["board", "superuser"]:
+            _, df_mou = _mou_read_df()
+            if df_mou.empty:
+                st.info("Belum ada MoU untuk direview.")
+            else:
+                # Urutkan tgl_selesai asc
+                try:
+                    df_mou = df_mou.sort_values(by="tgl_selesai")
+                except Exception:
+                    pass
+                for idx, row in df_mou.iterrows():
+                    exp_label = f"{row['nomor']} | {row['nama']} | {row['tgl_mulai']} - {row['tgl_selesai']}"
+                    with st.expander(exp_label):
+                        st.write(f"Pihak: {row['pihak']}")
+                        st.write(f"Jenis: {row['jenis']}")
+                        st.write(f"Catatan Board: {row['board_note']}")
+                        note = st.text_area("Catatan Board", value=row['board_note'], key=f"board_note_{row['id']}")
+                        approve = st.checkbox("Approve Board", value=bool(row['board_approved']), key=f"board_appr_{row['id']}")
+                        if st.button("Simpan Review Board", key=f"save_board_{row['id']}"):
+                            try:
+                                _mou_update_by_id(row['id'], {
+                                    "board_note": note,
+                                    "board_approved": 1 if approve else 0,
+                                    "updated_at": datetime.utcnow().isoformat()
+                                })
+                                try:
+                                    audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                                except Exception:
+                                    pass
+                                st.success("Review Board disimpan.")
+                                st.experimental_rerun()
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+        else:
+            st.info("Hanya Board yang dapat review di sini.")
+
+    # TAB 3: Daftar & Rekap
+    with tab3:
+        st.markdown("### Daftar & Rekap MoU")
+        _, df_all = _mou_read_df()
+        today = date.today()
+        if not df_all.empty:
+            # Status aktif
+            def _status(row):
+                try:
+                    mulai = datetime.fromisoformat(str(row['tgl_mulai'])).date()
+                    selesai = datetime.fromisoformat(str(row['tgl_selesai'])).date()
+                    return 'Aktif' if mulai <= today <= selesai else 'Tidak Aktif'
+                except Exception:
+                    return 'Tidak Aktif'
+            df_all['status_aktif'] = df_all.apply(_status, axis=1)
+        else:
+            df_all['status_aktif'] = []
+
+        cols_show = ["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","draft_file_name","board_approved","status_aktif"]
+        show_df = df_all[cols_show].copy() if not df_all.empty else pd.DataFrame(columns=cols_show)
+        if not show_df.empty:
+            show_df['Board Approved'] = show_df['board_approved'].map({0: '❌', 1: '✅'})
+            show_df = show_df.rename(columns={
+                "id":"ID","nomor":"Nomor","nama":"Nama","pihak":"Pihak","jenis":"Jenis",
+                "tgl_mulai":"Tgl Mulai","tgl_selesai":"Tgl Selesai","draft_file_name":"File",
+                "status_aktif":"Status Aktif"
+            })
+        left, right = st.columns([3,2])
+        with left:
+            st.subheader("📋 Daftar MoU")
+            if show_df.empty:
+                st.info("Belum ada data MoU.")
+            else:
+                safe_dataframe(show_df, index=False)
+        with right:
+            st.subheader("⬇️ Download File")
+            if df_all.empty:
+                st.info("Belum ada data.")
+            else:
+                opt_map = {f"{r['nomor']} | {r['nama']} — {r['draft_file_name']}": r['id'] for _, r in df_all.iterrows() if r.get('draft_file_name')}
+                pilihan = st.selectbox("Pilih MoU", [""] + list(opt_map.keys()))
+                if pilihan:
+                    mid = opt_map[pilihan]
+                    # Provide download via Google Drive link if available
+                    _, df_tmp = _mou_read_df()
+                    row = df_tmp[df_tmp['id'] == mid]
+                    if not row.empty:
+                        link = row.iloc[0].get('draft_file_link') or ''
+                        if link:
+                            st.markdown(f"[Buka File Draft di Google Drive]({link})")
+                        else:
+                            st.info("Link file tidak tersedia.")
+        st.markdown("#### 📅 Rekap Bulanan MoU (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        if not df_all.empty:
+            df_month = df_all[(df_all['tgl_mulai'].astype(str).str[:7] == this_month) | (df_all['tgl_selesai'].astype(str).str[:7] == this_month)]
+        else:
+            df_month = pd.DataFrame()
+        st.write(f"Total MoU terkait bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_jenis = df_month['jenis'].value_counts()
+            st.write("Rekap per Jenis:")
+            safe_dataframe(by_jenis.to_frame(name='Jumlah'), index=True)
 
 
 def cash_advance_module():
