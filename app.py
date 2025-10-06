@@ -35,6 +35,7 @@ CONFIG_SHEET_NAME = "config"
 MOU_SHEET_NAME = "mou"
 CASH_ADVANCE_SHEET_NAME = "cash_advance"
 PMR_SHEET_NAME = "pmr"
+DELEGASI_SHEET_NAME = "delegasi"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -70,6 +71,9 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("pmr", "upload"): ["finance"],
     ("pmr", "finance_review"): ["director"],
     ("pmr", "director_approval"): ["finance"],
+    # Delegasi events
+    ("delegasi", "create"): ["director"],
+    ("delegasi", "update"): ["director"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -618,6 +622,13 @@ def ensure_core_sheets():
             "tanggal_submit", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, PMR_SHEET_NAME, pmr_headers)
+
+        # Delegasi sheet
+        delegasi_headers = [
+            "id", "judul", "deskripsi", "pic", "tgl_mulai", "tgl_selesai",
+            "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, DELEGASI_SHEET_NAME, delegasi_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -3137,8 +3148,259 @@ def flex_module():
 
 
 def delegasi_module():
-    st.header("📝 Delegasi")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.header("🗂️ Delegasi Tugas & Monitoring")
+    st.markdown("<div style='color:#2563eb;font-size:1.05rem;margin-bottom:1.0em'>Alur: Pemberi tugas membuat → PIC update status/upload bukti → Director monitor → Rekap & peringatan tenggat.</div>", unsafe_allow_html=True)
+
+    def _del_headers():
+        return [
+            "id", "judul", "deskripsi", "pic", "tgl_mulai", "tgl_selesai",
+            "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _del_ws():
+        try:
+            return _get_ws(DELEGASI_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), DELEGASI_SHEET_NAME, _del_headers())
+
+    def _del_read_df():
+        ws = _del_ws()
+        headers = _del_headers()
+        try:
+            records = _cached_get_all_records(DELEGASI_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        if 'status' in df.columns:
+            df['status'] = df['status'].replace({None: ''}).fillna('')
+        return ws, df
+
+    def _del_append(row: dict):
+        ws = _del_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
+
+    def _del_update_by_id(did: str, updates: dict):
+        ws = _del_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(did)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _upload_file(file):
+        if not file:
+            return None, None, None
+        try:
+            drive = get_gdrive_service()
+            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            meta = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
+            created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
+            return created.get('id'), file.name, created.get('webViewLink')
+        except Exception:
+            return None, None, None
+
+    def _deadline_color(end_date_str: str) -> str:
+        try:
+            end = datetime.fromisoformat(end_date_str).date()
+        except Exception:
+            return "-"
+        today = date.today()
+        d = (end - today).days
+        if d < 0:
+            return "Merah"
+        if d <= 3:
+            return "Oranye"
+        if d <= 7:
+            return "Kuning"
+        return "Hijau"
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🆕 Buat Tugas", "📝 Update Status/Bukti", "👀 Monitoring Director", "📅 Rekap & Filter"
+    ])
+
+    # --- Tab 1: Buat Tugas ---
+    with tab1:
+        st.markdown("### 🆕 Buat Tugas Baru (Pemberi Tugas)")
+        with st.form("del_add"):
+            judul = st.text_input("Judul Tugas")
+            deskripsi = st.text_area("Deskripsi")
+            pic = st.text_input("Penanggung Jawab (PIC)")
+            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+            submit = st.form_submit_button("Buat Tugas")
+            if submit:
+                if not (judul and deskripsi and pic):
+                    st.warning("Semua field wajib diisi.")
+                elif tgl_selesai < tgl_mulai:
+                    st.warning("Tanggal selesai tidak boleh sebelum mulai.")
+                else:
+                    did = gen_id("del")
+                    row = {
+                        "id": did,
+                        "judul": judul,
+                        "deskripsi": deskripsi,
+                        "pic": pic,
+                        "tgl_mulai": tgl_mulai.isoformat(),
+                        "tgl_selesai": tgl_selesai.isoformat(),
+                        "status": "Belum Selesai",
+                        "file_id": "",
+                        "file_name": "",
+                        "file_link": "",
+                        "tanggal_update": now_wib_iso(),
+                        "created_at": now_wib_iso(),
+                        "updated_at": now_wib_iso(),
+                        "submitted_by": (get_current_user() or {}).get("email", "")
+                    }
+                    _del_append(row)
+                    try:
+                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event("delegasi", "create", subject="Delegasi Baru", body=f"Tugas {judul} untuk {pic}")
+                    except Exception:
+                        pass
+                    st.success("Tugas berhasil dibuat.")
+
+    # --- Tab 2: Update Status & Upload Bukti (PIC) ---
+    with tab2:
+        st.markdown("### 📝 PIC Update Status & Upload Bukti")
+        _, df_all = _del_read_df()
+        nama_user = (user.get("full_name") or user.get("email") or "").strip()
+        tugas_pic = df_all[df_all['pic'].astype(str).str.lower() == nama_user.lower()].copy() if not df_all.empty else pd.DataFrame()
+        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_pic")
+        if filter_status != "Semua" and not tugas_pic.empty:
+            tugas_pic = tugas_pic[tugas_pic['status'] == filter_status]
+        if tugas_pic.empty:
+            st.info("Tidak ada tugas untuk Anda.")
+        else:
+            try:
+                tugas_pic = tugas_pic.sort_values(by='tgl_selesai')
+            except Exception:
+                pass
+            for idx, row in tugas_pic.iterrows():
+                header = f"{row['judul']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | Status: {row['status']}"
+                with st.expander(header):
+                    st.write(f"Deskripsi: {row.get('deskripsi','')}")
+                    st.write(f"Tenggat: {row.get('tgl_mulai','')} s/d {row.get('tgl_selesai','')}")
+                    status = st.selectbox("Status", ["Belum Selesai", "Proses", "Selesai"], index=["Belum Selesai", "Proses", "Selesai"].index(row.get('status','Belum Selesai') or "Belum Selesai"), key=f"status_{row['id']}")
+                    file_bukti = st.file_uploader("Upload Bukti (wajib jika selesai)", key=f"bukti_{row['id']}")
+                    if st.button("Update Status", key=f"update_{row['id']}"):
+                        if status == "Selesai" and not file_bukti and not row.get('file_id'):
+                            st.error("Status 'Selesai' wajib upload file dokumentasi!")
+                        else:
+                            fid, fname, flink = (row.get('file_id'), row.get('file_name'), row.get('file_link'))
+                            if file_bukti:
+                                fid, fname, flink = _upload_file(file_bukti)
+                            updates = {
+                                "status": status,
+                                "tanggal_update": now_wib_iso(),
+                                "updated_at": now_wib_iso(),
+                            }
+                            if status == "Selesai" and fid:
+                                updates.update({"file_id": fid or "", "file_name": fname or "", "file_link": flink or ""})
+                            _del_update_by_id(row['id'], updates)
+                            try:
+                                det = f"status={status}" + (f"; bukti={fname}" if fname else "")
+                                audit_log("delegasi", "update", target=row['id'], details=det)
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("delegasi", "update", subject="Update Delegasi", body=f"Tugas {row['judul']} status {status}")
+                            except Exception:
+                                pass
+                            st.success("Status tugas diperbarui.")
+                            st.rerun()
+
+    # --- Tab 3: Monitoring Director ---
+    with tab3:
+        st.markdown("### 👀 Monitoring Director")
+        if user.get("role") in ["director", "superuser"]:
+            _, df_all = _del_read_df()
+            if df_all.empty:
+                st.info("Belum ada tugas delegasi.")
+            else:
+                filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_dir")
+                if filter_status != "Semua":
+                    df_view = df_all[df_all['status'] == filter_status].copy()
+                else:
+                    df_view = df_all.copy()
+                try:
+                    df_view = df_view.sort_values(by='tgl_selesai')
+                except Exception:
+                    pass
+                st.dataframe(df_view[[c for c in ["id","judul","pic","tgl_mulai","tgl_selesai","status","file_name","tanggal_update"] if c in df_view.columns]], width='stretch', hide_index=True)
+                for idx, row in df_view.iterrows():
+                    with st.expander(f"{row['judul']} | {row['pic']} | Status: {row['status']}"):
+                        st.write(f"Deskripsi: {row.get('deskripsi','')}")
+                        st.write(f"Tenggat: {row.get('tgl_mulai','')} s/d {row.get('tgl_selesai','')}")
+                        st.write(f"Update terakhir: {row.get('tanggal_update','')}")
+                        if row.get('status') == 'Selesai' and row.get('file_name') and row.get('file_link'):
+                            st.markdown(f"📎 Bukti: <a href='{row['file_link']}' target='_blank'>{row['file_name']}</a>", unsafe_allow_html=True)
+                        st.write(f"Status: {row.get('status','')}")
+        else:
+            st.info("Hanya Director yang dapat monitoring di sini.")
+
+    # --- Tab 4: Rekap & Filter ---
+    with tab4:
+        st.markdown("### 📅 Rekap Bulanan Delegasi & Filter")
+        _, df_all = _del_read_df()
+        if df_all.empty:
+            st.info("Belum ada data delegasi.")
+        else:
+            filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_rekap")
+            df_view = df_all.copy()
+            if filter_status != "Semua":
+                df_view = df_view[df_view['status'] == filter_status]
+            this_month = date.today().strftime("%Y-%m")
+            df_month = df_view[df_view['tgl_mulai'].astype(str).str[:7] == this_month] if not df_view.empty else pd.DataFrame()
+            st.write(f"Total tugas bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                # Top PIC & Status dist
+                top_pic = df_month['pic'].value_counts().head(5)
+                st.write("Top 5 PIC:")
+                st.dataframe(top_pic, width='stretch')
+                status_count = df_month['status'].value_counts().to_dict()
+                st.write("Status:", status_count)
+            # Add deadline color preview
+            if not df_view.empty:
+                prev = df_view[["id","judul","pic","tgl_mulai","tgl_selesai","status"]].copy()
+                prev['color'] = prev['tgl_selesai'].apply(_deadline_color)
+                st.subheader("⏰ Status Tenggat (Preview Warna)")
+                st.dataframe(prev, width='stretch', hide_index=True)
 
 
 def kalender_pemakaian_mobil_kantor():
