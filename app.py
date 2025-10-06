@@ -672,43 +672,20 @@ if 'user' not in st.session_state:
 def show_login_page():
     """Menampilkan halaman login dan registrasi."""
     st.header("🔐 Secure App Login")
-
-    # Auto-login attempt if token query param present and session not logged in yet
-    try:
-        if not st.session_state.get('logged_in'):
-            token = st.query_params.get('auth') if hasattr(st, 'query_params') else None
-            if token:
-                found = _find_user_by_token(token)
-                if found:
-                    _, row = found
-                    st.session_state.logged_in = True
-                    st.session_state.username = row.get('email') or row.get('username')
-                    set_current_user({
-                        'email': row.get('email') or row.get('username'),
-                        'full_name': row.get('full_name',''),
-                        'role': str(row.get('role','user')).lower() or 'user',
-                        'active': int(row.get('active',1)) if str(row.get('active',1)).isdigit() else 1,
-                    })
-                    try:
-                        audit_log('auth','auto_login', target=st.session_state.username, details='via token (login page)')
-                    except Exception:
-                        pass
-                    st.success(f"Login otomatis sebagai {st.session_state.username}")
-                    st.rerun()
-    except Exception:
-        pass
+    # (Auto-login via token dipindahkan ke main() agar tidak duplikasi.)
     
     with st.sidebar:
         st.subheader("Pilih Aksi")
         action = st.radio(" ", ["Login", "Register"])
 
+    # Koneksi langsung ke worksheet tidak lagi diperlukan di layer UI karena
+    # login/registrasi memakai helper login_user/register_user yang sudah melakukan akses.
+    # Tetap lakukan pengecekan koneksi minimal agar user dapat pesan error lebih awal.
     try:
-        client = get_gsheets_client()
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
-        worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
+        _ = get_spreadsheet().worksheet(USERS_SHEET_NAME)
     except Exception as e:
-        st.error(f"Tidak dapat terhubung ke Google Sheet. Pastikan file dibagikan dan URL benar. Error: {e}")
-        st.stop()
+        st.error(f"Tidak dapat terhubung ke Google Sheet (users). Error: {e}")
+        return
 
     if action == "Login":
         st.subheader("Login")
@@ -718,7 +695,7 @@ def show_login_page():
                 st.session_state.remember_me = True
             remember = st.checkbox("Ingat saya (tetap login)", value=st.session_state.remember_me, help="Menyimpan sesi login hingga 14 hari atau sampai Anda logout.")
             st.session_state.remember_me = remember
-            username = st.text_input("Username").lower()
+            username = st.text_input("Email / Username").strip().lower()
             password = st.text_input("Password", type="password")
             if st.session_state.remember_me:
                 st.caption("Token login akan disimpan di URL (parameter ?auth=...). Jangan bagikan link ini ke orang lain.")
@@ -726,87 +703,35 @@ def show_login_page():
 
             if login_button:
                 if not username or not password:
-                    st.warning("Username dan Password tidak boleh kosong.")
-                    return
-
-                users_df = pd.DataFrame(worksheet.get_all_records())
-                user_data = users_df[users_df["username"] == username]
-
-                if not user_data.empty:
-                    stored_hash = user_data.iloc[0]["password_hash"]
-                    if verify_password(password, stored_hash):
-                        # If remember me: generate / store token (ensure headers first)
-                        try:
-                            if st.session_state.get("remember_me"):
-                                headers = worksheet.row_values(1)
-                                headers_changed = False
-                                needed = ["auth_token", "auth_token_expires"]
-                                for col in needed:
-                                    if col not in headers:
-                                        headers.append(col)
-                                        headers_changed = True
-                                if headers_changed:
-                                    worksheet.update("A1", [headers])
-                                    # refresh local df columns length alignment if needed
-                                # Determine row index (sheet row = df index + 2)
-                                sheet_row = user_data.index[0] + 2
-                                token = _generate_auth_token()
-                                _save_user_token(worksheet, sheet_row, token)
-                                # Set query param so reload keeps session
-                                try:
-                                    st.query_params["auth"] = token
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        
-                        # Kirim notifikasi ke seluruh SUPERUSER saat LOGIN
-                        email_subject = "Notifikasi: User Login"
-                        email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
-                        try:
-                            notify_event("auth", "login", email_subject, email_body)
-                        except Exception:
-                            pass
-                        
-                        st.session_state.logged_in = True
-                        st.session_state.username = username
+                    st.warning("Email/Username dan Password tidak boleh kosong.")
+                else:
+                    ok, msg = login_user(username, password, remember=st.session_state.remember_me)
+                    if ok:
+                        st.success("Login berhasil. Memuat aplikasi…")
                         st.rerun()
                     else:
-                        st.error("Username atau Password salah.")
-                else:
-                    st.error("Username atau Password salah.")
+                        st.error(msg)
 
     elif action == "Register":
         st.subheader("Buat Akun Baru")
         with st.form("register_form"):
-            new_username = st.text_input("Username Baru").lower()
-            new_password = st.text_input("Password Baru", type="password")
-            confirm_password = st.text_input("Konfirmasi Password", type="password")
+            reg_email = st.text_input("Email / Username Baru").strip().lower()
+            reg_fullname = st.text_input("Nama Lengkap")
+            reg_password = st.text_input("Password Baru", type="password")
+            reg_password2 = st.text_input("Konfirmasi Password", type="password")
             register_button = st.form_submit_button("Register")
 
             if register_button:
-                if not new_username or not new_password or not confirm_password:
+                if not reg_email or not reg_fullname or not reg_password or not reg_password2:
                     st.warning("Semua field harus diisi.")
-                    return
-                if new_password != confirm_password:
+                elif reg_password != reg_password2:
                     st.error("Password tidak cocok.")
-                    return
-                
-                users_df = pd.DataFrame(worksheet.get_all_records())
-                if new_username in users_df["username"].values:
-                    st.error("Username sudah terdaftar. Silakan pilih yang lain.")
                 else:
-                    hashed_pass = hash_password(new_password)
-                    worksheet.append_row([new_username, hashed_pass])
-                    st.success("Registrasi berhasil! Silakan login.")
-
-                    # Kirim notifikasi ke seluruh SUPERUSER saat REGISTRASI
-                    email_subject = "Notifikasi: User Baru Telah Mendaftar"
-                    email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
-                    try:
-                        notify_event("users", "register", email_subject, email_body)
-                    except Exception:
-                        pass
+                    ok, msg = register_user(reg_email, reg_fullname, reg_password)
+                    if ok:
+                        st.success("Registrasi berhasil! Silakan login.")
+                    else:
+                        st.error(msg)
 
 def show_main_app():
     """Menampilkan aplikasi utama setelah user berhasil login."""
