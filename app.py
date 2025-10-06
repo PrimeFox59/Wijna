@@ -36,6 +36,7 @@ MOU_SHEET_NAME = "mou"
 CASH_ADVANCE_SHEET_NAME = "cash_advance"
 PMR_SHEET_NAME = "pmr"
 DELEGASI_SHEET_NAME = "delegasi"
+FLEX_SHEET_NAME = "flex"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -74,6 +75,10 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     # Delegasi events
     ("delegasi", "create"): ["director"],
     ("delegasi", "update"): ["director"],
+    # Flex Time events
+    ("flex", "create"): ["finance"],
+    ("flex", "finance_review"): ["director"],
+    ("flex", "director_approval"): ["finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -629,6 +634,14 @@ def ensure_core_sheets():
             "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, DELEGASI_SHEET_NAME, delegasi_headers)
+
+        # Flex sheet
+        flex_headers = [
+            "id", "nama", "tanggal", "jam_mulai", "jam_selesai", "alasan",
+            "catatan_finance", "approval_finance", "catatan_director", "approval_director",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, FLEX_SHEET_NAME, flex_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -3143,8 +3156,263 @@ def pmr_module():
 
 
 def flex_module():
+    user = require_login()
     st.header("⏰ Flex Time")
-    st.info("Module coming soon (Sheets + Drive)")
+    st.markdown("<div style='color:#2563eb;margin-bottom:0.75rem'>Alur: Staf ajukan → Finance review → Director approval → Rekap bulanan.</div>", unsafe_allow_html=True)
+
+    def _flex_headers():
+        return [
+            "id", "nama", "tanggal", "jam_mulai", "jam_selesai", "alasan",
+            "catatan_finance", "approval_finance", "catatan_director", "approval_director",
+            "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _flex_ws():
+        try:
+            return _get_ws(FLEX_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), FLEX_SHEET_NAME, _flex_headers())
+
+    def _flex_read_df():
+        ws = _flex_ws()
+        headers = _flex_headers()
+        try:
+            records = _cached_get_all_records(FLEX_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        # numeric approvals
+        for col in ["approval_finance", "approval_director"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        return ws, df
+
+    def _flex_append(row: dict):
+        ws = _flex_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    def _flex_update_by_id(fid: str, updates: dict):
+        ws = _flex_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(fid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    # Helpers for overlap detection (only among approved director=1)
+    def _check_overlap(tanggal: date, jam_mulai: datetime.time, jam_selesai: datetime.time) -> bool:
+        _, df_all = _flex_read_df()
+        if df_all.empty:
+            return False
+        day_df = df_all[(df_all['tanggal'] == tanggal.isoformat()) & (df_all['approval_director'] == 1)].copy()
+        if day_df.empty:
+            return False
+        try:
+            new_start = datetime.fromisoformat(f"{tanggal.isoformat()}T{jam_mulai.isoformat()}")
+            new_end = datetime.fromisoformat(f"{tanggal.isoformat()}T{jam_selesai.isoformat()}")
+        except Exception:
+            return False
+        for _, r in day_df.iterrows():
+            try:
+                r_start = datetime.fromisoformat(f"{r['tanggal']}T{str(r['jam_mulai'])}")
+                r_end = datetime.fromisoformat(f"{r['tanggal']}T{str(r['jam_selesai'])}")
+            except Exception:
+                continue
+            # overlap if intervals intersect
+            if not (new_end <= r_start or new_start >= r_end):
+                return True
+        return False
+
+    tabs = st.tabs([
+        "📝 Input Staf",
+        "💰 Review Finance",
+        "✅ Approval Director",
+        "📋 Daftar Flex"
+    ])
+
+    # --- Tab 1: Input Staf ---
+    with tabs[0]:
+        st.subheader(":bust_in_silhouette: Ajukan Flex Time")
+        with st.form("flex_add_form"):
+            nama = st.text_input("Nama", value=(user.get("full_name") or user.get("email") or ""))
+            tanggal = st.date_input("Tanggal", value=date.today())
+            jam_mulai = st.time_input("Jam Mulai")
+            jam_selesai = st.time_input("Jam Selesai")
+            alasan = st.text_area("Alasan")
+            submit = st.form_submit_button("Ajukan")
+            if submit:
+                if not nama or not alasan:
+                    st.warning("Nama dan alasan wajib diisi.")
+                elif jam_mulai >= jam_selesai:
+                    st.warning("Jam selesai harus setelah jam mulai.")
+                elif _check_overlap(tanggal, jam_mulai, jam_selesai):
+                    st.error("Jam flex time bentrok/overlap dengan pengajuan lain yang sudah disetujui.")
+                else:
+                    fid = gen_id("flex")
+                    row = {
+                        "id": fid,
+                        "nama": nama,
+                        "tanggal": tanggal.isoformat(),
+                        "jam_mulai": jam_mulai.isoformat(),
+                        "jam_selesai": jam_selesai.isoformat(),
+                        "alasan": alasan,
+                        "catatan_finance": "",
+                        "approval_finance": 0,
+                        "catatan_director": "",
+                        "approval_director": 0,
+                        "created_at": now_wib_iso(),
+                        "updated_at": now_wib_iso(),
+                        "submitted_by": (get_current_user() or {}).get("email", ""),
+                    }
+                    _flex_append(row)
+                    try:
+                        audit_log("flex", "create", target=fid, details=f"{nama} {tanggal} {jam_mulai}-{jam_selesai}; alasan={alasan}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event("flex", "create", subject="Pengajuan Flex Baru", body=f"{nama} mengajukan flex {tanggal} {jam_mulai}-{jam_selesai}")
+                    except Exception:
+                        pass
+                    st.success("Flex time diajukan.")
+
+    # --- Tab 2: Review Finance ---
+    with tabs[1]:
+        st.subheader(":money_with_wings: Review Finance")
+        _, df_all = _flex_read_df()
+        df_fin = df_all[df_all['approval_finance'] == 0].copy() if not df_all.empty else pd.DataFrame()
+        if df_fin.empty:
+            st.info("Tidak ada pengajuan flex time yang perlu direview.")
+        else:
+            # Sort by tanggal desc
+            try:
+                df_fin = df_fin.sort_values(by='tanggal', ascending=False)
+            except Exception:
+                pass
+            for _, row in df_fin.iterrows():
+                with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
+                    st.write(f"Alasan: {row['alasan']}")
+                    catatan = st.text_area("Catatan Finance", value=row.get('catatan_finance','') or "", key=f"catatan_fin_{row['id']}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        approve = st.button("Approve", key=f"approve_fin_{row['id']}")
+                    with c2:
+                        reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
+                    if approve or reject:
+                        app_val = 1 if approve else -1
+                        _flex_update_by_id(row['id'], {
+                            "catatan_finance": catatan,
+                            "approval_finance": app_val,
+                            "updated_at": now_wib_iso(),
+                        })
+                        try:
+                            audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        try:
+                            notify_event("flex", "finance_review", subject="Review Finance Flex", body=f"{row['nama']} {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']} status finance {app_val}")
+                        except Exception:
+                            pass
+                        st.success("Status review finance diperbarui.")
+                        st.rerun()
+
+    # --- Tab 3: Approval Director ---
+    with tabs[2]:
+        st.subheader("👨‍💼 Approval Director")
+        _, df_all = _flex_read_df()
+        df_dir = df_all[(df_all['approval_finance'] == 1) & (df_all['approval_director'] == 0)].copy() if not df_all.empty else pd.DataFrame()
+        if df_dir.empty:
+            st.info("Tidak ada pengajuan flex time yang menunggu approval director.")
+        else:
+            try:
+                df_dir = df_dir.sort_values(by='tanggal', ascending=False)
+            except Exception:
+                pass
+            for _, row in df_dir.iterrows():
+                with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
+                    st.write(f"Alasan: {row['alasan']}")
+                    st.write(f"Catatan Finance: {row['catatan_finance']}")
+                    catatan = st.text_area("Catatan Director", value=row.get('catatan_director','') or "", key=f"catatan_dir_{row['id']}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        approve = st.button("Approve", key=f"approve_dir_{row['id']}")
+                    with c2:
+                        reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
+                    if approve or reject:
+                        app_val = 1 if approve else -1
+                        _flex_update_by_id(row['id'], {
+                            "catatan_director": catatan,
+                            "approval_director": app_val,
+                            "updated_at": now_wib_iso(),
+                        })
+                        try:
+                            audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        try:
+                            notify_event("flex", "director_approval", subject="Approval Director Flex", body=f"{row['nama']} {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']} director={app_val}")
+                        except Exception:
+                            pass
+                        st.success("Status approval director diperbarui.")
+                        st.rerun()
+
+    # --- Tab 4: Daftar Flex ---
+    with tabs[3]:
+        st.subheader(":clipboard: Daftar Flex Time")
+        _, df_all = _flex_read_df()
+        if df_all.empty:
+            st.info("Belum ada data flex time.")
+        else:
+            try:
+                df_all = df_all.sort_values(by=['tanggal', 'jam_mulai'])
+            except Exception:
+                pass
+            df_disp = df_all.copy()
+            df_disp['status'] = df_disp.apply(lambda r: '✅ Disetujui' if r['approval_director']==1 else ('❌ Ditolak' if r['approval_finance']==-1 or r['approval_director']==-1 else '🕒 Proses'), axis=1)
+            # Shorten time display
+            for col in ['jam_mulai','jam_selesai']:
+                if col in df_disp.columns:
+                    df_disp[col] = df_disp[col].astype(str).str.slice(0,5)
+            safe_dataframe(df_disp[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], index=False)
+        st.markdown("#### Rekap Bulanan Flex Time (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df_all[df_all['tanggal'].astype(str).str[:7] == this_month] if not df_all.empty else pd.DataFrame()
+        st.write(f"Total pengajuan flex bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_pegawai = df_month.groupby('nama').agg({'id':'count'}).rename(columns={'id':'jumlah_pengajuan'})
+            st.write("Rekap per Pegawai:")
+            safe_dataframe(by_pegawai, index=True)
 
 
 def delegasi_module():
