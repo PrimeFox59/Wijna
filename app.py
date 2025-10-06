@@ -1339,6 +1339,135 @@ def dashboard():
     else:
         st.info("Tidak ada event mendatang 14 hari ke depan.")
 
+    # --- Section: Dokumen Perlu Approval (lazy) ---
+    st.markdown("---")
+    user = get_current_user() or {}
+    user_role = (user.get("role") or "").lower()
+    with st.expander("📄 Dokumen Menunggu Approval", expanded=False):
+        st.caption("Menampilkan hanya modul relevan dengan peran Anda.")
+
+        # Role -> modul mapping untuk approval
+        role_modules = {
+            "finance": [
+                (INVENTORY_SHEET_NAME, "inventory", ["id","name","finance_approved","director_approved"], "finance_approved"),
+                (CASH_ADVANCE_SHEET_NAME, "cash_advance", ["id","finance_approved","director_approved","tanggal"], "finance_approved"),
+                (PMR_SHEET_NAME, "pmr", ["id","finance_approved","director_approved","tanggal_submit"], "finance_approved"),
+                (FLEX_SHEET_NAME, "flex", ["id","approval_finance","approval_director","tanggal"], "approval_finance"),
+                (CUTI_SHEET_NAME, "cuti", ["id","finance_approved","director_approved","nama","tgl_mulai"], "finance_approved")
+            ],
+            "director": [
+                (INVENTORY_SHEET_NAME, "inventory", ["id","name","finance_approved","director_approved"], "director_approved"),
+                (SURAT_MASUK_SHEET_NAME, "surat_masuk", ["id","nomor","perihal","director_approved"], "director_approved"),
+                (SURAT_KELUAR_SHEET_NAME, "surat_keluar", ["id","nomor","perihal","director_approved"], "director_approved"),
+                (MOU_SHEET_NAME, "mou", ["id","nomor","nama","board_approved"], "board_approved"),
+                (CASH_ADVANCE_SHEET_NAME, "cash_advance", ["id","finance_approved","director_approved","tanggal"], "director_approved"),
+                (PMR_SHEET_NAME, "pmr", ["id","finance_approved","director_approved","tanggal_submit"], "director_approved"),
+                (FLEX_SHEET_NAME, "flex", ["id","approval_finance","approval_director","tanggal"], "approval_director"),
+                (CUTI_SHEET_NAME, "cuti", ["id","finance_approved","director_approved","nama","tgl_mulai"], "director_approved"),
+                (NOTULEN_SHEET_NAME, "notulen", ["id","judul","director_approved"], "director_approved"),
+                (SOP_SHEET_NAME, "sop", ["id","judul","director_approved"], "director_approved")
+            ]
+        }
+
+        targets = role_modules.get(user_role, [])
+        if not targets:
+            st.info("Peran Anda tidak memiliki approval yang menunggu di modul ini.")
+        else:
+            @st.cache_data(ttl=30, show_spinner=False)
+            def _load_min(sheet_name: str, headers: list[str]):
+                try:
+                    ws = _get_ws(sheet_name)
+                    recs = ws.get_all_records()
+                    df = pd.DataFrame(recs)
+                    # pastikan kolom
+                    for h in headers:
+                        if h not in df.columns:
+                            df[h] = ""
+                    return df
+                except Exception:
+                    return pd.DataFrame(columns=headers)
+
+            pending_rows_all = []
+            for sheet_name, module_key, headers, approval_col in targets:
+                dfm = _load_min(sheet_name, headers)
+                if dfm.empty or approval_col not in dfm.columns:
+                    continue
+                try:
+                    mask = dfm[approval_col].astype(str) == '0'
+                    rows = dfm[mask].head(50).copy()
+                    if rows.empty:
+                        continue
+                    # tampilkan ringkas
+                    display_cols = [c for c in rows.columns if c not in (approval_col,)][:3]
+                    st.markdown(f"**{module_key.upper()}** ({len(rows)})")
+                    safe_dataframe(rows[[c for c in display_cols if c in rows.columns]].head(10), index=False, height=180)
+                    # kumpulkan untuk multi approve
+                    for _, r in rows.iterrows():
+                        pending_rows_all.append({
+                            'sheet': sheet_name,
+                            'module': module_key,
+                            'approval_col': approval_col,
+                            'id': r.get('id')
+                        })
+                except Exception:
+                    continue
+
+            if pending_rows_all:
+                st.markdown("---")
+                st.write("Pilih item untuk di-approve:")
+                # Buat daftar id unik per modul
+                opts = [f"{pr['module']} | {pr['id']}" for pr in pending_rows_all if pr.get('id')]
+                selected_multi = st.multiselect("Item", opts, max_selections=25)
+                if selected_multi:
+                    if st.button("✅ Approve Terpilih"):
+                        approved_count = 0
+                        for sel in selected_multi:
+                            try:
+                                parts = sel.split('|')
+                                if len(parts) < 2:
+                                    continue
+                                mod = parts[0].strip().lower()
+                                obj_id = parts[1].strip()
+                                match = [p for p in pending_rows_all if p['module']==mod and p['id']==obj_id]
+                                if not match:
+                                    continue
+                                info = match[0]
+                                ws = _get_ws(info['sheet'])
+                                # find id cell
+                                try:
+                                    cell = ws.find(obj_id)
+                                except Exception:
+                                    cell = None
+                                if not cell:
+                                    continue
+                                headers_ws = ws.row_values(1)
+                                if info['approval_col'] not in headers_ws:
+                                    continue
+                                col_idx = headers_ws.index(info['approval_col']) + 1
+                                a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                                for attempt in range(3):
+                                    try:
+                                        ws.update(a1, [[1]])
+                                        approved_count += 1
+                                        # audit
+                                        try:
+                                            audit_log(info['module'], 'bulk_approve', target=obj_id, details=f"col={info['approval_col']}")
+                                        except Exception:
+                                            pass
+                                        break
+                                    except gspread.exceptions.APIError as e:
+                                        if '429' in str(e):
+                                            time.sleep(1.0*(attempt+1))
+                                            continue
+                                        raise
+                            except Exception:
+                                continue
+                        _invalidate_data_cache()
+                        st.success(f"Berhasil approve {approved_count} item.")
+                        st.experimental_rerun()
+            else:
+                st.info("Tidak ada dokumen pending untuk peran ini.")
+
     st.markdown("---")
 
 
