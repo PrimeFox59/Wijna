@@ -5,6 +5,7 @@ from passlib.context import CryptContext
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 import io
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -4710,9 +4711,18 @@ def notulen_module():
         try:
             service = get_gdrive_service()
             fname = file.name
+            parents = []
+            if GDRIVE_FOLDER_ID:
+                try:
+                    service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
+                    parents = [GDRIVE_FOLDER_ID]
+                except HttpError:
+                    st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan/akses ditolak. File akan diupload ke root Drive service account.")
             media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
-            metadata = {"name": fname, "parents": [GDRIVE_FOLDER_ID]}
-            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name").execute()
+            metadata = {"name": fname}
+            if parents:
+                metadata["parents"] = parents
+            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name", supportsAllDrives=True).execute()
             fid = created.get('id','')
             link = created.get('webViewLink','')
             return fid, fname, link
@@ -5828,10 +5838,19 @@ def main():
         # --- Full page login/register, no sidebar ---
         st.markdown("""
             <style>
-            [data-testid="stSidebar"], .stSidebar {display: none !important;}
-            .center-login {
-                max-width: 400px;
-                margin: 5% auto 0 auto;
+            fname = file.name
+            parents = []
+            if GDRIVE_FOLDER_ID:
+                try:
+                    service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
+                    parents = [GDRIVE_FOLDER_ID]
+                except HttpError:
+                    st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan atau belum dibagikan ke service account. File akan diupload ke root Drive service account.")
+            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
+            metadata = {"name": fname}
+            if parents:
+                metadata["parents"] = parents
+            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name", supportsAllDrives=True).execute()
                 background: #fff;
                 border-radius: 12px;
                 box-shadow: 0 2px 16px rgba(80,140,255,0.10);
