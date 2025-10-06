@@ -1304,7 +1304,8 @@ def dashboard():
         (CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"]),
         (MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"])
     ]
-    if throttle_active and "_dash_cache" in st.session_state:
+    # Always ensure cache populated at least once even if throttle_active
+    if throttle_active and "_dash_cache" in st.session_state and isinstance(st.session_state.get("_dash_cache"), dict):
         loaded = st.session_state["_dash_cache"]
     else:
         loaded: dict[str, pd.DataFrame] = {}
@@ -1378,7 +1379,7 @@ def dashboard():
         except Exception:
             pass
 
-    # --- Styled Summary Cards (top KPIs) (selalu muncul tanpa perlu refresh manual) ---
+    # --- Styled Summary Cards (top KPIs) ---
     total_pending_approvals = sum(c for _, c, _ in approvals) if approvals else 0
     # Surat belum dibahas (status == 'Belum Dibahas')
     surat_belum_dibahas = 0
@@ -1517,11 +1518,16 @@ def dashboard():
 
         # Expandable detailed approvals list (optional)
         with st.expander("Detail Approval per Modul", expanded=False):
-                if approvals:
-                        for label, count, page_key in approvals:
-                                st.write(f"• {label}: {count}")
-                else:
-                        st.write("Tidak ada approval pending.")
+            if approvals:
+                for label, count, page_key in approvals:
+                    st.write(f"• {label}: {count}")
+            else:
+                st.write("Tidak ada approval pending.")
+                # Debug context (sementara) untuk membantu identifikasi bila total 0 padahal seharusnya ada
+                try:
+                    st.caption("Debug: sheets kosong = " + ", ".join([k for k,v in loaded.items() if v.empty]))
+                except Exception:
+                    pass
    
     # 6) Kalender Bersama (upcoming events & mobil booking)
     st.markdown("### 📅 Kalender & Event Mendatang (14 hari)")
