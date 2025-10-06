@@ -878,8 +878,12 @@ def _get_emails_by_role(role: str) -> list[str]:
         if df is None or df.empty:
             return []
         role_mask = df.get('role', pd.Series(dtype=str)).astype(str).str.lower() == str(role).lower()
+        # Interpret kolom active lebih fleksibel: terima 1/"1"/true/yes/y/aktif/active
         if 'active' in df.columns:
-            active_mask = pd.to_numeric(df['active'], errors='coerce').fillna(0).astype(int) == 1
+            active_col = df['active'].astype(str).str.strip().str.lower()
+            truthy_values = {"1", "true", "yes", "y", "aktif", "active"}
+            # Jika kolom numeric (0/1) tetap akan cocok dgn "1"
+            active_mask = active_col.isin(truthy_values)
             role_mask = role_mask & active_mask
         email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
         if not email_col:
