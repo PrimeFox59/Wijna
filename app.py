@@ -37,6 +37,7 @@ CASH_ADVANCE_SHEET_NAME = "cash_advance"
 PMR_SHEET_NAME = "pmr"
 DELEGASI_SHEET_NAME = "delegasi"
 FLEX_SHEET_NAME = "flex"
+MOBIL_SHEET_NAME = "mobil"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -79,6 +80,10 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("flex", "create"): ["finance"],
     ("flex", "finance_review"): ["director"],
     ("flex", "director_approval"): ["finance"],
+    # Mobil events
+    ("mobil", "create"): ["finance"],
+    ("mobil", "update"): ["finance", "director"],
+    ("mobil", "delete"): ["finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -642,6 +647,14 @@ def ensure_core_sheets():
             "created_at", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, FLEX_SHEET_NAME, flex_headers)
+
+        # Mobil Kantor sheet
+        mobil_headers = [
+            "id", "nama_pengguna", "divisi", "tgl_mulai", "tgl_selesai", "tujuan",
+            "kendaraan", "driver", "status", "finance_note",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, MOBIL_SHEET_NAME, mobil_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -3672,8 +3685,346 @@ def delegasi_module():
 
 
 def kalender_pemakaian_mobil_kantor():
-    st.header("🚗 Mobil Kantor")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.header("🚗 Kalender & Booking Mobil Kantor")
+    st.markdown("<div style='color:#2563eb;font-size:1.05rem;margin-bottom:1.0em'>Input/edit/hapus hanya Finance & Superuser. Semua user dapat melihat dan memfilter. Sistem mendeteksi potensi bentrok jadwal per kendaraan.</div>", unsafe_allow_html=True)
+
+    def _mobil_headers():
+        return [
+            "id", "nama_pengguna", "divisi", "tgl_mulai", "tgl_selesai", "tujuan",
+            "kendaraan", "driver", "status", "finance_note",
+            "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _mobil_ws():
+        try:
+            return _get_ws(MOBIL_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), MOBIL_SHEET_NAME, _mobil_headers())
+
+    def _mobil_read_df():
+        ws = _mobil_ws()
+        headers = _mobil_headers()
+        try:
+            records = _cached_get_all_records(MOBIL_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        return ws, df
+
+    def _mobil_has_overlap(kendaraan: str, start_date: date, end_date: date, exclude_id: str | None = None) -> tuple[bool, pd.DataFrame]:
+        """Cek apakah ada booking lain dengan kendaraan sama dan rentang tanggal overlap.
+        - Mengabaikan status Ditolak
+        - exclude_id: id yang diabaikan (saat edit)
+        Return: (True/False, df_conflicts)
+        Overlap rule (inclusive dates): (start1 <= end2) and (end1 >= start2)
+        """
+        try:
+            _, df_all = _mobil_read_df()
+            if df_all.empty:
+                return False, pd.DataFrame()
+            # Normalisasi & filter kendaraan + status
+            dff = df_all.copy()
+            dff = dff[dff['kendaraan'].astype(str).str.lower() == (kendaraan or '').lower()]
+            if dff.empty:
+                return False, pd.DataFrame()
+            dff = dff[~dff['status'].astype(str).str.lower().eq('ditolak')]
+            if exclude_id:
+                dff = dff[dff['id'] != exclude_id]
+            if dff.empty:
+                return False, pd.DataFrame()
+            # Parse tanggal
+            def _parse(d):
+                try:
+                    return datetime.fromisoformat(str(d)).date()
+                except Exception:
+                    return None
+            dff['d_mulai'] = dff['tgl_mulai'].apply(_parse)
+            dff['d_selesai'] = dff['tgl_selesai'].apply(_parse)
+            dff = dff.dropna(subset=['d_mulai','d_selesai'])
+            if dff.empty:
+                return False, pd.DataFrame()
+            mask = (dff['d_mulai'] <= end_date) & (dff['d_selesai'] >= start_date)
+            conflicts = dff[mask]
+            if conflicts.empty:
+                return False, pd.DataFrame()
+            return True, conflicts[['id','nama_pengguna','tgl_mulai','tgl_selesai','kendaraan','status','tujuan']]
+        except Exception:
+            return False, pd.DataFrame()
+
+    def _mobil_append(row: dict):
+        ws = _mobil_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    def _mobil_update_by_id(mid: str, updates: dict):
+        ws = _mobil_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(mid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _mobil_delete(mid: str):
+        ws = _mobil_ws()
+        try:
+            cell = ws.find(mid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for i in range(3):
+            try:
+                ws.delete_rows(row_idx)
+                _invalidate_data_cache()
+                return True
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+        return False
+
+    tab1, tab2, tab3 = st.tabs(["📝 Input/Edit/Hapus (Finance)", "📋 Daftar Booking & Filter", "📅 Rekap Bulanan & Bentrok"])
+
+    # --- Tab 1: Input/Edit/Hapus ---
+    with tab1:
+        st.markdown("### 📝 Input/Edit/Hapus Jadwal Mobil (Finance)")
+        if user.get("role") in ["finance", "superuser"]:
+            with st.form("form_mobil"):
+                nama_pengguna = st.text_input("Nama", value=(user.get("full_name") or user.get("email") or ""))
+                divisi = st.text_input("Divisi")
+                tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+                tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+                tujuan = st.text_input("Tujuan")
+                kendaraan = st.text_input("Kendaraan")
+                driver = st.text_input("Driver")
+                status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
+                finance_note = st.text_area("Catatan")
+                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil")
+                if submitted_btn:
+                    if not (nama_pengguna and kendaraan and tujuan):
+                        st.warning("Nama, Kendaraan, Tujuan wajib diisi.")
+                    elif tgl_selesai < tgl_mulai:
+                        st.warning("Tanggal selesai harus >= tanggal mulai.")
+                    else:
+                        # Overlap prevention
+                        has_conflict, conflicts = _mobil_has_overlap(kendaraan, tgl_mulai, tgl_selesai)
+                        if has_conflict:
+                            st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Periksa daftar berikut dan pilih tanggal lain.")
+                            try:
+                                safe_dataframe(conflicts, index=False)
+                            except Exception:
+                                st.write(conflicts)
+                            try:
+                                audit_log("mobil", "overlap_block", target=kendaraan, details=f"create {tgl_mulai}..{tgl_selesai}")
+                            except Exception:
+                                pass
+                        else:
+                            mid = gen_id("mobil")
+                            row = {
+                                "id": mid,
+                                "nama_pengguna": nama_pengguna,
+                                "divisi": divisi,
+                                "tgl_mulai": tgl_mulai.isoformat(),
+                                "tgl_selesai": tgl_selesai.isoformat(),
+                                "tujuan": tujuan,
+                                "kendaraan": kendaraan,
+                                "driver": driver,
+                                "status": status,
+                                "finance_note": finance_note,
+                                "created_at": now_wib_iso(),
+                                "updated_at": now_wib_iso(),
+                                "submitted_by": (get_current_user() or {}).get("email", ""),
+                            }
+                            _mobil_append(row)
+                            try:
+                                audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("mobil", "create", subject="Booking Mobil Baru", body=f"{kendaraan} {tgl_mulai}..{tgl_selesai} oleh {nama_pengguna}")
+                            except Exception:
+                                pass
+                            st.success("Jadwal mobil berhasil disimpan.")
+            # Edit / Hapus jadwal
+            st.markdown("#### ✏️ Edit / 🗑️ Hapus Jadwal Mobil")
+            _, df_all = _mobil_read_df()
+            if df_all.empty:
+                st.info("Belum ada jadwal mobil.")
+            else:
+                try:
+                    df_all = df_all.sort_values(by='tgl_mulai')
+                except Exception:
+                    pass
+                for _, row in df_all.iterrows():
+                    with st.expander(f"{row['nama_pengguna']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | {row['kendaraan']} | Status: {row['status']}"):
+                        with st.form(f"edit_mobil_{row['id']}"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                nama_pengguna_e = st.text_input("Nama", value=row.get('nama_pengguna',''), key=f"nama_{row['id']}")
+                                divisi_e = st.text_input("Divisi", value=row.get('divisi',''), key=f"div_{row['id']}")
+                                tujuan_e = st.text_input("Tujuan", value=row.get('tujuan',''), key=f"tujuan_{row['id']}")
+                                kendaraan_e = st.text_input("Kendaraan", value=row.get('kendaraan',''), key=f"kend_{row['id']}")
+                            with col2:
+                                driver_e = st.text_input("Driver", value=row.get('driver',''), key=f"drv_{row['id']}")
+                                status_e = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"], index=["Menunggu Approve", "Disetujui", "Ditolak"].index(row.get('status','Menunggu Approve') or "Menunggu Approve"), key=f"status_{row['id']}")
+                                finance_note_e = st.text_area("Catatan", value=row.get('finance_note',''), key=f"note_{row['id']}")
+                            tgl_mulai_e = st.date_input("Tgl Mulai", value=pd.to_datetime(row.get('tgl_mulai')).date() if row.get('tgl_mulai') else date.today(), key=f"mulai_{row['id']}")
+                            tgl_selesai_e = st.date_input("Tgl Selesai", value=pd.to_datetime(row.get('tgl_selesai')).date() if row.get('tgl_selesai') else date.today(), key=f"selesai_{row['id']}")
+                            c_upd, c_del = st.columns(2)
+                            with c_upd:
+                                update_btn = st.form_submit_button("💾 Simpan Perubahan")
+                            with c_del:
+                                del_btn = st.form_submit_button("🗑️ Hapus Jadwal")
+                            if update_btn:
+                                if tgl_selesai_e < tgl_mulai_e:
+                                    st.warning("Tanggal selesai tidak valid.")
+                                else:
+                                    # Overlap check (exclude this id)
+                                    has_conflict, conflicts = _mobil_has_overlap(kendaraan_e, tgl_mulai_e, tgl_selesai_e, exclude_id=row['id'])
+                                    if has_conflict:
+                                        st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Perubahan dibatalkan.")
+                                        try:
+                                            safe_dataframe(conflicts, index=False)
+                                        except Exception:
+                                            st.write(conflicts)
+                                        try:
+                                            audit_log("mobil", "overlap_block", target=row['id'], details=f"update {tgl_mulai_e}..{tgl_selesai_e} {kendaraan_e}")
+                                        except Exception:
+                                            pass
+                                    else:
+                                        changes = {
+                                            "nama_pengguna": nama_pengguna_e,
+                                            "divisi": divisi_e,
+                                            "tgl_mulai": tgl_mulai_e.isoformat(),
+                                            "tgl_selesai": tgl_selesai_e.isoformat(),
+                                            "tujuan": tujuan_e,
+                                            "kendaraan": kendaraan_e,
+                                            "driver": driver_e,
+                                            "status": status_e,
+                                            "finance_note": finance_note_e,
+                                            "updated_at": now_wib_iso(),
+                                        }
+                                        if _mobil_update_by_id(row['id'], changes):
+                                            try:
+                                                audit_log("mobil", "update", target=row['id'], details=f"status={status_e}; kendaraan={kendaraan_e}")
+                                            except Exception:
+                                                pass
+                                            try:
+                                                notify_event("mobil", "update", subject="Update Booking Mobil", body=f"{kendaraan_e} {tgl_mulai_e}..{tgl_selesai_e} status {status_e}")
+                                            except Exception:
+                                                pass
+                                            st.success("Perubahan disimpan.")
+                                            st.rerun()
+                            if del_btn:
+                                if _mobil_delete(row['id']):
+                                    try:
+                                        audit_log("mobil", "delete", target=row['id'], details=f"kendaraan={row.get('kendaraan','')}; tujuan={row.get('tujuan','')}")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        notify_event("mobil", "delete", subject="Hapus Booking Mobil", body=f"{row.get('kendaraan','')} {row.get('tgl_mulai','')}..{row.get('tgl_selesai','')}")
+                                    except Exception:
+                                        pass
+                                    st.success("Jadwal dihapus.")
+                                    st.rerun()
+        else:
+            st.info("Hanya Finance/Superuser yang dapat input atau menghapus jadwal.")
+
+    # --- Tab 2: Daftar Booking & Filter ---
+    with tab2:
+        st.markdown("### 📋 Daftar Booking Mobil & Filter")
+        _, df_all = _mobil_read_df()
+        if df_all.empty:
+            st.info("Belum ada data booking mobil.")
+        else:
+            filter_status = st.selectbox("Filter Status", ["Semua", "Menunggu Approve", "Disetujui", "Ditolak"], key="filter_status_mobil")
+            filter_kendaraan = st.text_input("Filter Kendaraan (opsional)", "", key="filter_kendaraan_mobil")
+            df_view = df_all.copy()
+            if filter_status != "Semua":
+                df_view = df_view[df_view['status'] == filter_status]
+            if filter_kendaraan:
+                df_view = df_view[df_view['kendaraan'].astype(str).str.contains(filter_kendaraan, case=False, na=False)]
+            try:
+                df_view = df_view.sort_values(by=['tgl_mulai','kendaraan'])
+            except Exception:
+                pass
+            safe_dataframe(df_view[["nama_pengguna","divisi","tgl_mulai","tgl_selesai","tujuan","kendaraan","driver","status"]], index=False)
+
+    # --- Tab 3: Rekap Bulanan & Bentrok ---
+    with tab3:
+        st.markdown("### 📅 Rekap Bulanan Mobil Kantor & Cek Bentrok")
+        _, df_all = _mobil_read_df()
+        if df_all.empty:
+            st.info("Belum ada data mobil.")
+        else:
+            this_month = date.today().strftime("%Y-%m")
+            df_month = df_all[df_all['tgl_mulai'].astype(str).str[:7] == this_month] if not df_all.empty else pd.DataFrame()
+            st.write(f"Total booking bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                by_kendaraan = df_month['kendaraan'].value_counts().rename("jumlah_booking")
+                st.write("Top Kendaraan Dipakai:")
+                safe_dataframe(by_kendaraan.to_frame(), index=True)
+            # Overlap detection per kendaraan
+            st.markdown("#### 🚨 Cek Bentrok Jadwal Mobil Kantor")
+            overlaps = []
+            if not df_all.empty:
+                try:
+                    df_sorted = df_all.sort_values(["kendaraan", "tgl_mulai"])
+                except Exception:
+                    df_sorted = df_all.copy()
+                current_vehicle = None
+                prev_end = None
+                for _, r in df_sorted.iterrows():
+                    veh = r.get('kendaraan')
+                    try:
+                        start = datetime.fromisoformat(r['tgl_mulai'] + "T00:00:00")
+                        end = datetime.fromisoformat(r['tgl_selesai'] + "T23:59:59")
+                    except Exception:
+                        continue
+                    if veh != current_vehicle:
+                        current_vehicle = veh
+                        prev_end = None
+                    if prev_end and start <= prev_end:
+                        overlaps.append((veh, r['tgl_mulai'], r['tgl_selesai']))
+                    prev_end = max(prev_end, end) if prev_end else end
+            if overlaps:
+                st.warning(f"Terdapat overlap jadwal untuk kendaraan yang sama: {overlaps}")
+            else:
+                st.success("Tidak ada bentrok jadwal mobil kantor bulan ini.")
 
 
 def calendar_module():
