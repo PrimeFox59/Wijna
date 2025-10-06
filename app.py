@@ -228,13 +228,20 @@ def safe_dataframe(df, *, index=True, height=None, key=None, use_container: bool
       - kwargs lain diteruskan ke st.dataframe.
     """
     try:
+        # Bangun argumen dinamis agar tidak mengirim height=None (menyebabkan StreamlitInvalidHeightError di versi baru)
+        df_args = {}
+        if height is not None:
+            df_args['height'] = height
         if use_container:
-            return st.dataframe(df, width='stretch', height=height, hide_index=not index, key=key, **kwargs)
+            # Versi baru menerima width='stretch'; jika tidak didukung akan ditangkap oleh except TypeError
+            return st.dataframe(df, width='stretch', hide_index=not index, key=key, **df_args, **kwargs)
         else:
-            return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+            return st.dataframe(df, hide_index=not index, key=key, **df_args, **kwargs)
     except TypeError:
         # Versi Streamlit lama belum dukung width argumen baru
-        return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+        if height is not None:
+            return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+        return st.dataframe(df, hide_index=not index, key=key, **kwargs)
 
 def safe_image(image, *, caption=None, clamp=False, channels="RGB", output_format="auto", use_container: bool = True, **kwargs):
     """Wrapper image untuk hindari width=None invalid di versi baru.
