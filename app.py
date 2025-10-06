@@ -2921,7 +2921,7 @@ def main():
         .wijna-nav-btn > button {
             width:100% !important;
             height:10px !important;
-            min-height:42px !important;
+            min-height:10px !important;
             display:flex !important;
             align-items:center !important;
             justify-content:center !important;
