@@ -4698,6 +4698,12 @@ def sop_module():
     user = require_login()
     st.header("📚 Kebijakan & SOP")
 
+    # Access guard: only Director & Superuser may access SOP module.
+    role = str(user.get("role", "")).strip().lower()
+    if role not in {"director", "superuser"}:
+        st.info("Modul SOP hanya dapat diakses oleh Director atau Superuser.")
+        return
+
     # Helpers
     def _sop_headers():
         return [
