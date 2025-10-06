@@ -2917,12 +2917,30 @@ def main():
     st.sidebar.markdown(
         """
         <style>
+        /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
-            width: 100% !important;
-            min-height: 42px !important;
-            font-size: 1.05rem !important;
-            margin-bottom: 6px !important;
-            border-radius: 6px !important;
+            width:100% !important;
+            height:48px !important;
+            min-height:48px !important;
+            display:flex !important;
+            align-items:center !important;
+            justify-content:center !important;
+            font-size:0.95rem !important;
+            font-weight:600 !important;
+            padding:0 10px !important;
+            margin:0 0 6px 0 !important;
+            border-radius:6px !important;
+            line-height:1.1 !important;
+            white-space:normal !important;
+        }
+        .wijna-nav-btn.active-nav > button {
+            background:#2563eb !important;
+            color:#ffffff !important;
+            border:1px solid #1d4ed8 !important;
+            box-shadow:0 0 0 1px rgba(37,99,235,0.35) inset;
+        }
+        .wijna-nav-btn > button:hover {
+            border:1px solid #2563eb !important;
         }
         </style>
         """,
@@ -2935,8 +2953,11 @@ def main():
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
         with col:
-            btn = st.button(label, key=f"nav_{key}", help=key)
-            if btn:
+            active_class = 'active-nav' if st.session_state.get("page") == key else ''
+            st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
+            clicked = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            if clicked:
                 st.session_state["page"] = key
                 st.rerun()
 
