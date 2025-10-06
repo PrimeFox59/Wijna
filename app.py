@@ -2920,17 +2920,17 @@ def main():
         /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
             width:100% !important;
-            height:48px !important;
-            min-height:48px !important;
+            height:42px !important;
+            min-height:42px !important;
             display:flex !important;
             align-items:center !important;
             justify-content:center !important;
             font-size:0.95rem !important;
             font-weight:600 !important;
             padding:0 10px !important;
-            margin:0 0 6px 0 !important;
+            margin:0 0 3px 0 !important;
             border-radius:6px !important;
-            line-height:1.1 !important;
+            line-height:1.0 !important;
             white-space:normal !important;
         }
         .wijna-nav-btn.active-nav > button {
@@ -2942,13 +2942,28 @@ def main():
         .wijna-nav-btn > button:hover {
             border:1px solid #2563eb !important;
         }
+        /* Compact sidebar heading & separator */
+        .sidebar-section-title { 
+            font-size:0.78rem; 
+            font-weight:700; 
+            letter-spacing:0.5px; 
+            color:#475569; 
+            text-transform:uppercase; 
+            margin:4px 0 6px 0 !important;
+        }
+        .sidebar-thin-sep { 
+            height:1px; 
+            background:linear-gradient(90deg,#cbd5e1,#f1f5f9); 
+            margin:6px 0 4px 0; 
+            border-radius:1px;
+        }
         </style>
         """,
         unsafe_allow_html=True
     )
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Navigasi Modul")
+    # Compact separator & heading
+    st.sidebar.markdown('<div class="sidebar-thin-sep"></div><div class="sidebar-section-title">Navigasi Modul</div>', unsafe_allow_html=True)
     nav_cols = st.sidebar.columns(2)
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
