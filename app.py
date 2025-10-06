@@ -2821,6 +2821,201 @@ def _cuti_update_by_id(cid: str, updates: dict):
     _invalidate_data_cache()
 
 
+def cuti_module():
+    """Module UI & logic for Cuti (leave requests) separated from main routing."""
+    user = require_login()
+    st.header("🌴 Pengajuan & Approval Cuti")
+    st.markdown("<div style='color:#2563eb;font-size:1.05rem;margin-bottom:1.0em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
+
+    tab_ajukan, tab_finance, tab_director = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
+
+    # TAB 1: AJUKAN CUTI
+    with tab_ajukan:
+        st.markdown("### 📝 Ajukan Cuti")
+        nama = user.get("full_name") or user.get("email")
+        tgl_mulai = st.date_input("Tanggal Mulai", value=date.today(), key="cuti_tgl_mulai")
+        tgl_selesai = st.date_input("Tanggal Selesai", value=date.today(), key="cuti_tgl_selesai")
+        alasan = st.text_area("Alasan Cuti", key="cuti_alasan")
+        durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
+
+        # Ambil info kuota terakhir pengguna
+        try:
+            _, df_cuti_all = _cuti_read_df()
+        except Exception:
+            df_cuti_all = pd.DataFrame()
+        df_user = df_cuti_all[df_cuti_all.get("nama", pd.Series(dtype=str)).astype(str) == str(nama)] if not df_cuti_all.empty else pd.DataFrame()
+        if not df_user.empty:
+            last = df_user.sort_values(by="tgl_mulai", ascending=False).iloc[0]
+            kuota_tahunan = int(pd.to_numeric(last.get("kuota_tahunan", 12), errors="coerce") or 12)
+            cuti_terpakai = int(pd.to_numeric(last.get("cuti_terpakai", 0), errors="coerce") or 0)
+        else:
+            kuota_tahunan = 12
+            cuti_terpakai = 0
+        sisa_kuota = kuota_tahunan - cuti_terpakai
+        st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
+        st.write(f"Durasi cuti diajukan: {durasi} hari")
+        if durasi > 0 and sisa_kuota < durasi:
+            st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
+        if st.button("Ajukan Cuti", key="btn_ajukan_cuti"):
+            if not alasan or durasi <= 0:
+                st.warning("Lengkapi data dan pastikan tanggal benar.")
+            elif sisa_kuota < durasi:
+                st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
+            else:
+                cid = gen_id("cuti")
+                now = datetime.utcnow().isoformat()
+                try:
+                    _cuti_append({
+                        "id": cid,
+                        "nama": nama,
+                        "tgl_mulai": tgl_mulai.isoformat(),
+                        "tgl_selesai": tgl_selesai.isoformat(),
+                        "durasi": int(durasi),
+                        "kuota_tahunan": int(kuota_tahunan),
+                        "cuti_terpakai": int(cuti_terpakai),
+                        "sisa_kuota": int(sisa_kuota),
+                        "status": "Menunggu Review Finance",
+                        "finance_note": "",
+                        "finance_approved": 0,
+                        "director_note": "",
+                        "director_approved": 0,
+                        "alasan": alasan,
+                        "created_at": now
+                    })
+                except Exception as e:
+                    st.error(f"Gagal menyimpan pengajuan: {e}")
+                else:
+                    st.success("Pengajuan cuti berhasil diajukan.")
+                    try:
+                        audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event(
+                            "cuti", "submit", "[WIJNA] Pengajuan Cuti Baru",
+                            f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}"
+                        )
+                    except Exception:
+                        pass
+                    st.rerun()
+
+    # TAB 2: REVIEW FINANCE
+    with tab_finance:
+        st.markdown("### Review & Approval Finance")
+        if user.get("role") in ["finance", "superuser"]:
+            try:
+                _, df = _cuti_read_df()
+            except Exception:
+                df = pd.DataFrame()
+            if "finance_approved" in df.columns:
+                df["finance_approved"] = pd.to_numeric(df["finance_approved"], errors="coerce").fillna(0).astype(int)
+            pending = df[df.get("finance_approved", 0) == 0] if not df.empty else pd.DataFrame()
+            if pending.empty:
+                st.info("Tidak ada pengajuan menunggu review.")
+            for _, row in pending.sort_values(by="tgl_mulai", ascending=False).iterrows():
+                with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
+                    st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
+                    st.write(f"Alasan: {row.get('alasan', '')}")
+                    note = st.text_area("Catatan Finance", value=row.get("finance_note") or "", key=f"fin_note_{row.get('id')}")
+                    approve = st.checkbox("Approve", value=bool(int(row.get("finance_approved", 0))), key=f"fin_appr_{row.get('id')}")
+                    if st.button("Simpan Review", key=f"fin_save_{row.get('id')}"):
+                        status = "Menunggu Approval Director" if approve else "Ditolak Finance"
+                        try:
+                            _cuti_update_by_id(row.get('id'), {
+                                "finance_note": note,
+                                "finance_approved": int(bool(approve)),
+                                "status": status
+                            })
+                            st.success("Review Finance disimpan.")
+                            try:
+                                audit_log("cuti", "finance_review", target=row.get('id'), details=f"approve={bool(approve)}; status={status}")
+                            except Exception:
+                                pass
+                            if approve:
+                                try:
+                                    notify_event(
+                                        "cuti", "finance_review", "[WIJNA] Cuti Menunggu Approval Director",
+                                        f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari"
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            st.error(f"Gagal menyimpan: {e}")
+                        st.rerun()
+        else:
+            st.info("Hanya Finance/Superuser yang dapat review di sini.")
+
+    # TAB 3: APPROVAL DIRECTOR & REKAP
+    with tab_director:
+        st.markdown("### Approval Director & Rekap Cuti")
+        if user.get("role") in ["director", "superuser"]:
+            try:
+                _, df = _cuti_read_df()
+            except Exception:
+                df = pd.DataFrame()
+            if not df.empty:
+                df["finance_approved"] = pd.to_numeric(df.get("finance_approved", 0), errors="coerce").fillna(0).astype(int)
+                df["director_approved"] = pd.to_numeric(df.get("director_approved", 0), errors="coerce").fillna(0).astype(int)
+                for _, row in df[df["finance_approved"] == 1].sort_values(by="tgl_mulai", ascending=False).iterrows():
+                    with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
+                        st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
+                        st.write(f"Alasan: {row.get('alasan', '')}")
+                        note = st.text_area("Catatan Director", value=row.get("director_note") or "", key=f"dir_note_{row.get('id')}")
+                        approve = st.checkbox("Approve", value=bool(int(row.get("director_approved", 0))), key=f"dir_appr_{row.get('id')}")
+                        if st.button("Simpan Approval", key=f"dir_save_{row.get('id')}"):
+                            try:
+                                if approve:
+                                    dur = int(pd.to_numeric(row.get("durasi", 0), errors="coerce") or 0)
+                                    terpakai = int(pd.to_numeric(row.get("cuti_terpakai", 0), errors="coerce") or 0)
+                                    kuota = int(pd.to_numeric(row.get("kuota_tahunan", 12), errors="coerce") or 12)
+                                    baru_terpakai = terpakai + dur
+                                    sisa = kuota - baru_terpakai
+                                    _cuti_update_by_id(row.get('id'), {
+                                        "director_note": note,
+                                        "director_approved": 1,
+                                        "status": "Disetujui Director",
+                                        "cuti_terpakai": baru_terpakai,
+                                        "sisa_kuota": sisa
+                                    })
+                                else:
+                                    _cuti_update_by_id(row.get('id'), {
+                                        "director_note": note,
+                                        "director_approved": 0,
+                                        "status": "Ditolak Director"
+                                    })
+                                st.success("Approval Director disimpan.")
+                                try:
+                                    audit_log("cuti", "director_approval", target=row.get('id'), details=f"approve={bool(approve)}")
+                                except Exception:
+                                    pass
+                                try:
+                                    if 'submitted_by' in row.index:
+                                        sb = str(row.get('submitted_by',''))
+                                        if sb:
+                                            send_notification_email(
+                                                sb,
+                                                f"[WIJNA] Pengajuan Cuti {'Disetujui' if approve else 'Ditolak'}",
+                                                f"Pengajuan cuti Anda {'disetujui' if approve else 'ditolak'} oleh Director."
+                                            )
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+                            st.rerun()
+            else:
+                st.info("Belum ada data cuti.")
+        # Rekap semua pengajuan
+        st.markdown("#### Rekap Pengajuan Cuti")
+        try:
+            _, df_all = _cuti_read_df()
+            if not df_all.empty:
+                st.dataframe(df_all.sort_values(by="tgl_mulai", ascending=False), use_container_width=True, hide_index=True)
+            else:
+                st.info("Belum ada pengajuan.")
+        except Exception as e:
+            st.error(f"Gagal memuat data cuti: {e}")
+
+
 def main():
     ensure_core_sheets()
     # --- Sidebar Logo ---
@@ -2913,80 +3108,75 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS navigasi sidebar profesional & konsisten
+    # CSS agar tombol navigasi seragam dan rapi
     st.sidebar.markdown(
         """
         <style>
-        .sidebar-section-title {font-size:10px;font-weight:700;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:4px 4px 6px 4px;}
-        .sidebar-nav-wrapper {margin:0 0 6px 0; max-height:calc(100vh - 340px); overflow-y:auto; padding-right:4px;}
-        .sidebar-nav-wrapper::-webkit-scrollbar {width:6px;}
-        .sidebar-nav-wrapper::-webkit-scrollbar-track {background:transparent;}
-        .sidebar-nav-wrapper::-webkit-scrollbar-thumb {background:#d3dce4;border-radius:3px;}
-        .sidebar-nav-wrapper::-webkit-scrollbar-thumb:hover {background:#94a3b8;}
-        .wijna-nav-btn {margin:0 0 4px 0;}
+        /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
             width:100% !important;
-            height:38px !important;
-            padding:0 14px !important;
-            border-radius:9px !important;
-            font-size:0.9rem !important;
-            font-weight:600 !important;
+            height:34px !important;
+            min-height:34px !important;
             display:flex !important;
             align-items:center !important;
-            justify-content:flex-start !important;
-            gap:10px !important;
-            background:linear-gradient(180deg,#ffffff,#f8fafc) !important;
-            border:1px solid #d9e2ec !important;
-            color:#1e293b !important;
-            box-shadow:0 1px 2px rgba(0,0,0,0.04) !important;
-            transition:all .18s ease !important;
-            letter-spacing:.25px;
+            justify-content:center !important;
+            font-size:0.88rem !important;
+            font-weight:600 !important;
+            padding:0 8px !important;
+            margin:0 0 1px 0 !important;
+            border-radius:5px !important;
+            line-height:1.0 !important;
+            white-space:nowrap !important;
         }
-        .wijna-nav-btn > button:hover {background:#eef3f8 !important; border-color:#b8c5d3 !important;}
-        .wijna-nav-btn.active-nav > button {background:linear-gradient(90deg,#2563eb,#1d4ed8) !important; color:#fff !important; border:1px solid #1d4ed8 !important; box-shadow:0 2px 6px -1px rgba(29,78,216,0.45),0 1px 3px rgba(0,0,0,0.08) !important;}
-        .wijna-nav-btn.active-nav > button:hover {background:linear-gradient(90deg,#1d4ed8,#1e40af) !important; border-color:#1e40af !important;}
-        .wijna-nav-btn > button:focus-visible {outline:2px solid #2563eb !important; outline-offset:2px !important;}
-        .wijna-icon {font-size:1.1rem; width:22px; text-align:center; opacity:.92;}
-        .wijna-nav-btn.active-nav .wijna-icon {opacity:1;}
-        .logout-btn > button {width:100% !important; height:40px !important; display:flex !important; align-items:center !important; justify-content:center !important; gap:8px !important; font-weight:600 !important; border-radius:9px !important; background:linear-gradient(180deg,#ffffff,#faf5f5) !important; border:1px solid #f1d6d6 !important; color:#b91c1c !important; transition:all .18s ease !important;}
-        .logout-btn > button:hover {background:#ffe5e5 !important; border-color:#f87171 !important;}
-        .logout-btn > button:active {background:#fecaca !important;}
-        .logout-btn > button:focus-visible {outline:2px solid #dc2626 !important;}
+        .wijna-nav-btn.active-nav > button {
+            background:#2563eb !important;
+            color:#ffffff !important;
+            border:1px solid #1d4ed8 !important;
+            box-shadow:0 0 0 1px rgba(37,99,235,0.35) inset;
+        }
+        .wijna-nav-btn > button:hover {
+            border:1px solid #2563eb !important;
+        }
+        /* Compact sidebar heading & separator */
+        .sidebar-section-title { 
+            font-size:0.78rem; 
+            font-weight:700; 
+            letter-spacing:0.5px; 
+            color:#475569; 
+            text-transform:uppercase; 
+            margin:4px 0 6px 0 !important;
+        }
+        .sidebar-thin-sep { 
+            height:1px; 
+            background:linear-gradient(90deg,#cbd5e1,#f1f5f9); 
+            margin:6px 0 4px 0; 
+            border-radius:1px;
+        }
         </style>
         """,
         unsafe_allow_html=True
     )
 
-    # Section title & daftar menu
-    st.sidebar.markdown('<div class="sidebar-section-title">Navigasi</div>', unsafe_allow_html=True)
-    st.sidebar.markdown('<div class="sidebar-nav-wrapper">', unsafe_allow_html=True)
-    for key, label in menu:
-        active_class = 'active-nav' if st.session_state.get("page") == key else ''
-        icon_part = ''
-        text_part = label
-        if ' ' in label:
-            first_token = label.split(' ')[0]
-            if len(first_token) <= 3:  # heuristik emoji
-                icon_part = first_token
-                text_part = label[len(first_token):].strip()
-        st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
-        btn_label = f"{icon_part}  {text_part}" if icon_part else text_part
-        clicked = st.button(btn_label, key=f"nav_{key}", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-        if clicked:
-            st.session_state["page"] = key
-            st.rerun()
-    st.sidebar.markdown('</div>', unsafe_allow_html=True)
+    # Compact separator & heading
+    st.sidebar.markdown('<div class="sidebar-thin-sep"></div><div class="sidebar-section-title">Navigasi Modul</div>', unsafe_allow_html=True)
+    nav_cols = st.sidebar.columns(2)
+    for idx, (key, label) in enumerate(menu):
+        col = nav_cols[idx % 2]
+        with col:
+            active_class = 'active-nav' if st.session_state.get("page") == key else ''
+            st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
+            clicked = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            if clicked:
+                st.session_state["page"] = key
+                st.rerun()
 
-    # --- Logout button (seragam style) ---
+    # --- Logout button at the very bottom ---
     if user:
-        st.sidebar.markdown('<div style="margin-top:8px;">', unsafe_allow_html=True)
-        st.sidebar.markdown('<div class="logout-btn">', unsafe_allow_html=True)
-        if st.button("🚪 Logout", key="sidebar_logout", use_container_width=True):
+        st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
+    if st.sidebar.button("Logout", key="sidebar_logout"): 
             logout()
             st.rerun()
-        st.sidebar.markdown('</div>', unsafe_allow_html=True)
-        st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     choice = st.session_state["page"]
 
@@ -3007,169 +3197,7 @@ def main():
     elif choice == "Cash Advance":
         cash_advance_module()
     elif choice == "Cuti":
-            user = require_login()
-            st.header("🌴 Pengajuan & Approval Cuti")
-            st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
-            tab1, tab2, tab3 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
-            # Tab 1: Ajukan Cuti
-            with tab1:
-                st.markdown("### 📝 Ajukan Cuti")
-                nama = user.get("full_name") or user.get("email")
-                tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
-                tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
-                alasan = st.text_area("Alasan Cuti")
-                durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
-                # Ambil info kuota terakhir pengguna
-                _, df_cuti_all = _cuti_read_df()
-                df_user = df_cuti_all[df_cuti_all.get("nama", pd.Series()).astype(str) == str(nama)]
-                if not df_user.empty:
-                    last = df_user.sort_values(by="tgl_mulai", ascending=False).iloc[0]
-                    kuota_tahunan = int(last.get("kuota_tahunan", 12)) if str(last.get("kuota_tahunan", "")).strip() else 12
-                    cuti_terpakai = int(last.get("cuti_terpakai", 0)) if str(last.get("cuti_terpakai", "")).strip() else 0
-                else:
-                    kuota_tahunan = 12
-                    cuti_terpakai = 0
-                sisa_kuota = kuota_tahunan - cuti_terpakai
-                st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
-                st.write(f"Durasi cuti diajukan: {durasi} hari")
-                if durasi > 0 and sisa_kuota < durasi:
-                    st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
-                if st.button("Ajukan Cuti"):
-                    if not alasan or durasi <= 0:
-                        st.warning("Lengkapi data dan pastikan tanggal benar.")
-                    elif sisa_kuota < durasi:
-                        st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
-                    else:
-                        cid = gen_id("cuti")
-                        now = datetime.utcnow().isoformat()
-                        _cuti_append({
-                            "id": cid,
-                            "nama": nama,
-                            "tgl_mulai": tgl_mulai.isoformat(),
-                            "tgl_selesai": tgl_selesai.isoformat(),
-                            "durasi": int(durasi),
-                            "kuota_tahunan": int(kuota_tahunan),
-                            "cuti_terpakai": int(cuti_terpakai),
-                            "sisa_kuota": int(sisa_kuota),
-                            "status": "Menunggu Review Finance",
-                            "finance_note": "",
-                            "finance_approved": 0,
-                            "director_note": "",
-                            "director_approved": 0,
-                            "alasan": alasan,
-                            "created_at": now
-                        })
-                        st.success("Pengajuan cuti berhasil diajukan.")
-                        try:
-                            audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
-                        except Exception:
-                            pass
-                        # Notifikasi ke Finance + Superuser untuk review
-                        try:
-                            notify_event("cuti", "submit", "[WIJNA] Pengajuan Cuti Baru",
-                                         f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}")
-                        except Exception:
-                            pass
-                        st.rerun()
-            # Tab 2: Review Finance
-            with tab2:
-                st.markdown("### Review & Approval Finance")
-                if user.get("role") in ["finance", "superuser"]:
-                    _, df = _cuti_read_df()
-                    # Normalize types
-                    if "finance_approved" in df.columns:
-                        df["finance_approved"] = pd.to_numeric(df["finance_approved"], errors="coerce").fillna(0).astype(int)
-                    pending = df[df.get("finance_approved", 0) == 0]
-                    for idx, row in pending.sort_values(by="tgl_mulai", ascending=False).iterrows():
-                        with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
-                            st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
-                            st.write(f"Alasan: {row.get('alasan', '')}")
-                            note = st.text_area("Catatan Finance", value=row.get("finance_note") or "", key=f"fin_note_{row.get('id')}")
-                            approve = st.checkbox("Approve", value=bool(int(row.get("finance_approved", 0))), key=f"fin_appr_{row.get('id')}")
-                            if st.button("Simpan Review", key=f"fin_save_{row.get('id')}"):
-                                status = "Menunggu Approval Director" if approve else "Ditolak Finance"
-                                try:
-                                    _cuti_update_by_id(row.get('id'), {
-                                        "finance_note": note,
-                                        "finance_approved": int(bool(approve)),
-                                        "status": status
-                                    })
-                                    st.success("Review Finance disimpan.")
-                                    try:
-                                        audit_log("cuti", "finance_review", target=row.get('id'), details=f"approve={bool(approve)}; status={status}")
-                                    except Exception:
-                                        pass
-                                    # Jika approve, beritahu Director + Superuser
-                                        if approve:
-                                            try:
-                                                notify_event("cuti", "finance_review", "[WIJNA] Cuti Menunggu Approval Director",
-                                                             f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari")
-                                            except Exception:
-                                                pass
-                                except Exception as e:
-                                    st.error(f"Gagal menyimpan: {e}")
-                                st.rerun()
-                else:
-                    st.info("Hanya Finance/Superuser yang dapat review di sini.")
-            # Tab 3: Approval Director & Rekap
-            with tab3:
-                st.markdown("### Approval Director & Rekap Cuti")
-                if user.get("role") in ["director", "superuser"]:
-                    _, df = _cuti_read_df()
-                    df["finance_approved"] = pd.to_numeric(df.get("finance_approved", 0), errors="coerce").fillna(0).astype(int)
-                    df["director_approved"] = pd.to_numeric(df.get("director_approved", 0), errors="coerce").fillna(0).astype(int)
-                    for idx, row in df[df["finance_approved"] == 1].sort_values(by="tgl_mulai", ascending=False).iterrows():
-                        with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
-                            st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
-                            st.write(f"Alasan: {row.get('alasan', '')}")
-                            note = st.text_area("Catatan Director", value=row.get("director_note") or "", key=f"dir_note_{row.get('id')}")
-                            approve = st.checkbox("Approve", value=bool(int(row.get("director_approved", 0))), key=f"dir_appr_{row.get('id')}")
-                            if st.button("Simpan Approval", key=f"dir_save_{row.get('id')}"):
-                                try:
-                                    if approve:
-                                        dur = int(pd.to_numeric(row.get("durasi", 0), errors="coerce") or 0)
-                                        terpakai = int(pd.to_numeric(row.get("cuti_terpakai", 0), errors="coerce") or 0)
-                                        kuota = int(pd.to_numeric(row.get("kuota_tahunan", 12), errors="coerce") or 12)
-                                        baru_terpakai = terpakai + dur
-                                        sisa = kuota - baru_terpakai
-                                        _cuti_update_by_id(row.get('id'), {
-                                            "director_note": note,
-                                            "director_approved": 1,
-                                            "status": "Disetujui Director",
-                                            "cuti_terpakai": baru_terpakai,
-                                            "sisa_kuota": sisa
-                                        })
-                                    else:
-                                        _cuti_update_by_id(row.get('id'), {
-                                            "director_note": note,
-                                            "director_approved": 0,
-                                            "status": "Ditolak Director"
-                                        })
-                                    st.success("Approval Director disimpan.")
-                                    try:
-                                        audit_log("cuti", "director_approval", target=row.get('id'), details=f"approve={bool(approve)}")
-                                    except Exception:
-                                        pass
-                                    # Notifikasi ke pemohon terkait keputusan Director (jika ada kolom submitted_by gunakan itu)
-                                    try:
-                                        # Gunakan 'submitted_by' jika ada, fallback skip
-                                        if 'submitted_by' in row.index:
-                                            sb = str(row.get('submitted_by',''))
-                                            if sb:
-                                                send_notification_email(sb, f"[WIJNA] Pengajuan Cuti {'Disetujui' if approve else 'Ditolak'}",
-                                                                        f"Pengajuan cuti Anda {'disetujui' if approve else 'ditolak'} oleh Director.")
-                                    except Exception:
-                                        pass
-                                except Exception as e:
-                                    st.error(f"Gagal menyimpan: {e}")
-                                st.rerun()
-                # Rekap semua pengajuan cuti
-                st.markdown("#### Rekap Pengajuan Cuti")
-                try:
-                    _, df_all = _cuti_read_df()
-                    st.dataframe(df_all.sort_values(by="tgl_mulai", ascending=False), use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(f"Gagal memuat data cuti: {e}")
+        cuti_module()
     elif choice == "PMR":
         pmr_module()
     elif choice == "Flex Time":
