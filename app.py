@@ -38,6 +38,8 @@ PMR_SHEET_NAME = "pmr"
 DELEGASI_SHEET_NAME = "delegasi"
 FLEX_SHEET_NAME = "flex"
 MOBIL_SHEET_NAME = "mobil"
+CALENDAR_SHEET_NAME = "calendar"
+PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -84,6 +86,8 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("mobil", "create"): ["finance"],
     ("mobil", "update"): ["finance", "director"],
     ("mobil", "delete"): ["finance"],
+    # Calendar events
+    ("calendar", "add_holiday"): ["director"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -655,6 +659,20 @@ def ensure_core_sheets():
             "created_at", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, MOBIL_SHEET_NAME, mobil_headers)
+
+        # Calendar (generic events) sheet
+        calendar_headers = [
+            "id", "jenis", "judul", "nama_divisi", "tgl_mulai", "tgl_selesai",
+            "deskripsi", "file_id", "file_name", "file_link",
+            "is_holiday", "sumber", "ditetapkan_oleh", "tanggal_penetapan", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, CALENDAR_SHEET_NAME, calendar_headers)
+
+        # Public holidays (normalized) sheet
+        public_holidays_headers = [
+            "tahun", "tanggal", "nama", "keterangan", "ditetapkan_oleh", "tanggal_penetapan"
+        ]
+        ensure_sheet_with_headers(spreadsheet, PUBLIC_HOLIDAYS_SHEET_NAME, public_holidays_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -4028,8 +4046,304 @@ def kalender_pemakaian_mobil_kantor():
 
 
 def calendar_module():
-    st.header("📅 Kalender Bersama")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.header("📅 Kalender Bersama (Auto Integrasi)")
+
+    # Helpers for calendar & public holidays
+    def _cal_headers():
+        return [
+            "id", "jenis", "judul", "nama_divisi", "tgl_mulai", "tgl_selesai",
+            "deskripsi", "file_id", "file_name", "file_link",
+            "is_holiday", "sumber", "ditetapkan_oleh", "tanggal_penetapan", "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _cal_ws():
+        try:
+            return _get_ws(CALENDAR_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), CALENDAR_SHEET_NAME, _cal_headers())
+
+    def _cal_read_df():
+        ws = _cal_ws()
+        headers = _cal_headers()
+        try:
+            records = _cached_get_all_records(CALENDAR_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        # Normalisasi flag
+        df['is_holiday'] = pd.to_numeric(df.get('is_holiday'), errors='coerce').fillna(0).astype(int)
+        return ws, df
+
+    def _cal_append(row: dict):
+        ws = _cal_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    def _pub_ws():
+        try:
+            return _get_ws(PUBLIC_HOLIDAYS_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), PUBLIC_HOLIDAYS_SHEET_NAME, ["tahun","tanggal","nama","keterangan","ditetapkan_oleh","tanggal_penetapan"])
+
+    def _pub_append(row: dict):
+        ws = _pub_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    tab1, tab2 = st.tabs(["➕ Tambah Libur Nasional", "📆 Kalender & Rekap"])
+
+    # Tab 1: Tambah Libur Nasional
+    with tab1:
+        st.subheader("Tambah Libur Nasional (Director)")
+        if user.get("role") in ["director", "superuser"]:
+            with st.form("add_libur_nasional"):
+                judul = st.text_input("Judul Libur Nasional")
+                tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+                tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+                sumber = st.text_input("Sumber / Dasar Penetapan (opsional)")
+                submit_libur = st.form_submit_button("Tambah Libur Nasional")
+                if submit_libur:
+                    if not judul:
+                        st.warning("Judul wajib diisi.")
+                    elif tgl_selesai < tgl_mulai:
+                        st.warning("Tanggal selesai harus >= tanggal mulai.")
+                    else:
+                        cid = gen_id("cal")
+                        now_iso = now_wib_iso()
+                        row = {
+                            "id": cid,
+                            "jenis": "Libur Nasional",
+                            "judul": judul,
+                            "nama_divisi": "-",
+                            "tgl_mulai": tgl_mulai.isoformat(),
+                            "tgl_selesai": tgl_selesai.isoformat(),
+                            "deskripsi": sumber,
+                            "file_id": "",
+                            "file_name": "",
+                            "file_link": "",
+                            "is_holiday": 1,
+                            "sumber": sumber,
+                            "ditetapkan_oleh": (get_current_user() or {}).get("full_name") or (get_current_user() or {}).get("email"),
+                            "tanggal_penetapan": now_iso,
+                            "created_at": now_iso,
+                            "updated_at": now_iso,
+                            "submitted_by": (get_current_user() or {}).get("email", ""),
+                        }
+                        _cal_append(row)
+                        # Normalized public holiday row (ambil hanya tanggal mulai sebagai representative)
+                        pub = {
+                            "tahun": tgl_mulai.year,
+                            "tanggal": tgl_mulai.isoformat(),
+                            "nama": judul,
+                            "keterangan": sumber or "",
+                            "ditetapkan_oleh": row["ditetapkan_oleh"],
+                            "tanggal_penetapan": now_iso,
+                        }
+                        _pub_append(pub)
+                        try:
+                            audit_log("calendar", "add_holiday", target=cid, details=f"{judul} {tgl_mulai}..{tgl_selesai}")
+                        except Exception:
+                            pass
+                        try:
+                            notify_event("calendar", "add_holiday", subject="Tambah Libur Nasional", body=f"{judul} {tgl_mulai}..{tgl_selesai}")
+                        except Exception:
+                            pass
+                        st.success("Libur Nasional ditambahkan.")
+        else:
+            st.info("Hanya Director yang bisa menambah Libur Nasional.")
+
+    # Tab 2: Kalender Gabungan & Rekap
+    with tab2:
+        # Ambil data modul lain dari Sheets
+        # Cuti (disetujui director)
+        try:
+            _, df_cuti = _cuti_read_df()  # assumes _cuti_read_df returns (ws, df) or df? existing impl returns ws? We adapt
+        except Exception:
+            df_cuti = pd.DataFrame()
+        if isinstance(df_cuti, tuple):  # safety if signature differs
+            df_cuti = df_cuti[1]
+        if df_cuti is None:
+            df_cuti = pd.DataFrame()
+        if not df_cuti.empty:
+            try:
+                df_cuti = df_cuti[pd.to_numeric(df_cuti.get('director_approved'), errors='coerce').fillna(0).astype(int) == 1][['nama','tgl_mulai','tgl_selesai']].rename(columns={'nama':'judul'})
+                df_cuti['jenis'] = 'Cuti'
+                df_cuti['nama_divisi'] = df_cuti['judul']
+            except Exception:
+                df_cuti = pd.DataFrame()
+
+        # Flex (approved director)
+        try:
+            _, df_flex_raw = _get_ws(FLEX_SHEET_NAME), None  # placeholder to avoid lint
+        except Exception:
+            pass
+        try:
+            ws_flex = _get_ws(FLEX_SHEET_NAME)
+            flex_records = _cached_get_all_records(FLEX_SHEET_NAME, [])
+            df_flex = pd.DataFrame(flex_records)
+        except Exception:
+            df_flex = pd.DataFrame()
+        if not df_flex.empty:
+            try:
+                df_flex = df_flex[pd.to_numeric(df_flex.get('approval_director'), errors='coerce').fillna(0).astype(int) == 1][['nama','tanggal']]
+                df_flex = df_flex.rename(columns={'nama':'judul','tanggal':'tgl_mulai'})
+                df_flex['tgl_selesai'] = df_flex['tgl_mulai']
+                df_flex['jenis'] = 'Flex Time'
+                df_flex['nama_divisi'] = df_flex['judul']
+            except Exception:
+                df_flex = pd.DataFrame()
+
+        # Delegasi (semua tugas)
+        try:
+            ws_del = _get_ws(DELEGASI_SHEET_NAME)
+            del_records = _cached_get_all_records(DELEGASI_SHEET_NAME, [])
+            df_delegasi = pd.DataFrame(del_records)
+        except Exception:
+            df_delegasi = pd.DataFrame()
+        if not df_delegasi.empty:
+            try:
+                df_delegasi = df_delegasi[['judul','pic','tgl_mulai','tgl_selesai']]
+                df_delegasi = df_delegasi.rename(columns={'pic':'nama_divisi'})
+                df_delegasi['jenis'] = 'Delegasi'
+            except Exception:
+                df_delegasi = pd.DataFrame()
+
+        # Mobil (status Disetujui)
+        try:
+            ws_mobil = _get_ws(MOBIL_SHEET_NAME)
+            mobil_records = _cached_get_all_records(MOBIL_SHEET_NAME, [])
+            df_mobil = pd.DataFrame(mobil_records)
+        except Exception:
+            df_mobil = pd.DataFrame()
+        if not df_mobil.empty:
+            try:
+                df_mobil = df_mobil[df_mobil['status'].astype(str).str.lower() == 'disetujui']
+                df_mobil = df_mobil[['tujuan','kendaraan','tgl_mulai','tgl_selesai','kendaraan']].rename(columns={'tujuan':'judul','kendaraan':'nama_divisi'})
+                df_mobil['jenis'] = 'Mobil Kantor'
+            except Exception:
+                df_mobil = pd.DataFrame()
+
+        # Libur (is_holiday=1)
+        try:
+            _, df_cal_all = _cal_read_df()
+            df_libur = df_cal_all[pd.to_numeric(df_cal_all.get('is_holiday'), errors='coerce').fillna(0).astype(int) == 1][['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai']]
+        except Exception:
+            df_libur = pd.DataFrame()
+
+        # Gabung
+        frames = [df for df in [df_cuti, df_flex, df_delegasi, df_mobil.drop(columns=['nama_divisi'], errors='ignore') if not df_mobil.empty else df_mobil, df_libur] if isinstance(df, pd.DataFrame) and not df.empty]
+        # Perhatikan df_mobil: sudah rename kendaraan->nama_divisi; kita tidak ingin drop kolom yang ada.
+        if not df_mobil.empty:
+            # df_mobil saat ini punya kolom nama_divisi dan mungkin kolom 'kendaraan' kedua (rename conflict); normalisasi:
+            if 'kendaraan' in df_mobil.columns and 'nama_divisi' in df_mobil.columns:
+                df_mobil = df_mobil.drop(columns=['kendaraan'], errors='ignore')
+        frames = [df_cuti, df_flex, df_delegasi, df_mobil, df_libur]
+        frames = [f for f in frames if f is not None and not f.empty]
+        if frames:
+            df_all = pd.concat(frames, ignore_index=True)
+        else:
+            df_all = pd.DataFrame(columns=['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai'])
+
+        # Overlap kendaraan (mobil) tambahan per referensi
+        if 'Mobil Kantor' in (df_all['jenis'].unique().tolist() if not df_all.empty else []):
+            try:
+                df_mobil_for_overlap = df_all[df_all['jenis']=='Mobil Kantor'].copy()
+                df_mobil_for_overlap['kendaraan'] = df_mobil_for_overlap['nama_divisi']
+                df_mobil_sorted = df_mobil_for_overlap.sort_values(['kendaraan','tgl_mulai'])
+                overlaps = []
+                prev_end_by_car = {}
+                for _, r in df_mobil_sorted.iterrows():
+                    veh = r.get('kendaraan')
+                    try:
+                        start = pd.to_datetime(r['tgl_mulai'])
+                        end = pd.to_datetime(r['tgl_selesai'])
+                    except Exception:
+                        continue
+                    if veh in prev_end_by_car and start <= prev_end_by_car[veh]:
+                        overlaps.append((veh, r['tgl_mulai'], r['tgl_selesai']))
+                    prev_end_by_car[veh] = max(prev_end_by_car[veh], end) if veh in prev_end_by_car else end
+                if overlaps:
+                    st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
+            except Exception:
+                pass
+
+        st.subheader("🔎 Filter Kalender")
+        if not df_all.empty:
+            dff = df_all.copy()
+            dff['tgl_mulai_dt'] = pd.to_datetime(dff['tgl_mulai'], errors='coerce')
+            dff['tgl_selesai_dt'] = pd.to_datetime(dff['tgl_selesai'], errors='coerce')
+            min_date = dff['tgl_mulai_dt'].min()
+            max_date = dff['tgl_selesai_dt'].max()
+            today = date.today()
+            month_start = today.replace(day=1)
+            next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            month_end = next_month - timedelta(days=1)
+            default_start = month_start if pd.notna(min_date) else today
+            default_end = month_end if pd.notna(max_date) else today
+            col_a, col_b = st.columns([2,2])
+            with col_a:
+                jenis_opts = sorted([x for x in dff['jenis'].dropna().unique().tolist()])
+                jenis_selected = st.multiselect("Jenis Event", jenis_opts, default=jenis_opts)
+            with col_b:
+                date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end))
+            col_c, col_d = st.columns([2,2])
+            with col_c:
+                filter_div = st.text_input("Filter Divisi (nama_divisi)", "")
+            with col_d:
+                filter_judul = st.text_input("Cari Judul", "")
+            # Apply filters
+            if jenis_selected:
+                dff = dff[dff['jenis'].isin(jenis_selected)]
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                start_d, end_d = date_range
+                if start_d and end_d:
+                    dff = dff[(dff['tgl_mulai_dt'] <= pd.to_datetime(end_d)) & (dff['tgl_selesai_dt'] >= pd.to_datetime(start_d))]
+            if filter_div:
+                dff = dff[dff['nama_divisi'].astype(str).str.contains(filter_div, case=False, na=False)]
+            if filter_judul:
+                dff = dff[dff['judul'].astype(str).str.contains(filter_judul, case=False, na=False)]
+            st.subheader("📆 Tampilkan Kalender (Gabungan) — Hasil Filter")
+            if not dff.empty:
+                dff = dff.sort_values('tgl_mulai')
+                show_cols = [c for c in ['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai'] if c in dff.columns]
+                safe_dataframe(dff[show_cols], index=False)
+                csv_bytes = dff[show_cols].to_csv(index=False).encode('utf-8')
+                st.download_button("⬇️ Download CSV (Hasil Filter)", data=csv_bytes, file_name=f"kalender_gabungan_filtered_{today.isoformat()}.csv", mime="text/csv")
+            else:
+                st.info("Tidak ada event sesuai filter.")
+            st.markdown("#### 📅 Rekap Bulanan Kalender (Otomatis) — Berdasar Filter")
+            this_month = date.today().strftime("%Y-%m")
+            df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
+            st.write(f"Total event bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                by_jenis = df_month['jenis'].value_counts()
+                safe_dataframe(by_jenis.to_frame(name='jumlah'), index=True)
+        else:
+            st.info("Belum ada event pada kalender.")
 
 
 def sop_module():
