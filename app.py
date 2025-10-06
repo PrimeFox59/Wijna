@@ -2913,29 +2913,31 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS baru: ukuran tombol seragam single-column penuh
+    # CSS baru: ukuran tombol seragam (single column full width) dengan tinggi konsisten
     st.sidebar.markdown(
         """
         <style>
-        #wijna-nav-area button {
+        #wijna-nav-area button, #wijna-logout-area button {
             width: 100% !important;
-            height: 50px !important;
-            min-height: 50px !important;
-            padding: 4px 8px !important;
-            margin-bottom: 6px !important;
-            font-size: 0.95rem !important;
+            height: 52px !important;
+            min-height: 52px !important;
+            padding: 6px 12px !important;
+            margin-bottom: 8px !important;
+            font-size: 0.96rem !important;
             font-weight: 600 !important;
-            border-radius: 8px !important;
+            border-radius: 10px !important;
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
-            line-height: 1.1 !important;
+            line-height: 1.15 !important;
             white-space: normal !important;
             text-align: center !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
         }
-        #wijna-nav-area button:hover {outline: 2px solid rgba(59,130,246,0.35) !important;}
-        #wijna-nav-area [data-testid="column"] {padding-right:4px !important; padding-left:4px !important;}
+        #wijna-nav-area button:hover, #wijna-logout-area button:hover {outline: 2px solid rgba(59,130,246,0.35) !important;}
         #wijna-nav-area {margin-top:0.25rem;}
+        #wijna-logout-area {margin-top:0.75rem;}
+        </style>
         </style>
         """,
         unsafe_allow_html=True
@@ -2948,13 +2950,15 @@ def main():
         if st.sidebar.button(label, key=f"nav_{key}", help=key):
             st.session_state["page"] = key
             st.rerun()
-    st.sidebar.markdown('<hr style="margin:6px 0 10px 0;" />', unsafe_allow_html=True)
-    if st.sidebar.button("🚪 Logout", key="nav_full_logout"):
-        logout()
-        st.rerun()
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-    # (Logout sudah ditangani dalam wrapper navigasi di atas)
+    # --- Logout button at the very bottom ---
+    if user:
+        st.sidebar.markdown('<div id="wijna-logout-area">', unsafe_allow_html=True)
+        if st.sidebar.button("🚪 Logout", key="sidebar_logout", help="Keluar aplikasi"):
+            logout()
+            st.rerun()
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     choice = st.session_state["page"]
 
