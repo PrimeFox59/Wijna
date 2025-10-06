@@ -24,8 +24,88 @@ AUDIT_SHEET_NAME = "audit_log"
 INVENTORY_SHEET_NAME = "inventory"
 SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SURAT_KELUAR_SHEET_NAME = "surat_keluar"
+CONFIG_SHEET_NAME = "config"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
-ADMIN_EMAIL_RECIPIENT = "adinugroho@wijna.org"  # Email tujuan notifikasi
+# ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
+# pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
+# khusus (misal selalu kirim ke tim IT), isi dengan alamat distribution list.
+ADMIN_EMAIL_RECIPIENT = ""
+
+# Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
+# Catatan: superuser selalu otomatis ditambahkan oleh helper.
+# Tambahkan / ubah sesuai kebutuhan bisnis Anda.
+NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
+    ("inventory", "create"): ["finance"],
+    ("inventory", "finance_review"): ["director"],
+    ("inventory", "director_approved"): ["finance"],  # misal informasikan balik ke finance
+    ("inventory", "director_reject"): ["finance"],
+    ("surat_masuk", "draft"): ["director"],
+    ("surat_masuk", "director_approved"): ["finance"],
+    ("surat_keluar", "draft"): ["director"],
+    ("surat_keluar", "final_upload"): ["finance"],
+    ("cuti", "submit"): ["finance"],
+    ("cuti", "finance_review"): ["director"],
+    ("cuti", "director_approved"): ["finance"],
+    ("cuti", "director_reject"): ["finance"],
+    # Auth events
+    ("auth", "login"): ["superuser"],
+    ("auth", "logout"): ["superuser"],
+    ("users", "register"): ["superuser"],
+}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_config_notif_map() -> dict[tuple[str, str], list[str]]:
+    """Load dynamic notification role mapping from config sheet.
+    Sheet schema: module | action | roles | active | updated_at | updated_by
+    - roles: comma-separated roles, e.g. "finance,director"
+    - active: 1/0 or TRUE/FALSE; only active==1 considered
+    Returns dict with (module, action) => [roles]
+    """
+    mapping: dict[tuple[str, str], list[str]] = {}
+    try:
+        ws = _get_ws(CONFIG_SHEET_NAME)
+        records = ws.get_all_records()
+        for rec in records:
+            try:
+                mod = str(rec.get("module", "")).strip().lower()
+                act = str(rec.get("action", "")).strip().lower()
+                roles_raw = str(rec.get("roles", "")).strip()
+                active_val = str(rec.get("active", "1")).strip().lower()
+                if not mod or not act or not roles_raw:
+                    continue
+                if active_val not in ("1", "true", "yes", "y"):  # treat others as inactive
+                    continue
+                roles_list = [r.strip().lower() for r in roles_raw.split(',') if r.strip()]
+                if not roles_list:
+                    continue
+                mapping[(mod, act)] = roles_list
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return mapping
+
+def notify_event(module: str, action: str, subject: str, body: str, roles: list[str] | None = None):
+    """Kirim notifikasi email berbasis module & action.
+    - roles: override manual; bila None akan lookup NOTIF_ROLE_MAP.
+    - superuser + ADMIN_EMAIL_RECIPIENT ditambahkan otomatis oleh _notify_roles.
+    - Diam (silent) jika tidak ada peran terpetakan.
+    """
+    try:
+        if roles is not None:
+            target_roles = roles
+        else:
+            # First try dynamic config sheet
+            dyn_map = load_config_notif_map()
+            target_roles = dyn_map.get((module.lower(), action.lower()))
+            if not target_roles:
+                # fallback to static default
+                target_roles = NOTIF_ROLE_MAP.get((module, action), [])
+        if not target_roles or not isinstance(target_roles, list):
+            return
+        _notify_roles(list(set(target_roles)), subject, body)
+    except Exception:
+        pass
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 # Use centered layout on login screen; switch to wide after user logs in.
 _layout_mode = "wide" if st.session_state.get("user") else "centered"
@@ -386,6 +466,10 @@ def ensure_core_sheets():
         ]
         ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, sk_headers)
 
+        # Config sheet for dynamic notification mappings
+        config_headers = ["module", "action", "roles", "active", "updated_at", "updated_by"]
+        ensure_sheet_with_headers(spreadsheet, CONFIG_SHEET_NAME, config_headers)
+
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
         st.error(f"Gagal memastikan sheet inti tersedia: {e}")
@@ -440,7 +524,7 @@ def show_login_page():
                         email_subject = "Notifikasi: User Login"
                         email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
                         try:
-                            _notify_roles(["superuser"], email_subject, email_body)
+                            notify_event("auth", "login", email_subject, email_body)
                         except Exception:
                             pass
                         
@@ -480,7 +564,7 @@ def show_login_page():
                     email_subject = "Notifikasi: User Baru Telah Mendaftar"
                     email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
                     try:
-                        _notify_roles(["superuser"], email_subject, email_body)
+                        notify_event("users", "register", email_subject, email_body)
                     except Exception:
                         pass
 
@@ -493,7 +577,7 @@ def show_main_app():
         email_subject = "Notifikasi: User Logout"
         email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
         try:
-            _notify_roles(["superuser"], email_subject, email_body)
+            notify_event("auth", "logout", email_subject, email_body)
         except Exception:
             pass
         
@@ -615,7 +699,7 @@ def logout():
     user = get_current_user()
     if user:
         try:
-            _notify_roles(["superuser"], "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
+            notify_event("auth", "logout", "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
         except Exception:
             pass
         # Audit logout event
@@ -667,7 +751,7 @@ def login_user(email: str, password: str):
         st.session_state.logged_in = True
         st.session_state.username = user_obj["email"]
         try:
-            _notify_roles(["superuser"], "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
+            notify_event("auth", "login", "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
         except Exception:
             pass
         # Audit login event
@@ -728,7 +812,7 @@ def register_user(email: str, full_name: str, password: str):
                     continue
                 raise
         try:
-            _notify_roles(["superuser"], "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
+            notify_event("users", "register", "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
         except Exception:
             pass
         # Audit register
@@ -815,7 +899,7 @@ def _notify_role(role: str, subject: str, body: str):
 def _notify_roles(roles: list[str], subject: str, body: str):
     """Kirim email ke gabungan beberapa role (dedupe), selalu menyertakan superuser. Async + bulk."""
     unique_roles = {*(r.strip().lower() for r in roles if r), "superuser"}
-    all_emails: set[str] = set()
+    all_emails: set[str] = set()  # Initialize a set to store unique emails
     for r in unique_roles:
         try:
             for e in _get_emails_by_role(r):
@@ -823,7 +907,7 @@ def _notify_roles(roles: list[str], subject: str, body: str):
                     all_emails.add(str(e).strip())
         except Exception:
             continue
-    # Tambahkan admin fallback jika ada
+    # Add admin fallback if available
     admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip() if ADMIN_EMAIL_RECIPIENT else ""
     if admin_email:
         all_emails.add(admin_email)
@@ -1108,7 +1192,7 @@ def inventory_module():
                             pass
                         # Notify Finance users
                         try:
-                            _notify_roles(["finance"], "[WIJNA] Draft Inventaris Baru",
+                            notify_event("inventory", "create", "[WIJNA] Draft Inventaris Baru",
                                           f"Item inventaris baru menunggu review Finance.\n\nNama: {full_nama}\nID: {iid}\nLokasi: {loc}\nStatus: {status}\nPIC: {pic}")
                         except Exception:
                             pass
@@ -1160,8 +1244,8 @@ def inventory_module():
                     except Exception:
                         pass
                     try:
-                        _notify_roles(["director"], "[WIJNA] Inventaris Menunggu Approval Director",
-                                       f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
+                        notify_event("inventory", "finance_review", "[WIJNA] Inventaris Menunggu Approval Director",
+                                      f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
                     except Exception:
                         pass
                     st.success("Finance reviewed. Menunggu persetujuan Director.")
@@ -1323,8 +1407,8 @@ def inventory_module():
                             except Exception:
                                 pass
                             try:
-                                _notify_roles(["finance"], "[WIJNA] Permohonan Pinjam Barang",
-                                               f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
+                                notify_event("inventory", "loan_request", "[WIJNA] Permohonan Pinjam Barang",
+                                             f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
                             except Exception:
                                 pass
                             st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
@@ -1550,8 +1634,8 @@ def surat_masuk_module():
                             )
                             # Notifikasi: Ada surat masuk baru perlu review/approve oleh Director
                             try:
-                                _notify_roles(["director"], "[WIJNA] Surat Masuk Baru",
-                                               f"Surat Masuk baru menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nPengirim: {pengirim}\nTanggal: {tanggal}")
+                                notify_event("surat_masuk", "draft", "[WIJNA] Surat Masuk Baru",
+                                             f"Surat Masuk baru menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nPengirim: {pengirim}\nTanggal: {tanggal}")
                             except Exception:
                                 pass
                             st.success("Surat masuk berhasil dicatat.")
@@ -1870,8 +1954,8 @@ def surat_keluar_module():
                     audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; draft={'file:'+draft_name if draft_name else 'url:'+str(draft_link)}")
                     # Notifikasi: Ada draft Surat Keluar yang perlu direview/approve
                     try:
-                        _notify_roles(["director"], "[WIJNA] Draft Surat Keluar Baru",
-                                       f"Draft Surat Keluar menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nDitujukan: {ditujukan}\nDibuat oleh: {user.get('full_name') or user.get('email')}\nTanggal: {tanggal}")
+                        notify_event("surat_keluar", "draft", "[WIJNA] Draft Surat Keluar Baru",
+                                     f"Draft Surat Keluar menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nDitujukan: {ditujukan}\nDibuat oleh: {user.get('full_name') or user.get('email')}\nTanggal: {tanggal}")
                     except Exception:
                         pass
                     st.success("✅ Surat keluar (draft) tersimpan.")
@@ -2212,8 +2296,200 @@ def audit_trail_module():
 
 
 def superuser_panel():
-    st.header("🔑 Superuser Panel")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    role = str(user.get("role", "")).lower()
+    if role != "superuser":
+        st.error("Hanya superuser yang dapat mengakses panel ini.")
+        return
+    st.header("🔑 Superuser Panel - Notifikasi Dinamis")
+    st.markdown(
+        """
+        Kelola pemetaan notifikasi berbasis (module, action) ke daftar peran (roles) yang akan menerima email.
+        Data disimpan di sheet `config` dengan kolom: module, action, roles, active, updated_at, updated_by.
+        Catatan:
+        - roles ditulis dipisahkan koma, contoh: ``finance,director``.
+        - hanya baris dengan active=1 (atau TRUE/yes) yang dipakai.
+        - superuser tetap otomatis ditambahkan saat pengiriman email.
+        - Mapping statis di kode menjadi fallback jika (module, action) belum ada di sini.
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Utility: refresh dynamic cache
+    def _clear_config_cache():
+        try:
+            load_config_notif_map.clear()  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+
+    # Fetch sheet
+    try:
+        ws = _get_ws(CONFIG_SHEET_NAME)
+        records = ws.get_all_records()
+    except Exception as e:
+        st.error(f"Gagal membaca sheet config: {e}")
+        return
+
+    # Normalize display dataframe
+    df_cfg = pd.DataFrame(records)
+    base_cols = ["module", "action", "roles", "active", "updated_at", "updated_by"]
+    for c in base_cols:
+        if c not in df_cfg.columns:
+            df_cfg[c] = ""
+    if not df_cfg.empty:
+        df_cfg['active'] = df_cfg['active'].astype(str)
+
+    with st.expander("📋 Lihat Mapping Saat Ini", expanded=True):
+        if df_cfg.empty:
+            st.info("Belum ada data di config sheet.")
+        else:
+            st.dataframe(df_cfg[base_cols], use_container_width=True)
+            st.caption(f"Total entri: {len(df_cfg)}")
+
+    st.markdown("---")
+    st.subheader("➕ Tambah / Update Mapping")
+    with st.form("cfg_add_update", clear_on_submit=False):
+        colA, colB = st.columns(2)
+        with colA:
+            mod_in = st.text_input("Module", placeholder="misal: inventory")
+        with colB:
+            act_in = st.text_input("Action", placeholder="misal: create")
+        roles_in = st.text_input("Roles (pisahkan koma)", placeholder="finance,director")
+        active_in = st.checkbox("Active", value=True)
+        submitted = st.form_submit_button("Simpan / Update Mapping")
+        if submitted:
+            mod = mod_in.strip().lower()
+            act = act_in.strip().lower()
+            roles_raw = roles_in.strip()
+            if not mod or not act or not roles_raw:
+                st.warning("Module, Action, dan Roles wajib diisi.")
+            else:
+                roles_clean = ",".join(sorted({r.strip().lower() for r in roles_raw.split(',') if r.strip()}))
+                # Upsert logic: find existing row with same module+action
+                headers = ws.row_values(1)
+                # Ensure headers correctness (should already exist)
+                try:
+                    module_col = headers.index('module') + 1
+                    action_col = headers.index('action') + 1
+                except ValueError:
+                    st.error("Kolom module/action tidak ditemukan di sheet config.")
+                    st.stop()
+                target_row = None
+                try:
+                    # brute force find; gspread find can't search two columns simultaneously
+                    all_vals = ws.get_all_values()
+                    for ridx, row_vals in enumerate(all_vals[1:], start=2):
+                        try:
+                            if str(row_vals[module_col-1]).strip().lower() == mod and str(row_vals[action_col-1]).strip().lower() == act:
+                                target_row = ridx
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                updated_at = datetime.utcnow().isoformat()
+                updated_by = (get_current_user() or {}).get('email', 'system')
+                row_payload = {
+                    'module': mod,
+                    'action': act,
+                    'roles': roles_clean,
+                    'active': '1' if active_in else '0',
+                    'updated_at': updated_at,
+                    'updated_by': updated_by
+                }
+                if target_row:
+                    # update existing
+                    for k, v in row_payload.items():
+                        if k in headers:
+                            a1 = gspread.utils.rowcol_to_a1(target_row, headers.index(k) + 1)
+                            for i in range(3):
+                                try:
+                                    ws.update(a1, v)
+                                    break
+                                except gspread.exceptions.APIError as e:
+                                    if '429' in str(e):
+                                        time.sleep(1 + i)
+                                        continue
+                                    raise
+                    st.success(f"Mapping diperbarui: {mod} / {act}")
+                    try:
+                        audit_log("config", "update", target=f"{mod}:{act}", details=roles_clean)
+                    except Exception:
+                        pass
+                else:
+                    # append new
+                    values = [row_payload.get(h, "") for h in headers]
+                    for i in range(3):
+                        try:
+                            ws.append_row(values)
+                            break
+                        except gspread.exceptions.APIError as e:
+                            if '429' in str(e):
+                                time.sleep(1 + i)
+                                continue
+                            raise
+                    st.success(f"Mapping ditambahkan: {mod} / {act}")
+                    try:
+                        audit_log("config", "add", target=f"{mod}:{act}", details=roles_clean)
+                    except Exception:
+                        pass
+                _clear_config_cache()
+                st.experimental_rerun()
+
+    st.markdown("---")
+    st.subheader("🗑️ Hapus Mapping")
+    if df_cfg.empty:
+        st.info("Tidak ada mapping untuk dihapus.")
+    else:
+        # Build label list
+        df_cfg['label'] = df_cfg.apply(lambda r: f"{r['module']} | {r['action']} -> {r['roles']} (active={r['active']})", axis=1)
+        choice = st.selectbox("Pilih mapping", df_cfg['label'])
+        if choice:
+            sel_row = df_cfg[df_cfg['label'] == choice].iloc[0]
+            if st.button("Hapus Mapping Terpilih", type="primary"):
+                mod = str(sel_row.get('module'))
+                act = str(sel_row.get('action'))
+                # find row index again
+                all_vals = ws.get_all_values()
+                headers = all_vals[0]
+                module_idx = headers.index('module') if 'module' in headers else None
+                action_idx = headers.index('action') if 'action' in headers else None
+                del_row = None
+                if module_idx is not None and action_idx is not None:
+                    for ridx, row_vals in enumerate(all_vals[1:], start=2):
+                        try:
+                            if str(row_vals[module_idx]).strip().lower() == mod and str(row_vals[action_idx]).strip().lower() == act:
+                                del_row = ridx
+                                break
+                        except Exception:
+                            continue
+                if del_row:
+                    for i in range(3):
+                        try:
+                            ws.delete_rows(del_row)
+                            break
+                        except gspread.exceptions.APIError as e:
+                            if '429' in str(e):
+                                time.sleep(1 + i)
+                                continue
+                            raise
+                    st.success(f"Mapping dihapus: {mod} / {act}")
+                    try:
+                        audit_log("config", "delete", target=f"{mod}:{act}")
+                    except Exception:
+                        pass
+                    _clear_config_cache()
+                    st.experimental_rerun()
+                else:
+                    st.warning("Gagal menemukan baris mapping untuk dihapus.")
+
+    st.markdown("---")
+    if st.button("🔄 Refresh Mapping Cache"):
+        _clear_config_cache()
+        st.success("Cache dynamic mapping dibersihkan.")
 
 
 def _cuti_read_df():
@@ -2479,8 +2755,8 @@ def main():
                             pass
                         # Notifikasi ke Finance + Superuser untuk review
                         try:
-                            _notify_roles(["finance"], "[WIJNA] Pengajuan Cuti Baru",
-                                           f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}")
+                            notify_event("cuti", "submit", "[WIJNA] Pengajuan Cuti Baru",
+                                         f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}")
                         except Exception:
                             pass
                         st.rerun()
@@ -2513,12 +2789,12 @@ def main():
                                     except Exception:
                                         pass
                                     # Jika approve, beritahu Director + Superuser
-                                    if approve:
-                                        try:
-                                            _notify_roles(["director"], "[WIJNA] Cuti Menunggu Approval Director",
-                                                           f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari")
-                                        except Exception:
-                                            pass
+                                        if approve:
+                                            try:
+                                                notify_event("cuti", "finance_review", "[WIJNA] Cuti Menunggu Approval Director",
+                                                             f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari")
+                                            except Exception:
+                                                pass
                                 except Exception as e:
                                     st.error(f"Gagal menyimpan: {e}")
                                 st.rerun()
