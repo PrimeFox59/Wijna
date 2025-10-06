@@ -13,6 +13,12 @@ import os
 import uuid
 from datetime import datetime, date, timedelta
 import time
+from datetime import timezone
+try:
+    # Python 3.9+: zoneinfo
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # Fallback; we will manually offset
 import threading
 
 # --- 1. KONFIGURASI APLIKASI ---
@@ -128,6 +134,59 @@ def is_superuser_auto_enabled() -> bool:
     val = str(row.get("superuser_auto", "1")) if row else "1"
     return val.strip().lower() in ("1", "true", "yes", "y")
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
+# --- Timezone Helpers (WIB GMT+07:00) ---
+WIB_OFFSET = 7  # hours
+WIB_TZ = None
+if ZoneInfo:
+    try:
+        WIB_TZ = ZoneInfo("Asia/Jakarta")
+    except Exception:
+        WIB_TZ = None
+
+# All application timestamps are standardized to WIB (UTC+07:00) via now_wib_dt()/now_wib_iso().
+# IMPORTANT:
+#  - Always call now_wib_iso() for storing a timestamp (avoid direct datetime.utcnow()).
+#  - Historical rows may still contain naive UTC timestamps from before migration; treat
+#    them as legacy if you need to normalize. New writes are WIB localized.
+#  - Microseconds are stripped for consistency and easier filtering/comparison in Sheets.
+#  - If a timestamp stored has no timezone info, we assume it's already WIB.
+
+def now_wib_dt() -> datetime:
+    """Return current datetime in WIB (UTC+7) tz-aware if possible."""
+    if WIB_TZ:
+        return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(WIB_TZ)
+    # Manual offset fallback
+    return datetime.utcnow() + timedelta(hours=WIB_OFFSET)
+
+def now_wib_iso() -> str:
+    dt = now_wib_dt()
+    # Standardize ISO without microseconds for consistency
+    return dt.replace(microsecond=0).isoformat()
+
+def parse_wib(ts: str) -> datetime | None:
+    """Parse ISO timestamp string into a datetime in WIB.
+
+    Behavior:
+      - If ts has TZ info, convert to WIB (Asia/Jakarta if available else fixed offset).
+      - If ts is naive, assume it is already WIB (post-migration convention).
+      - Returns None if parsing fails.
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # Assume already WIB
+        if WIB_TZ:
+            return dt.replace(tzinfo=WIB_TZ)
+        return dt  # naive but treated as WIB
+    # Convert to WIB
+    if WIB_TZ:
+        return dt.astimezone(WIB_TZ)
+    # Fallback fixed offset
+    return dt.astimezone(timezone(timedelta(hours=WIB_OFFSET)))
 # Use centered layout on login screen; switch to wide after user logs in.
 _layout_mode = "wide" if st.session_state.get("user") else "centered"
 st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout=_layout_mode)
@@ -469,7 +528,7 @@ def ensure_core_sheets():
             # Append a default superuser only if sheet is empty
             for i in range(3):
                 try:
-                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", datetime.utcnow().isoformat(), 1])
+                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", now_wib_iso(), 1])
                     break
                 except gspread.exceptions.APIError as e:
                     if "429" in str(e):
@@ -842,7 +901,7 @@ def register_user(email: str, full_name: str, password: str):
         if email_col and (df[email_col].astype(str).str.lower() == email_lower).any():
             return False, "Email/Username sudah terdaftar."
         hashed = hash_password(password)
-        now = datetime.utcnow().isoformat()
+        now = now_wib_iso()
         # Adapt to sheet schema
         headers = ws.row_values(1)
         row_values = []
@@ -1008,7 +1067,7 @@ def audit_log(module: str, action: str, target: str = "", details: str = ""):
     try:
         ws = _get_ws(AUDIT_SHEET_NAME)
         actor = (get_current_user() or {}).get("email", "guest")
-        data = [datetime.utcnow().isoformat(), actor, module, action, target, details]
+        data = [now_wib_iso(), actor, module, action, target, details]
         for i in range(3):
             try:
                 ws.append_row(data)
@@ -1020,7 +1079,7 @@ def audit_log(module: str, action: str, target: str = "", details: str = ""):
                     continue
                 raise
     except Exception:
-        # Non-blocking
+        # Non-blocking audit logging failure; swallow errors
         pass
 
 
@@ -1235,7 +1294,7 @@ def inventory_module():
                     else:
                         full_nama = name if not keterangan_opsi else f"{name} ({keterangan_opsi})"
                         iid = gen_id("inv")
-                        now = datetime.utcnow().isoformat()
+                        now = now_wib_iso()
                         file_id, file_name, file_link = upload_file_to_drive(f) if f else ("", "", "")
                         # PIC adalah user penginput
                         pic = (user.get("full_name") or user.get("email") or "").strip()
@@ -1469,7 +1528,7 @@ def inventory_module():
                                 "loan_info": info_pic,
                                 "finance_approved": 0,
                                 "director_approved": 0,
-                                "updated_at": datetime.utcnow().isoformat()
+                                "updated_at": now_wib_iso()
                             })
                             try:
                                 audit_log("inventory", "loan_request", target=rid, details=f"keperluan={keperluan}; kembali={tgl_kembali}")
@@ -1676,7 +1735,7 @@ def surat_masuk_module():
                             st.error("Gagal mengupload file ke Drive.")
                         else:
                             sid = gen_id("sm")
-                            now = datetime.utcnow().isoformat()
+                            now = now_wib_iso()
                             _sm_append(
                                 {
                                     "id": sid,
@@ -1992,7 +2051,7 @@ def surat_keluar_module():
                     st.error("Link draft surat wajib diisi.")
                 else:
                     sid = gen_id("sk")
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     draft_file_id, draft_name, draft_web = "", "", ""
                     if draft_type == "Upload File":
                         draft_file_id, draft_name, draft_web = _upload_to_drive(draft_file)
@@ -2076,7 +2135,7 @@ def surat_keluar_module():
                                 "director_note": note,
                                 "director_approved": 1,
                                 "status": "Final",
-                                "updated_at": datetime.utcnow().isoformat(),
+                                "updated_at": now_wib_iso(),
                             })
                             audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
                             st.success("Final uploaded & approved.")
@@ -2086,7 +2145,7 @@ def surat_keluar_module():
                         "status": "Draft",
                         "director_note": note,
                         "director_approved": 0,
-                        "updated_at": datetime.utcnow().isoformat(),
+                        "updated_at": now_wib_iso(),
                     })
                     audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
                     st.warning("Surat dikembalikan ke draft untuk direvisi.")
@@ -2291,7 +2350,7 @@ def mou_module():
                 else:
                     mid = gen_id("mou")
                     fid, fname, flink = _upload_file(draft_file)
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     row = {
                         "id": mid,
                         "nomor": nomor,
@@ -2347,7 +2406,7 @@ def mou_module():
                                 _mou_update_by_id(row['id'], {
                                     "board_note": note,
                                     "board_approved": 1 if approve else 0,
-                                    "updated_at": datetime.utcnow().isoformat()
+                                    "updated_at": now_wib_iso()
                                 })
                                 try:
                                     audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
@@ -2786,7 +2845,7 @@ def superuser_panel():
                                 continue
                     except Exception:
                         pass
-                    updated_at = datetime.utcnow().isoformat()
+                    updated_at = now_wib_iso()
                     updated_by = (get_current_user() or {}).get('email', 'system')
                     row_payload = {
                         'module': mod,
@@ -2908,7 +2967,7 @@ def superuser_panel():
                         if len(row_vals) > module_idx and str(row_vals[module_idx]).strip().lower() == '__settings__':
                             found_row = ridx
                             break
-                updated_at = datetime.utcnow().isoformat()
+                updated_at = now_wib_iso()
                 updater = (get_current_user() or {}).get('email', 'system')
                 settings_payload = {
                     'module': '__settings__',
@@ -3148,7 +3207,7 @@ def cuti_module():
                 st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
             else:
                 cid = gen_id("cuti")
-                now = datetime.utcnow().isoformat()
+                now = now_wib_iso()
                 try:
                     _cuti_append({
                         "id": cid,
