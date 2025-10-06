@@ -1639,7 +1639,7 @@ def dashboard():
             # Kelompokkan berdasar warna untuk memudahkan scanning
             df_items = pd.DataFrame(items)
             order = ["Merah","Oranye","Kuning","Hijau","Biru","Ungu","Abu-abu"]
-            df_items['__order'] = df_items['warna'].applSy(lambda w: order.index(w) if w in order else 999)
+            df_items['__order'] = df_items['warna'].apply(lambda w: order.index(w) if w in order else 999)
             df_items = df_items.sort_values(['__order','label'])
 
             # Tampilkan sebagai HTML custom agar warna blok jelas
