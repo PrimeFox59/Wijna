@@ -1377,80 +1377,78 @@ def dashboard():
     if not sop.empty and 'director_approved' in sop.columns:
         pend = (sop['director_approved'].astype(str) == '0').sum()
         if pend: approvals.append(("SOP (Director)", pend, "SOP"))
-    # Cuti
+    # Cuti (hanya untuk menambahkan angka approval; stat cards sekarang selalu dirender di luar blok ini)
     cuti = loaded.get(CUTI_SHEET_NAME, pd.DataFrame())
     if not cuti.empty:
-        fp = (cuti['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in cuti.columns else 0
-        dp = (cuti['director_approved'].astype(str) == '0').sum() if 'director_approved' in cuti.columns else 0
-        if fp: approvals.append(("Cuti (Finance)", fp, "Cuti"))
-        if dp: approvals.append(("Cuti (Director)", dp, "Cuti"))
+        try:
+            fp = (cuti['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in cuti.columns else 0
+            dp = (cuti['director_approved'].astype(str) == '0').sum() if 'director_approved' in cuti.columns else 0
+            if fp: approvals.append(("Cuti (Finance)", fp, "Cuti"))
+            if dp: approvals.append(("Cuti (Director)", dp, "Cuti"))
+        except Exception:
+            pass
 
-        # --- Styled Summary Cards (top KPIs) ---
-        total_pending_approvals = sum(c for _, c, _ in approvals) if approvals else 0
-        # Surat belum dibahas (status == 'Belum Dibahas')
-        surat_belum_dibahas = 0
-        if not sm.empty and 'status' in sm.columns:
-                surat_belum_dibahas = sm['status'].astype(str).str.lower().eq('belum dibahas').sum()
-        # MoU due in <= 7 days
-        mou_due7 = 0
-        if not mou.empty and 'tgl_selesai' in mou.columns:
-                try:
-                        mou['_tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
-                        upcoming_limit = pd.Timestamp.today() + pd.Timedelta(days=7)
-                        mou_due7 = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)].shape[0]
-                        # --- Automated notification for due <=7 days ---
+    # --- Styled Summary Cards (top KPIs) (selalu muncul tanpa perlu refresh manual) ---
+    total_pending_approvals = sum(c for _, c, _ in approvals) if approvals else 0
+    # Surat belum dibahas (status == 'Belum Dibahas')
+    surat_belum_dibahas = 0
+    if not sm.empty and 'status' in sm.columns:
+        try:
+            surat_belum_dibahas = sm['status'].astype(str).str.lower().eq('belum dibahas').sum()
+        except Exception:
+            pass
+    # MoU due in <= 7 days
+    mou_due7 = 0
+    if not mou.empty and 'tgl_selesai' in mou.columns:
+        try:
+            mou['_tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
+            upcoming_limit = pd.Timestamp.today() + pd.Timedelta(days=7)
+            mou_due7 = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)].shape[0]
+            # --- Automated notification for due <=7 days ---
+            try:
+                if mou_due7 > 0:
+                    if 'due_notified' not in mou.columns:
+                        mou['due_notified'] = ''
+                    due_rows = mou[(mou['_tgl_selesai_dt'].notna()) & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)]
+                    need_notify = due_rows[due_rows.get('due_notified','').astype(str).str.strip() == '']
+                    if not need_notify.empty:
+                        notif_roles = NOTIF_ROLE_MAP.get(("mou","due_soon"), ["director","finance"])
                         try:
-                            if mou_due7 > 0:
-                                # Ensure due_notified column exists
-                                if 'due_notified' not in mou.columns:
-                                    mou['due_notified'] = ''
-                                due_rows = mou[(mou['_tgl_selesai_dt'].notna()) & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)]
-                                need_notify = due_rows[due_rows.get('due_notified','').astype(str).str.strip() == '']
-                                if not need_notify.empty:
-                                    # Collect recipients via NOTIF_ROLE_MAP for a new event key (mou,due_soon)
-                                    # Fallback: director + finance + superuser roles
-                                    notif_roles = NOTIF_ROLE_MAP.get(("mou","due_soon"), ["director","finance"])
-                                    # load users sheet to map roles -> emails
+                            users_df = pd.DataFrame(_get_ws(USERS_SHEET_NAME).get_all_records())
+                        except Exception:
+                            users_df = pd.DataFrame()
+                        recipients = []
+                        if not users_df.empty and 'email' in users_df.columns and 'role' in users_df.columns:
+                            for r in notif_roles + ["superuser"]:
+                                recipients.extend(users_df[users_df['role'].astype(str).str.lower()==r]['email'].tolist())
+                        subject = f"[WIJNA] MoU akan jatuh tempo ≤7 hari ({len(need_notify)})"
+                        body_lines = ["Daftar MoU yang akan jatuh tempo dalam 7 hari:"]
+                        for _, row in need_notify.iterrows():
+                            body_lines.append(f"- {row.get('nomor','?')} | {row.get('nama','?')} | berakhir: {row.get('tgl_selesai','?')}")
+                        body_lines.append("\nSegera lakukan perpanjangan atau tindak lanjut sesuai prosedur.")
+                        body = "\n".join(body_lines)
+                        if recipients:
+                            _send_async(send_notification_bulk, recipients, subject, body)
+                        try:
+                            ws_mou = _get_ws(MOU_SHEET_NAME)
+                            headers_mou = ws_mou.row_values(1)
+                            if 'due_notified' in headers_mou:
+                                col_idx = headers_mou.index('due_notified') + 1
+                                for _, row in need_notify.iterrows():
                                     try:
-                                        users_df = pd.DataFrame(_get_ws(USERS_SHEET_NAME).get_all_records())
+                                        cell = ws_mou.find(str(row.get('id','')))
+                                        if cell:
+                                            a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                                            ws_mou.update(a1, [[now_wib_iso()]])
                                     except Exception:
-                                        users_df = pd.DataFrame()
-                                    recipients = []
-                                    if not users_df.empty and 'email' in users_df.columns and 'role' in users_df.columns:
-                                        for r in notif_roles + ["superuser"]:
-                                            recipients.extend(users_df[users_df['role'].astype(str).str.lower()==r]['email'].tolist())
-                                    subject = f"[WIJNA] MoU akan jatuh tempo ≤7 hari ({len(need_notify)})"
-                                    body_lines = ["Daftar MoU yang akan jatuh tempo dalam 7 hari:"]
-                                    for _, row in need_notify.iterrows():
-                                        body_lines.append(f"- {row.get('nomor','?')} | {row.get('nama','?')} | berakhir: {row.get('tgl_selesai','?')}")
-                                    body_lines.append("\nSegera lakukan perpanjangan atau tindak lanjut sesuai prosedur.")
-                                    body = "\n".join(body_lines)
-                                    if recipients:
-                                        _send_async(send_notification_bulk, recipients, subject, body)
-                                    # Update due_notified flag in sheet
-                                    try:
-                                        ws_mou = _get_ws(MOU_SHEET_NAME)
-                                        headers_mou = ws_mou.row_values(1)
-                                        if 'due_notified' not in headers_mou:
-                                            # Should have been ensured by ensure_core_sheets, skip if absent
-                                            pass
-                                        else:
-                                            col_idx = headers_mou.index('due_notified') + 1
-                                            for _, row in need_notify.iterrows():
-                                                try:
-                                                    cell = ws_mou.find(str(row.get('id','')))
-                                                    if cell:
-                                                        a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
-                                                        ws_mou.update(a1, [[now_wib_iso()]])
-                                                except Exception:
-                                                    continue
-                                            _invalidate_data_cache()
-                                    except Exception:
-                                        pass
+                                        continue
+                                _invalidate_data_cache()
                         except Exception:
                             pass
-                except Exception:
-                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # Inject CSS (idempotent)
         st.markdown("""
