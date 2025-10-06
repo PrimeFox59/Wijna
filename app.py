@@ -1657,6 +1657,11 @@ def dashboard():
     user_role = (user.get("role") or "").lower()
     with st.expander("📄 Dokumen Menunggu Approval", expanded=False):
         st.caption("Menampilkan hanya modul relevan dengan peran Anda.")
+        # --- Filters: modul & tanggal (opsional) ---
+        filter_col1, filter_col2, filter_col3 = st.columns([2,2,2])
+        all_mod_names = []
+        # definisikan setelah role_modules agar tersedia
+        # (placeholder akan diisi nanti setelah role_modules)
 
         # Role -> modul mapping untuk approval
         role_modules = {
@@ -1682,6 +1687,18 @@ def dashboard():
         }
 
         targets = role_modules.get(user_role, [])
+        # Siapkan pilihan modul untuk filter setelah targets diketahui
+        if targets:
+            all_mod_names = [mk for _, mk, _, _ in targets]
+            all_mod_names_sorted = sorted(set(all_mod_names))
+            with filter_col1:
+                selected_module = st.selectbox("Filter Modul", ["Semua"] + all_mod_names_sorted, key="approval_filter_mod")
+            with filter_col2:
+                date_from = st.date_input("Dari Tgl", value=None, key="approval_filter_from")
+            with filter_col3:
+                date_to = st.date_input("Sampai Tgl", value=None, key="approval_filter_to")
+        else:
+            selected_module = "Semua"; date_from = None; date_to = None
         if not targets:
             st.info("Peran Anda tidak memiliki approval yang menunggu di modul ini.")
         else:
@@ -1701,11 +1718,28 @@ def dashboard():
 
             pending_rows_all = []
             for sheet_name, module_key, headers, approval_col in targets:
+                if selected_module != "Semua" and module_key != selected_module:
+                    continue
                 dfm = _load_min(sheet_name, headers)
                 if dfm.empty or approval_col not in dfm.columns:
                     continue
                 try:
                     mask = dfm[approval_col].astype(str) == '0'
+                    # Terapkan filter tanggal jika ada kolom tanggal yang cocok
+                    if (date_from or date_to) and not dfm.empty:
+                        # Heuristik: cari kolom pertama yang mengandung 'tgl' atau 'tanggal' atau 'created'
+                        date_cols = [c for c in dfm.columns if any(k in c.lower() for k in ['tgl','tanggal','created_at','updated_at','tanggal_submit'])]
+                        target_date_col = None
+                        for dc in date_cols:
+                            if dfm[dc].astype(str).str.len().gt(0).any():
+                                target_date_col = dc; break
+                        if target_date_col:
+                            # parse tanggal
+                            parsed = pd.to_datetime(dfm[target_date_col], errors='coerce')
+                            if date_from:
+                                mask = mask & (parsed.dt.date >= date_from)
+                            if date_to:
+                                mask = mask & (parsed.dt.date <= date_to)
                     rows = dfm[mask].head(50).copy()
                     if rows.empty:
                         continue
