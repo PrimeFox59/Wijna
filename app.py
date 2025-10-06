@@ -2625,16 +2625,68 @@ def superuser_panel():
                             st.warning("Mapping tidak memiliki roles aktif.")
                         else:
                             notify_event(m_sel, a_sel, test_subject, test_body, roles=None)  # dynamic lookup
-                            st.success("Email test berdasarkan mapping dikirim (cek inbox).")
+                            # Cek secara manual siapa saja penerima (diagnostik) dengan memanggil fungsi internal
+                            dyn_roles = load_config_notif_map().get((m_sel, a_sel), []) or []
+                            preview_roles = set(dyn_roles)
+                            if is_superuser_auto_enabled():
+                                preview_roles.add("superuser")
+                            # Ambil email tiap role
+                            preview_emails = []
+                            for r in preview_roles:
+                                try:
+                                    preview_emails.extend(_get_emails_by_role(r))
+                                except Exception:
+                                    pass
+                            preview_emails = sorted({e for e in preview_emails if e})
+                            if preview_emails:
+                                st.success(f"Email test berdasarkan mapping dikirim ke {len(preview_emails)} penerima.")
+                                with st.expander("Detail Penerima", expanded=False):
+                                    st.write(preview_emails)
+                            else:
+                                st.error("Mapping valid tetapi tidak ditemukan email penerima (cek sheet users & kolom active).")
                 else:
                     valid_roles = [r for r in manual_roles if r in ALLOWED_ROLES]
                     if not valid_roles:
                         st.warning("Pilih minimal satu role valid untuk manual.")
                     else:
                         notify_event("test", "manual", test_subject, test_body, roles=valid_roles)
-                        st.success("Email test manual dikirim (cek inbox).")
+                        # Diagnostik manual
+                        diag_roles = set(valid_roles)
+                        if is_superuser_auto_enabled():
+                            diag_roles.add("superuser")
+                        diag_emails = []
+                        for r in diag_roles:
+                            try:
+                                diag_emails.extend(_get_emails_by_role(r))
+                            except Exception:
+                                pass
+                        diag_emails = sorted({e for e in diag_emails if e})
+                        if diag_emails:
+                            st.success(f"Email test manual dikirim ke {len(diag_emails)} penerima.")
+                            with st.expander("Detail Penerima", expanded=False):
+                                st.write(diag_emails)
+                        else:
+                            st.error("Tidak ada email ditemukan untuk roles yang dipilih. Pastikan user, role, dan active benar.")
             except Exception as e:
                 st.error(f"Gagal mengirim email test: {e}")
+
+    # Panel Diagnostik Role -> Emails
+    st.markdown("---")
+    with st.expander("🩺 Diagnostik Role & Penerima", expanded=False):
+        st.caption("Gunakan panel ini untuk melihat email yang terdeteksi per role sesuai isi sheet users saat ini.")
+        roles_check = st.multiselect("Pilih roles untuk cek", ALLOWED_ROLES, default=["finance","director","superuser"])
+        if st.button("Cek Penerima", key="btn_diag_roles"):
+            rows = []
+            for r in roles_check:
+                try:
+                    emails = _get_emails_by_role(r)
+                except Exception:
+                    emails = []
+                rows.append({"role": r, "jumlah": len(emails), "emails": ", ".join(emails)})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            else:
+                st.info("Tidak ada data untuk roles dipilih.")
 
 
 def _cuti_read_df():
