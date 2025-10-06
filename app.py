@@ -131,6 +131,37 @@ ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 _layout_mode = "wide" if st.session_state.get("user") else "centered"
 st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout=_layout_mode)
 
+# --- Compatibility Helpers (Deprecation safe) ---
+def safe_dataframe(df, *, index=True, height=None, key=None, use_container: bool = True, **kwargs):
+    """Wrapper untuk transisi dari use_container_width -> width='stretch'.
+    Param:
+      - use_container: jika True (default) akan pakai width='stretch'.
+      - kwargs lain diteruskan ke st.dataframe.
+    """
+    try:
+        if use_container:
+            return st.dataframe(df, width='stretch', height=height, hide_index=not index, key=key, **kwargs)
+        else:
+            return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+    except TypeError:
+        # Versi Streamlit lama belum dukung width argumen baru
+        return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+
+def safe_image(image, *, caption=None, clamp=False, channels="RGB", output_format="auto", use_container: bool = True, **kwargs):
+    """Wrapper image untuk hindari width=None invalid di versi baru.
+    - Jika use_container True, kita biarkan Streamlit autosize tanpa mengirim width=None eksplisit.
+    - Jika ada argumen width=None, diabaikan.
+    """
+    if 'width' in kwargs and kwargs['width'] is None:
+        kwargs.pop('width')
+    try:
+        return st.sidebar.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
+    except Exception:
+        try:
+            return st.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
+        except Exception:
+            pass
+
 # Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
 def _enforce_page_title():
     try:
@@ -2839,7 +2870,8 @@ def main():
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    st.sidebar.image(logo_path, width=None)  # width None biarkan auto; use_container_width deprecated
+    # Gunakan helper agar tidak memicu StreamlitInvalidWidthError (hindari width=None eksplisit)
+    safe_image(logo_path)
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Management System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
