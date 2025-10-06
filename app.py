@@ -2414,6 +2414,9 @@ def superuser_panel():
             else:
                 mod_in = sel_mod.strip().lower()
                 filtered_actions = _actions_for_module(mod_in)
+            # Fallback: jika module belum punya action sama sekali (kosong), pakai list kosong dulu (akan jadi hanya (Custom))
+            if not filtered_actions:
+                filtered_actions = []
             # Tambahkan opsi custom di akhir
             filtered_actions_with_custom = filtered_actions + ["(Custom)"]
         with c2:
