@@ -2920,18 +2920,18 @@ def main():
         /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
             width:100% !important;
-            height:10px !important;
-            min-height:10px !important;
+            height:34px !important;
+            min-height:34px !important;
             display:flex !important;
             align-items:center !important;
             justify-content:center !important;
-            font-size:0.95rem !important;
+            font-size:0.88rem !important;
             font-weight:600 !important;
-            padding:0 10px !important;
-            margin:0 0 3px 0 !important;
-            border-radius:6px !important;
+            padding:0 8px !important;
+            margin:0 0 1px 0 !important;
+            border-radius:5px !important;
             line-height:1.0 !important;
-            white-space:normal !important;
+            white-space:nowrap !important;
         }
         .wijna-nav-btn.active-nav > button {
             background:#2563eb !important;
