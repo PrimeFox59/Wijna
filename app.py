@@ -2382,18 +2382,42 @@ def superuser_panel():
     existing_actions = sorted(set(str(a).strip().lower() for a in df_cfg.get('action', []) if a))
     default_modules = sorted({m for (m, _) in NOTIF_ROLE_MAP.keys()})
     module_options = sorted(set(existing_modules) | set(default_modules)) + ["(Custom)"]
-    action_options = sorted(set(existing_actions) | {a for (_, a) in NOTIF_ROLE_MAP.keys()}) + ["(Custom)"]
+    # Action list akan difilter berdasarkan module terpilih
+    # Kumpulkan mapping static per module
+    static_actions_by_module: dict[str, set[str]] = {}
+    for (m, a) in NOTIF_ROLE_MAP.keys():
+        static_actions_by_module.setdefault(m, set()).add(a)
+    # Kumpulkan mapping dynamic per module
+    dynamic_actions_by_module: dict[str, set[str]] = {}
+    if not df_cfg.empty:
+        for _, row in df_cfg.iterrows():
+            m = str(row.get('module','')).strip().lower()
+            a = str(row.get('action','')).strip().lower()
+            if m and a and not m.startswith('__'):
+                dynamic_actions_by_module.setdefault(m, set()).add(a)
+    # Fungsi helper untuk dapat semua actions suatu module
+    def _actions_for_module(mod: str) -> list[str]:
+        acts = set()
+        acts |= static_actions_by_module.get(mod, set())
+        acts |= dynamic_actions_by_module.get(mod, set())
+        return sorted(acts)
 
     with st.form("cfg_add_update", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
-            sel_mod = st.selectbox("Pilih Module", module_options, key="cfg_sel_mod")
+            sel_mod = st.selectbox("Pilih Module", module_options, key="cfg_sel_mod", help="Pilih module. Daftar action di sebelah kanan otomatis difilter sesuai module.")
             if sel_mod == "(Custom)":
                 mod_in = st.text_input("Module Baru", placeholder="misal: cash_advance").strip().lower()
+                # Untuk module custom, kumpulkan semua action unik agar user bisa pilih referensi atau buat baru
+                all_actions_flat = sorted({a for s in static_actions_by_module.values() for a in s} | {a for s in dynamic_actions_by_module.values() for a in s})
+                filtered_actions = all_actions_flat
             else:
                 mod_in = sel_mod.strip().lower()
+                filtered_actions = _actions_for_module(mod_in)
+            # Tambahkan opsi custom di akhir
+            filtered_actions_with_custom = filtered_actions + ["(Custom)"]
         with c2:
-            sel_act = st.selectbox("Pilih Action", action_options, key="cfg_sel_act")
+            sel_act = st.selectbox("Pilih Action", filtered_actions_with_custom, key="cfg_sel_act", help="Action hanya menampilkan yang relevan dengan module terpilih. Gunakan (Custom) untuk menambah baru.")
             if sel_act == "(Custom)":
                 act_in = st.text_input("Action Baru", placeholder="misal: submitted").strip().lower()
             else:
