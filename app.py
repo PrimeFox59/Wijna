@@ -2913,17 +2913,29 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS agar tombol navigasi seragam dan rapi
+    # CSS baru: ukuran tombol seragam (2 kolom) dengan tinggi konsisten
     st.sidebar.markdown(
         """
         <style>
-        .wijna-nav-btn > button {
+        #wijna-nav-area button {
             width: 100% !important;
-            min-height: 42px !important;
-            font-size: 1.05rem !important;
+            height: 50px !important;
+            min-height: 50px !important;
+            padding: 4px 8px !important;
             margin-bottom: 6px !important;
-            border-radius: 6px !important;
+            font-size: 0.95rem !important;
+            font-weight: 600 !important;
+            border-radius: 8px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            line-height: 1.1 !important;
+            white-space: normal !important;
+            text-align: center !important;
         }
+        #wijna-nav-area button:hover {outline: 2px solid rgba(59,130,246,0.35) !important;}
+        #wijna-nav-area [data-testid="column"] {padding-right:4px !important; padding-left:4px !important;}
+        #wijna-nav-area {margin-top:0.25rem;}
         </style>
         """,
         unsafe_allow_html=True
@@ -2931,14 +2943,15 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Navigasi Modul")
+    st.sidebar.markdown('<div id="wijna-nav-area">', unsafe_allow_html=True)
     nav_cols = st.sidebar.columns(2)
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
         with col:
-            btn = st.button(label, key=f"nav_{key}", help=key)
-            if btn:
+            if st.button(label, key=f"nav_{key}", help=key):
                 st.session_state["page"] = key
                 st.rerun()
+    st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     # --- Logout button at the very bottom ---
     if user:
