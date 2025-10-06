@@ -9,6 +9,7 @@ import io
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import json
 import os
 import uuid
 from datetime import datetime, date, timedelta
@@ -32,6 +33,7 @@ SURAT_MASUK_SHEET_NAME = "surat_masuk"
 SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 CONFIG_SHEET_NAME = "config"
 MOU_SHEET_NAME = "mou"
+CASH_ADVANCE_SHEET_NAME = "cash_advance"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -59,6 +61,10 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("auth", "login"): ["superuser"],
     ("auth", "logout"): ["superuser"],
     ("users", "register"): ["superuser"],
+    # Cash Advance events
+    ("cash_advance", "create"): ["finance"],
+    ("cash_advance", "finance_review"): ["director"],
+    ("cash_advance", "director_approval"): ["finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -315,65 +321,6 @@ def verify_password(plain_password: str, hashed_password: str):
     """Memverifikasi password dengan hash yang tersimpan."""
     return pwd_context.verify(plain_password, hashed_password)
 
-# --- Persistent Login Token Helpers ---
-# SECURITY NOTE:
-#   Implementasi ini menggunakan token di query parameter (?auth=...).
-#   Kekurangan: URL bisa tersalin / terbocorkan (history browser, log, sharing).
-#   Untuk produksi lebih aman, pertimbangkan:
-#     1. Simpan token di httpOnly cookie (butuh custom backend / st.experimental_* API).
-#     2. Gunakan token single-use + refresh short-lived.
-#     3. Enkripsi token atau gunakan HMAC dengan secret.
-#   Saat ini cukup untuk kenyamanan internal. Token otomatis kadaluarsa (default 14 hari).
-def _generate_auth_token() -> str:
-    return uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars
-
-def _save_user_token(ws, row_idx: int, token: str, days_valid: int = 14):
-    expires = (now_wib_dt() + timedelta(days=days_valid)).replace(microsecond=0).isoformat()
-    headers = ws.row_values(1)
-    updates = {}
-    if 'auth_token' in headers:
-        updates['auth_token'] = token
-    if 'auth_token_expires' in headers:
-        updates['auth_token_expires'] = expires
-    if updates:
-        _users_update_row(ws, row_idx, updates)
-
-def _clear_user_token(ws, row_idx: int):
-    headers = ws.row_values(1)
-    updates = {}
-    if 'auth_token' in headers:
-        updates['auth_token'] = ''
-    if 'auth_token_expires' in headers:
-        updates['auth_token_expires'] = ''
-    if updates:
-        _users_update_row(ws, row_idx, updates)
-
-def _find_user_by_token(token: str):
-    if not token:
-        return None
-    try:
-        ws, df = _load_users_df()
-        if df.empty:
-            return None
-        if 'auth_token' not in df.columns:
-            return None
-        match = df[df['auth_token'].astype(str) == str(token)]
-        if match.empty:
-            return None
-        row = match.iloc[0]
-        # Validate expiry
-        exp_raw = str(row.get('auth_token_expires', '')).strip()
-        if exp_raw:
-            try:
-                exp_dt = parse_wib(exp_raw) or datetime.fromisoformat(exp_raw)
-                if exp_dt < now_wib_dt():
-                    return None
-            except Exception:
-                return None
-        return ws, row
-    except Exception:
-        return None
-
 def send_notification_email(recipient_email, subject, body):
     """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
     try:
@@ -575,10 +522,7 @@ def ensure_core_sheets():
         spreadsheet = get_spreadsheet()
 
         # Users sheet: create or validate headers only (no full read)
-        users_headers = [
-            "email", "password_hash", "full_name", "role", "created_at", "active",
-            "auth_token", "auth_token_expires"
-        ]
+        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
         users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
 
         # Lightweight check for at least one data row; only read a tiny range
@@ -654,6 +598,14 @@ def ensure_core_sheets():
         ]
         ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
 
+        # Cash Advance sheet
+        ca_headers = [
+            "id", "divisi", "items_json", "totals", "tanggal",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, CASH_ADVANCE_SHEET_NAME, ca_headers)
+
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
         st.error(f"Gagal memastikan sheet inti tersedia: {e}")
@@ -672,66 +624,85 @@ if 'user' not in st.session_state:
 def show_login_page():
     """Menampilkan halaman login dan registrasi."""
     st.header("🔐 Secure App Login")
-    # (Auto-login via token dipindahkan ke main() agar tidak duplikasi.)
     
     with st.sidebar:
         st.subheader("Pilih Aksi")
         action = st.radio(" ", ["Login", "Register"])
 
-    # Koneksi langsung ke worksheet tidak lagi diperlukan di layer UI karena
-    # login/registrasi memakai helper login_user/register_user yang sudah melakukan akses.
-    # Tetap lakukan pengecekan koneksi minimal agar user dapat pesan error lebih awal.
     try:
-        _ = get_spreadsheet().worksheet(USERS_SHEET_NAME)
+        client = get_gsheets_client()
+        spreadsheet = client.open_by_url(SPREADSHEET_URL)
+        worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
     except Exception as e:
-        st.error(f"Tidak dapat terhubung ke Google Sheet (users). Error: {e}")
-        return
+        st.error(f"Tidak dapat terhubung ke Google Sheet. Pastikan file dibagikan dan URL benar. Error: {e}")
+        st.stop()
 
     if action == "Login":
         st.subheader("Login")
         with st.form("login_form"):
-            # Placeholder form elements (email, password) assumed omitted above; we inject remember checkbox
-            if 'remember_me' not in st.session_state:
-                st.session_state.remember_me = True
-            remember = st.checkbox("Ingat saya (tetap login)", value=st.session_state.remember_me, help="Menyimpan sesi login hingga 14 hari atau sampai Anda logout.")
-            st.session_state.remember_me = remember
-            username = st.text_input("Email / Username").strip().lower()
+            username = st.text_input("Username").lower()
             password = st.text_input("Password", type="password")
-            if st.session_state.remember_me:
-                st.caption("Token login akan disimpan di URL (parameter ?auth=...). Jangan bagikan link ini ke orang lain.")
             login_button = st.form_submit_button("Login")
 
             if login_button:
                 if not username or not password:
-                    st.warning("Email/Username dan Password tidak boleh kosong.")
-                else:
-                    ok, msg = login_user(username, password, remember=st.session_state.remember_me)
-                    if ok:
-                        st.success("Login berhasil. Memuat aplikasi…")
+                    st.warning("Username dan Password tidak boleh kosong.")
+                    return
+
+                users_df = pd.DataFrame(worksheet.get_all_records())
+                user_data = users_df[users_df["username"] == username]
+
+                if not user_data.empty:
+                    stored_hash = user_data.iloc[0]["password_hash"]
+                    if verify_password(password, stored_hash):
+                        
+                        # Kirim notifikasi ke seluruh SUPERUSER saat LOGIN
+                        email_subject = "Notifikasi: User Login"
+                        email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
+                        try:
+                            notify_event("auth", "login", email_subject, email_body)
+                        except Exception:
+                            pass
+                        
+                        st.session_state.logged_in = True
+                        st.session_state.username = username
                         st.rerun()
                     else:
-                        st.error(msg)
+                        st.error("Username atau Password salah.")
+                else:
+                    st.error("Username atau Password salah.")
 
     elif action == "Register":
         st.subheader("Buat Akun Baru")
         with st.form("register_form"):
-            reg_email = st.text_input("Email / Username Baru").strip().lower()
-            reg_fullname = st.text_input("Nama Lengkap")
-            reg_password = st.text_input("Password Baru", type="password")
-            reg_password2 = st.text_input("Konfirmasi Password", type="password")
+            new_username = st.text_input("Username Baru").lower()
+            new_password = st.text_input("Password Baru", type="password")
+            confirm_password = st.text_input("Konfirmasi Password", type="password")
             register_button = st.form_submit_button("Register")
 
             if register_button:
-                if not reg_email or not reg_fullname or not reg_password or not reg_password2:
+                if not new_username or not new_password or not confirm_password:
                     st.warning("Semua field harus diisi.")
-                elif reg_password != reg_password2:
+                    return
+                if new_password != confirm_password:
                     st.error("Password tidak cocok.")
+                    return
+                
+                users_df = pd.DataFrame(worksheet.get_all_records())
+                if new_username in users_df["username"].values:
+                    st.error("Username sudah terdaftar. Silakan pilih yang lain.")
                 else:
-                    ok, msg = register_user(reg_email, reg_fullname, reg_password)
-                    if ok:
-                        st.success("Registrasi berhasil! Silakan login.")
-                    else:
-                        st.error(msg)
+                    hashed_pass = hash_password(new_password)
+                    worksheet.append_row([new_username, hashed_pass])
+                    st.success("Registrasi berhasil! Silakan login.")
+
+                    # Kirim notifikasi ke seluruh SUPERUSER saat REGISTRASI
+                    email_subject = "Notifikasi: User Baru Telah Mendaftar"
+                    email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
+                    try:
+                        notify_event("users", "register", email_subject, email_body)
+                    except Exception:
+                        pass
 
 def show_main_app():
     """Menampilkan aplikasi utama setelah user berhasil login."""
@@ -872,25 +843,6 @@ def logout():
             audit_log("auth", "logout", target=user.get("email", ""))
         except Exception:
             pass
-        # Clear token if exists
-        try:
-            ws, df = _load_users_df()
-            email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
-            if email_col:
-                match = df[df[email_col].astype(str).str.lower() == str(user.get('email','')).lower()]
-                if not match.empty:
-                    row_idx = match.index[0] + 2
-                    _clear_user_token(ws, row_idx)
-        except Exception:
-            pass
-        # Remove auth param from URL
-        try:
-            if 'auth' in st.query_params:
-                qp = st.query_params
-                del qp['auth']
-                st.query_params.update(qp)
-        except Exception:
-            pass
     st.session_state.user = None
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -899,10 +851,7 @@ def logout():
 def _load_users_df():
     spreadsheet = get_spreadsheet()
     ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-    users_headers = [
-        "email", "password_hash", "full_name", "role", "created_at", "active",
-        "auth_token", "auth_token_expires"
-    ]
+    users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
     try:
         records = _cached_get_all_records(USERS_SHEET_NAME, users_headers)
     except Exception:
@@ -911,7 +860,7 @@ def _load_users_df():
     return ws, df
 
 
-def login_user(email: str, password: str, remember: bool = False):
+def login_user(email: str, password: str):
     try:
         ws, df = _load_users_df()
         email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
@@ -937,16 +886,6 @@ def login_user(email: str, password: str, remember: bool = False):
         set_current_user(user_obj)
         st.session_state.logged_in = True
         st.session_state.username = user_obj["email"]
-        # If remember me, generate token and store
-        if remember:
-            try:
-                row_idx = row.index[0] + 2  # account for header row (1-based) and zero-based df
-                token = _generate_auth_token()
-                _save_user_token(ws, row_idx, token)
-                # Set query params for future auto-login
-                st.query_params["auth"] = token
-            except Exception:
-                pass
         try:
             notify_event("auth", "login", "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
         except Exception:
@@ -965,10 +904,7 @@ def register_user(email: str, full_name: str, password: str):
     try:
         spreadsheet = get_spreadsheet()
         ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-        users_headers = [
-            "email", "password_hash", "full_name", "role", "created_at", "active",
-            "auth_token", "auth_token_expires"
-        ]
+        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
         try:
             df = pd.DataFrame(_cached_get_all_records(USERS_SHEET_NAME, users_headers))
         except Exception:
@@ -2563,8 +2499,365 @@ def mou_module():
 
 
 def cash_advance_module():
+    user = require_login()
     st.header("💸 Cash Advance")
-    st.info("Module coming soon (Sheets + Drive)")
+
+    # Helpers
+    def _ca_headers():
+        return [
+            "id", "divisi", "items_json", "totals", "tanggal",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
+        ]
+
+    def _ca_ws():
+        try:
+            return _get_ws(CASH_ADVANCE_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            ws = ensure_sheet_with_headers(get_spreadsheet(), CASH_ADVANCE_SHEET_NAME, _ca_headers())
+            return ws
+
+    def _ca_read_df():
+        ws = _ca_ws()
+        headers = _ca_headers()
+        try:
+            records = _cached_get_all_records(CASH_ADVANCE_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        # Ensure required columns
+        for h in headers:
+            if h not in df.columns:
+                df[h] = "" if h not in ("finance_approved", "director_approved") else 0
+        # Normalize numeric approvals
+        for col in ["finance_approved", "director_approved"]:
+            df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0).astype(int)
+        return ws, df
+
+    def _ca_append(row: dict):
+        ws = _ca_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
+
+    def _ca_update_by_id(cid: str, updates: dict):
+        ws = _ca_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(cid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _upload_tor(file) -> tuple[str, str, str] | tuple[None, None, None]:
+        if not file:
+            return None, None, None
+        try:
+            drive = get_gdrive_service()
+            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            meta = {
+                'name': file.name,
+                'parents': [GDRIVE_FOLDER_ID]
+            }
+            created = drive.files().create(body=meta, media_body=media, fields='id, name, webViewLink').execute()
+            file_id = created.get('id')
+            file_link = created.get('webViewLink')
+            return file_id, file.name, file_link
+        except Exception:
+            return None, None, None
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📝 Input Staf",
+        "💰 Review Finance",
+        "✅ Approval Director",
+        "📋 Daftar & Rekap"
+    ])
+
+    # --- Tab 1: Input Staf ---
+    with tab1:
+        st.markdown("### Pengajuan Cash Advance (Staf)")
+        if 'ca_nominals' not in st.session_state:
+            st.session_state['ca_nominals'] = [0.0] * 10
+        items: list[dict] = []
+        nama_program = st.text_input("Nama Program / Divisi", key="ca_divisi")
+
+        import re
+        def format_ribuan(val):
+            if val is None or val == "":
+                return ""
+            val_str = str(val)
+            val_str = re.sub(r'[^\d]', '', val_str)
+            if not val_str:
+                return ""
+            return f"{int(val_str):,}".replace(",", ".")
+
+        for i in range(1, 11):
+            col1, col2 = st.columns([3, 2])
+            with col1:
+                item = st.text_input(f"Item {i}", key=f"ca_item_{i}")
+            with col2:
+                key_nom = f"ca_nom_{i}"
+                val = st.session_state.get(key_nom, "")
+                val_disp = format_ribuan(val)
+                nominal_str = st.text_input(f"Nominal {i}", value=val_disp, key=key_nom)
+                clean_nom = re.sub(r'[^\d]', '', nominal_str)
+                st.session_state['ca_nominals'][i-1] = float(clean_nom) if clean_nom else 0.0
+            if item:
+                items.append({"item": item, "nominal": float(st.session_state['ca_nominals'][i-1])})
+        total = sum(st.session_state['ca_nominals'])
+        tanggal = st.date_input("Tanggal", value=date.today())
+
+        def format_rp(val):
+            return f"Rp. {val:,.0f}".replace(",", ".")
+        st.info(f"Total: {format_rp(total)}")
+        if st.button("Ajukan Cash Advance"):
+            if not nama_program or not items:
+                st.error("Nama Program dan minimal 1 item wajib diisi.")
+            else:
+                cid = gen_id("ca")
+                row = {
+                    "id": cid,
+                    "divisi": nama_program,
+                    "items_json": json.dumps(items),
+                    "totals": total,
+                    "tanggal": tanggal.isoformat(),
+                    "finance_note": "",
+                    "finance_approved": 0,
+                    "director_note": "",
+                    "director_approved": 0,
+                    "tor_file_id": "",
+                    "tor_file_name": "",
+                    "tor_file_link": "",
+                    "created_at": now_wib_iso(),
+                    "updated_at": now_wib_iso(),
+                    "submitted_by": (get_current_user() or {}).get("email", "")
+                }
+                _ca_append(row)
+                try:
+                    audit_log("cash_advance", "create", target=cid, details=f"divisi={nama_program}; total={total}")
+                except Exception:
+                    pass
+                try:
+                    notify_event("cash_advance", "create", subject="Cash Advance Baru", body=f"Pengajuan baru {cid} total {format_rp(total)} oleh {row['submitted_by']}")
+                except Exception:
+                    pass
+                st.success("Cash advance diajukan.")
+                st.session_state['ca_nominals'] = [0.0] * 10
+                st.rerun()
+
+    # --- Tab 2: Review Finance ---
+    with tab2:
+        st.markdown("### Review & Approval Finance")
+        if user.get("role") in ["finance", "superuser"]:
+            _, df_fin = _ca_read_df()
+            if df_fin.empty:
+                st.info("Belum ada pengajuan.")
+            else:
+                # Order by tanggal desc
+                try:
+                    df_fin = df_fin.sort_values(by="tanggal", ascending=False)
+                except Exception:
+                    pass
+                def format_rp(val):
+                    try:
+                        return f"Rp. {float(val):,.0f}".replace(",", ".")
+                    except Exception:
+                        return str(val)
+                for idx, row in df_fin.iterrows():
+                    title = f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"
+                    with st.expander(title):
+                        items = []
+                        try:
+                            items = json.loads(row.get('items_json') or "[]")
+                        except Exception:
+                            items = []
+                        if items:
+                            df_items = pd.DataFrame(items)
+                            if 'nominal' in df_items.columns:
+                                df_items['nominal'] = df_items['nominal'].apply(format_rp)
+                            st.dataframe(df_items, width='stretch')
+                        st.write(f"Catatan Finance: {row.get('finance_note','')}")
+                        note = st.text_area("Catatan Finance", value=row.get('finance_note',''), key=f"fin_note_{row['id']}")
+                        tor_file = st.file_uploader("Upload File ToR (jika ada)", key=f"tor_{row['id']}")
+                        colA, colB = st.columns(2)
+                        with colA:
+                            approve = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                        with colB:
+                            return_user = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                        if approve:
+                            tor_note = ""
+                            if tor_file:
+                                fid, fname, flink = _upload_tor(tor_file)
+                                if fid:
+                                    tor_note = f"\n[ToR diupload: {fname}]"
+                                    _ca_update_by_id(row['id'], {
+                                        "tor_file_id": fid,
+                                        "tor_file_name": fname,
+                                        "tor_file_link": flink,
+                                    })
+                            _ca_update_by_id(row['id'], {
+                                "finance_note": note + tor_note,
+                                "finance_approved": 1,
+                                "updated_at": now_wib_iso(),
+                            })
+                            try:
+                                audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=1; note={note}")
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("cash_advance", "finance_review", subject="Cash Advance ke Director", body=f"Pengajuan {row['id']} diajukan ke Director")
+                            except Exception:
+                                pass
+                            st.success("Diajukan ke Director.")
+                            st.rerun()
+                        if return_user:
+                            _ca_update_by_id(row['id'], {
+                                "finance_note": note + "\n[Perlu revisi oleh user]",
+                                "finance_approved": 0,
+                                "updated_at": now_wib_iso(),
+                            })
+                            try:
+                                audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                            except Exception:
+                                pass
+                            st.warning("Dikembalikan ke user peminta.")
+                            st.rerun()
+        else:
+            st.info("Hanya Finance yang dapat review di sini.")
+
+    # --- Tab 3: Approval Director ---
+    with tab3:
+        st.markdown("### Approval Director Cash Advance")
+        if user.get("role") in ["director", "superuser"]:
+            _, df_dir = _ca_read_df()
+            if df_dir.empty:
+                st.info("Belum ada pengajuan.")
+            else:
+                try:
+                    df_dir = df_dir.sort_values(by="tanggal", ascending=False)
+                except Exception:
+                    pass
+                for idx, row in df_dir.iterrows():
+                    with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {float(row.get('totals',0)) :,.0f}".replace(",", ".")):
+                        items = []
+                        try:
+                            items = json.loads(row.get('items_json') or "[]")
+                        except Exception:
+                            pass
+                        if items:
+                            st.dataframe(pd.DataFrame(items), width='stretch')
+                        st.write(f"Finance Approved: {'Ya' if row.get('finance_approved') else 'Belum'}")
+                        st.write(f"Catatan Director: {row.get('director_note','')}")
+                        note = st.text_area("Catatan Director", value=row.get('director_note',''), key=f"dir_note_{row['id']}")
+                        approve = st.checkbox("Approve Director", value=bool(row.get('director_approved')), key=f"dir_app_{row['id']}")
+                        if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                            _ca_update_by_id(row['id'], {
+                                "director_note": note,
+                                "director_approved": 1 if approve else 0,
+                                "updated_at": now_wib_iso(),
+                            })
+                            try:
+                                audit_log("cash_advance", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("cash_advance", "director_approval", subject="Cash Advance Director", body=f"Director update untuk {row['id']} approve={bool(approve)}")
+                            except Exception:
+                                pass
+                            st.success("Approval Director disimpan.")
+                            st.rerun()
+        else:
+            st.info("Hanya Director yang dapat approve di sini.")
+
+    # --- Tab 4: Daftar & Rekap ---
+    with tab4:
+        st.markdown("### Daftar & Rekap Cash Advance")
+        _, df_all = _ca_read_df()
+        if df_all.empty:
+            st.info("Belum ada data.")
+            return
+        df_all['status'] = df_all.apply(lambda x: 'Cair' if x.get('finance_approved') and x.get('director_approved') else 'Proses', axis=1)
+        # Filter UI
+        with st.container():
+            col_div, col_status, col_tgl = st.columns([2,2,3])
+            with col_div:
+                divisi_list = ["Semua"] + sorted(set(str(v) for v in df_all['divisi'].dropna().unique().tolist()))
+                filter_divisi = st.selectbox("Filter Divisi", divisi_list)
+            with col_status:
+                status_list = ["Semua", "Cair", "Proses"]
+                filter_status = st.selectbox("Status", status_list)
+            with col_tgl:
+                try:
+                    df_all['tanggal_dt'] = pd.to_datetime(df_all['tanggal'], errors='coerce')
+                except Exception:
+                    df_all['tanggal_dt'] = pd.NaT
+                min_tgl = df_all['tanggal_dt'].min() if not df_all.empty else date.today()
+                max_tgl = df_all['tanggal_dt'].max() if not df_all.empty else date.today()
+                if pd.isna(min_tgl):
+                    min_tgl = date.today()
+                if pd.isna(max_tgl):
+                    max_tgl = date.today()
+                filter_tgl = st.date_input("Tanggal", value=(min_tgl.date() if hasattr(min_tgl, 'date') else min_tgl, max_tgl.date() if hasattr(max_tgl, 'date') else max_tgl))
+
+        dff = df_all.copy()
+        if filter_divisi != "Semua":
+            dff = dff[dff['divisi'] == filter_divisi]
+        if filter_status != "Semua":
+            dff = dff[dff['status'] == filter_status]
+        if filter_tgl and isinstance(filter_tgl, tuple) and len(filter_tgl) == 2:
+            tgl_start, tgl_end = filter_tgl
+            try:
+                dff = dff[(pd.to_datetime(dff['tanggal']) >= pd.to_datetime(tgl_start)) & (pd.to_datetime(dff['tanggal']) <= pd.to_datetime(tgl_end))]
+            except Exception:
+                pass
+
+        show_cols = ["id", "divisi", "totals", "tanggal", "finance_approved", "director_approved", "status"]
+        st.dataframe(dff[show_cols], width='stretch', hide_index=True)
+
+        # Rekap Bulanan
+        st.markdown("#### Rekap Bulanan Cash Advance (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        try:
+            df_month = dff[dff['tanggal'].astype(str).str[:7] == this_month]
+        except Exception:
+            df_month = pd.DataFrame(columns=dff.columns)
+        st.write(f"Jumlah pengajuan bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            try:
+                by_div = df_month.groupby('divisi').agg({'id': 'count', 'totals': 'sum'}).rename(columns={'id': 'jumlah_pengajuan', 'totals': 'total_nominal'})
+                st.write("Rekap per Divisi:")
+                st.dataframe(by_div, width='stretch')
+                approved = df_month[(df_month['finance_approved'] == 1) & (df_month['director_approved'] == 1)]
+                pending = df_month[(df_month['finance_approved'] == 0) | (df_month['director_approved'] == 0)]
+                st.write(f"Approved (Cair): {len(approved)} | Pending: {len(pending)}")
+            except Exception:
+                st.warning("Gagal menghitung rekap bulanan.")
 
 
 def pmr_module():
@@ -3442,32 +3735,6 @@ def main():
     ensure_core_sheets()
     # --- Sidebar Logo ---
     user = get_current_user()
-    # Auto-login via auth token in query params (if present and not already logged in)
-    if not user:
-        try:
-            token = st.query_params.get("auth") if hasattr(st, 'query_params') else None
-            if token:
-                found = _find_user_by_token(token)
-                if found:
-                    ws_token, row = found
-                    # Build user object
-                    user_obj = {
-                        "email": row.get("email") or row.get("username"),
-                        "full_name": row.get("full_name", ""),
-                        "role": str(row.get("role", "user")).lower() or "user",
-                        "active": int(row.get("active", 1)) if str(row.get("active", 1)).isdigit() else 1,
-                    }
-                    if user_obj["active"]:
-                        set_current_user(user_obj)
-                        st.session_state.logged_in = True
-                        st.session_state.username = user_obj["email"]
-                        user = user_obj
-                        try:
-                            audit_log("auth", "auto_login", target=user_obj["email"], details="via token")
-                        except Exception:
-                            pass
-        except Exception:
-            pass
     if not user:
         # --- Full page login/register, no sidebar ---
         st.markdown("""
