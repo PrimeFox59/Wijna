@@ -3119,18 +3119,15 @@ def main():
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
         with col:
-            active_class = 'active-nav' if st.session_state.get("page") == key else ''
-            st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
-            clicked = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            if clicked:
+            btn = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            if btn:
                 st.session_state["page"] = key
                 st.rerun()
 
     # --- Logout button at the very bottom ---
     if user:
         st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
-    if st.sidebar.button("Logout", key="sidebar_logout"): 
+        if st.sidebar.button("Logout", key="sidebar_logout", use_container_width=True):
             logout()
             st.rerun()
 
