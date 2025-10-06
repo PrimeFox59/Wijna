@@ -64,21 +64,21 @@ CREATE_ACCESS: dict[str, set[str]] = {
     # (Menu: "💸 Cash Advance")
     "cash_advance": {"staff", "finance", "director", "superuser"},
     # (Menu: "📑 PMR")
-    "pmr": {"staff", "finance", "director", "superuser"},
+    "PMR": {"staff", "finance", "director", "superuser"},
     # (Menu: "🌴 Cuti")
     "cuti": {"staff", "finance", "director", "superuser"},
     # (Menu: "⏰ Flex Time")
-    "flex": {"staff", "finance", "director", "superuser"},
+    "Flex Time": {"staff", "finance", "director", "superuser"},
     # (Menu: "📝 Delegasi")
-    "delegasi": {"staff", "finance", "director", "superuser"},
+    "Delegasi": {"staff", "finance", "director", "superuser"},
     # (Menu: "🚗 Mobil Kantor") – sebelumnya key terpisah calendar_mobil
-    "mobil": {"finance", "director", "superuser"},
+    "Mobil Kantor": {"finance", "director", "superuser"},
     # (Menu: "📅 Kalender Bersama") – sebelumnya calendar_libur (hanya director & superuser yang dapat buat event/libur)
-    "calendar": {"director", "superuser"},
+    "Kalender Bersama": {"director", "superuser"},
     # (Menu: "📚 SOP")
-    "sop": {"director", "superuser"},
+    "SOP": {"director", "superuser"},
     # (Menu: "🗒️ Notulen") – finance tidak input notulen
-    "notulen": {"staff", "director", "superuser"},
+    "Notulen": {"staff", "director", "superuser"},
 }
 
 def can_create(module_key: str, user: dict | None) -> bool:
