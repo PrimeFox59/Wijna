@@ -6,202 +6,710 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
-import io, smtplib, json, os, uuid, time, threading
+import io
+import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, date, timedelta, timezone
-try:  # Python 3.9+: zoneinfo
+import json
+import os
+import uuid
+from datetime import datetime, date, timedelta
+import time
+from datetime import timezone
+try:
+    # Python 3.9+: zoneinfo
     from zoneinfo import ZoneInfo  # type: ignore
 except Exception:  # pragma: no cover
-    ZoneInfo = None
+    ZoneInfo = None  # Fallback; we will manually offset
+import threading
 
-# ==== STUB / FALLBACK DEFINITIONS (prevent NameError & indentation corruption) ====
-# NOTE: Replace these stub constants and functions with actual implementations
-# elsewhere in the file or merge duplicates if they already exist later.
+# --- 1. KONFIGURASI APLIKASI ---
+# PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
+GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
+USERS_SHEET_NAME = "users"
+CUTI_SHEET_NAME = "cuti"
+AUDIT_SHEET_NAME = "audit_log"
+INVENTORY_SHEET_NAME = "inventory"
+SURAT_MASUK_SHEET_NAME = "surat_masuk"
+SURAT_KELUAR_SHEET_NAME = "surat_keluar"
+CONFIG_SHEET_NAME = "config"
+MOU_SHEET_NAME = "mou"
+CASH_ADVANCE_SHEET_NAME = "cash_advance"
+PMR_SHEET_NAME = "pmr"
+DELEGASI_SHEET_NAME = "delegasi"
+FLEX_SHEET_NAME = "flex"
+MOBIL_SHEET_NAME = "mobil"
+CALENDAR_SHEET_NAME = "calendar"
+PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
+NOTULEN_SHEET_NAME = "notulen"
+SOP_SHEET_NAME = "sop"
+SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
+# ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
+# pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
+# khusus (misal selalu kirim ke tim IT), isi dengan alamat distribution list.
+ADMIN_EMAIL_RECIPIENT = ""
+ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser", "board"]
 
-# Sheet name constants (define if not yet defined later)
-DEFAULT_SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL", "")
-SPREADSHEET_URL = DEFAULT_SPREADSHEET_URL
-USERS_SHEET_NAME = 'users'
-MOU_SHEET_NAME = 'mou'
-CASH_ADVANCE_SHEET_NAME = 'cash_advance'
-PMR_SHEET_NAME = 'pmr'
-DELEGASI_SHEET_NAME = 'delegasi'
-FLEX_SHEET_NAME = 'flex'
-MOBIL_SHEET_NAME = 'mobil'
-CALENDAR_SHEET_NAME = 'calendar'
-PUBLIC_HOLIDAYS_SHEET_NAME = 'public_holidays'
-NOTULEN_SHEET_NAME = 'notulen'
-SOP_SHEET_NAME = 'sop'
-AUDIT_SHEET_NAME = 'audit_log'
-CONFIG_SHEET_NAME = 'config'
-CUTI_SHEET_NAME = 'cuti'
-INVENTORY_SHEET_NAME = 'inventory'
-SURAT_MASUK_SHEET_NAME = 'surat_masuk'
-SURAT_KELUAR_SHEET_NAME = 'surat_keluar'
+# Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
+# Catatan: superuser selalu otomatis ditambahkan oleh helper.
+# Tambahkan / ubah sesuai kebutuhan bisnis Anda.
+NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
+    ("inventory", "create"): ["finance"],
+    ("inventory", "finance_review"): ["director"],
+    ("inventory", "director_approved"): ["finance"],  # misal informasikan balik ke finance
+    ("inventory", "director_reject"): ["finance"],
+    ("surat_masuk", "draft"): ["director"],
+    ("surat_masuk", "director_approved"): ["finance"],
+    ("surat_keluar", "draft"): ["director"],
+    ("surat_keluar", "final_upload"): ["finance"],
+    ("cuti", "submit"): ["finance"],
+    ("cuti", "finance_review"): ["director"],
+    ("cuti", "director_approved"): ["finance"],
+    ("cuti", "director_reject"): ["finance"],
+    # Auth events
+    ("auth", "login"): ["superuser"],
+    ("auth", "logout"): ["superuser"],
+    ("users", "register"): ["superuser"],
+    # Cash Advance events
+    ("cash_advance", "create"): ["finance"],
+    ("cash_advance", "finance_review"): ["director"],
+    ("cash_advance", "director_approval"): ["finance"],
+    # PMR events
+    ("pmr", "upload"): ["finance"],
+    ("pmr", "finance_review"): ["director"],
+    ("pmr", "director_approval"): ["finance"],
+    # Delegasi events
+    ("delegasi", "create"): ["director"],
+    ("delegasi", "update"): ["director"],
+    # Flex Time events
+    ("flex", "create"): ["finance"],
+    ("flex", "finance_review"): ["director"],
+    ("flex", "director_approval"): ["finance"],
+    # Mobil events
+    ("mobil", "create"): ["finance"],
+    ("mobil", "update"): ["finance", "director"],
+    ("mobil", "delete"): ["finance"],
+    # Calendar events
+    ("calendar", "add_holiday"): ["director"],
+    # Notulen events
+    ("notulen", "upload"): ["director"],
+    ("notulen", "director_approval"): ["staff", "finance"],  # optional broadcast; uploader akan tetap dapat email jika masuk role
+    # SOP events
+    ("sop", "upload"): ["director"],
+    ("sop", "director_approval"): ["staff", "finance"],
+    # MoU due soon automatic alert
+    ("mou", "due_soon"): ["director", "finance"],
+}
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str) -> str:
-    try: return pwd_context.hash(password)
-    except Exception: return password
-
-def verify_password(password: str, hashed: str) -> bool:
-    try: return pwd_context.verify(password, hashed)
-    except Exception: return password == hashed
-
-def get_gsheets_client():  # minimal stub
-    # Actual implementation should authenticate via service account
-    # Returning a dummy object if credentials missing will raise later when used
-    creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
-    if creds_json:
-        info = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
-        return gspread.authorize(creds)
-    raise RuntimeError("Google Sheets credentials not configured")
-
-def ensure_sheet_with_headers(spreadsheet, sheet_name: str, headers: list):  # placeholder
-    try:
-        try:
-            ws = spreadsheet.worksheet(sheet_name)
-        except Exception:
-            ws = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=max(10, len(headers)+2))
-        existing = ws.row_values(1)
-        if existing != headers:
-            ws.update('1:1', [headers])
-        return ws
-    except Exception:
-        return None
-
-def notify_event(module: str, event: str, subject: str, body: str):  # stub notifier
-    # Replace with real notification dispatch (email / chat) later
-    print(f"[NOTIFY] {module}.{event}: {subject}")
-
-def now_wib_iso() -> str:
-    tz = ZoneInfo("Asia/Jakarta") if ZoneInfo else None
-    dt = datetime.now(tz if tz else timezone.utc) + (timedelta(hours=7) if not tz else timedelta())
-    return dt.isoformat(timespec='seconds')
-
-def _cached_get_all_records(sheet_name: str, headers: list):  # lightweight in-memory cache stub
-    key = f"_cache_{sheet_name}"
-    if key in st.session_state:
-        return st.session_state[key]
-    try:
-        client = get_gsheets_client()
-        ss = client.open_by_url(SPREADSHEET_URL)
-        ws = ss.worksheet(sheet_name)
-        rows = ws.get_all_records()
-        st.session_state[key] = rows
-        return rows
-    except Exception:
-        return []
-
-def _invalidate_data_cache(sheet_name: str=None):
-    if sheet_name:
-        st.session_state.pop(f"_cache_{sheet_name}", None)
-    else:
-        for k in list(st.session_state.keys()):
-            if k.startswith("_cache_"):
-                st.session_state.pop(k, None)
-
-def ensure_core_sheets():
-    """Wrapper that was previously indented incorrectly at top of file."""
-    try:
-        client = get_gsheets_client()
-        ss = client.open_by_url(SPREADSHEET_URL)
-        # MOU
-        mou_headers = [
-            "id","nomor","nama","pihak","tgl_mulai","tgl_selesai","kategori","nilai","status",
-            "finance_note","finance_approved","director_note","director_approved","board_note","board_approved",
-            "final_file_id","final_file_name","final_file_link","due_notified","created_at","updated_at","submitted_by"
-        ]
-        ensure_sheet_with_headers(ss, MOU_SHEET_NAME, mou_headers)
-        # Additional sheets can be created lazily elsewhere; we just mark done.
-        st.session_state["_core_sheets_ok"] = True
-    except Exception as e:
-        st.warning(f"Tidak dapat memastikan sheet inti: {e}")
-
-# Additional placeholder utilities (prevent NameError until real implementations below)
-ADMIN_EMAIL_RECIPIENT = os.environ.get("ADMIN_EMAIL_RECIPIENT", "admin@example.com")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
-NOTIF_ROLE_MAP = {}
-ALLOWED_ROLES = ["user","finance","director","superuser"]
-
-_SPREADSHEET_CACHE_KEY = "_cached_spreadsheet_obj"
-
-def get_spreadsheet():
-    """Return the gspread Spreadsheet object.
-
-    Uses SPREADSHEET_URL if set; optionally supports SPREADSHEET_KEY env var.
-    Caches the Spreadsheet in st.session_state to avoid repeated open calls.
-    Raises a RuntimeError with a friendly message if credentials or URL missing.
+@st.cache_data(ttl=60, show_spinner=False)
+def load_config_notif_map() -> dict[tuple[str, str], list[str]]:
+    """Load dynamic notification role mapping from config sheet.
+    Sheet schema: module | action | roles | active | updated_at | updated_by
+    - roles: comma-separated roles, e.g. "finance,director"
+    - active: 1/0 or TRUE/FALSE; only active==1 considered
+    Returns dict with (module, action) => [roles]
     """
-    if _SPREADSHEET_CACHE_KEY in st.session_state:
-        return st.session_state[_SPREADSHEET_CACHE_KEY]
-    url = SPREADSHEET_URL.strip()
-    key = os.environ.get("SPREADSHEET_KEY", "").strip()
-    if not url and key:
-        url = f"https://docs.google.com/spreadsheets/d/{key}"
-    if not url:
-        raise RuntimeError("SPREADSHEET_URL (atau SPREADSHEET_KEY) belum dikonfigurasi")
+    mapping: dict[tuple[str, str], list[str]] = {}
     try:
-        client = get_gsheets_client()
-        ss = client.open_by_url(url)
-        st.session_state[_SPREADSHEET_CACHE_KEY] = ss
-        return ss
-    except Exception as e:
-        raise RuntimeError(f"Gagal membuka spreadsheet: {e}")
+        ws = _get_ws(CONFIG_SHEET_NAME)
+        records = ws.get_all_records()
+        for rec in records:
+            try:
+                mod = str(rec.get("module", "")).strip().lower()
+                act = str(rec.get("action", "")).strip().lower()
+                roles_raw = str(rec.get("roles", "")).strip()
+                active_val = str(rec.get("active", "1")).strip().lower()
+                if not mod or not act or not roles_raw:
+                    continue
+                if active_val not in ("1", "true", "yes", "y"):  # treat others as inactive
+                    continue
+                roles_list = [r.strip().lower() for r in roles_raw.split(',') if r.strip()]
+                if not roles_list:
+                    continue
+                mapping[(mod, act)] = roles_list
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return mapping
 
-def is_superuser_auto_enabled():
-    return True
+def notify_event(module: str, action: str, subject: str, body: str, roles: list[str] | None = None):
+    """Kirim notifikasi email berbasis module & action.
+    - roles: override manual; bila None akan lookup NOTIF_ROLE_MAP.
+    - superuser + ADMIN_EMAIL_RECIPIENT ditambahkan otomatis oleh _notify_roles.
+    - Diam (silent) jika tidak ada peran terpetakan.
+    """
+    try:
+        if roles is not None:
+            target_roles = roles
+        else:
+            # First try dynamic config sheet
+            dyn_map = load_config_notif_map()
+            target_roles = dyn_map.get((module.lower(), action.lower()))
+            if not target_roles:
+                # fallback to static default
+                target_roles = NOTIF_ROLE_MAP.get((module, action), [])
+        if not target_roles or not isinstance(target_roles, list):
+            return
+        _notify_roles(list(set(target_roles)), subject, body)
+    except Exception:
+        pass
 
-def load_config_notif_map():
+def _load_settings_row() -> dict:
+    """Read special settings row from config sheet where module='__settings__'. Returns dict."""
+    try:
+        ws = _get_ws(CONFIG_SHEET_NAME)
+        records = ws.get_all_records()
+        for rec in records:
+            if str(rec.get("module", "")).strip().lower() == "__settings__":
+                return rec
+    except Exception:
+        return {}
     return {}
 
-def get_gdrive_service():
-    # Minimal stub; real implementation should authenticate Drive API
-    creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
-    if not creds_json:
-        raise RuntimeError("Drive credentials missing")
-    info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"])
-    return build('drive','v3', credentials=creds)
-
-def send_notification_email(to_list, subject, body):
-    print(f"[EMAIL] to={to_list} subj={subject}")
-
-def send_notification_bulk(messages):
-    for m in messages:
-        print(f"[BULK_NOTIFY] {m}")
-
-def _send_async(func, *args, **kwargs):
-    th = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
-    th.start()
-
-def safe_dataframe(df: pd.DataFrame, **kwargs):
+@st.cache_data(ttl=60, show_spinner=False)
+def is_superuser_auto_enabled() -> bool:
+    """Check settings to decide whether superuser auto inclusion is active. Default True if not set."""
+    row = _load_settings_row()
+    val = str(row.get("superuser_auto", "1")) if row else "1"
+    return val.strip().lower() in ("1", "true", "yes", "y")
+ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
+# --- Timezone Helpers (WIB GMT+07:00) ---
+WIB_OFFSET = 7  # hours
+WIB_TZ = None
+if ZoneInfo:
     try:
-        st.dataframe(df, **kwargs)
+        WIB_TZ = ZoneInfo("Asia/Jakarta")
     except Exception:
-        st.write(df.head())
+        WIB_TZ = None
 
-def safe_image(path: str, **kwargs):
-    """Display an image if available; fallback to a simple placeholder message.
+# All application timestamps are standardized to WIB (UTC+07:00) via now_wib_dt()/now_wib_iso().
+# IMPORTANT:
+#  - Always call now_wib_iso() for storing a timestamp (avoid direct datetime.utcnow()).
+#  - Historical rows may still contain naive UTC timestamps from before migration; treat
+#    them as legacy if you need to normalize. New writes are WIB localized.
+#  - Microseconds are stripped for consistency and easier filtering/comparison in Sheets.
+#  - If a timestamp stored has no timezone info, we assume it's already WIB.
 
-    Parameters
-    ----------
-    path : str
-        Local file path to image.
-    **kwargs : Any
-        Forwarded to st.image.
+def now_wib_dt() -> datetime:
+    """Return current datetime in WIB (UTC+7) tz-aware if possible."""
+    if WIB_TZ:
+        return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(WIB_TZ)
+    # Manual offset fallback
+    return datetime.utcnow() + timedelta(hours=WIB_OFFSET)
+
+def now_wib_iso() -> str:
+    dt = now_wib_dt()
+    # Standardize ISO without microseconds for consistency
+    return dt.replace(microsecond=0).isoformat()
+
+def parse_wib(ts: str) -> datetime | None:
+    """Parse ISO timestamp string into a datetime in WIB.
+
+    Behavior:
+      - If ts has TZ info, convert to WIB (Asia/Jakarta if available else fixed offset).
+      - If ts is naive, assume it is already WIB (post-migration convention).
+      - Returns None if parsing fails.
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # Assume already WIB
+        if WIB_TZ:
+            return dt.replace(tzinfo=WIB_TZ)
+        return dt  # naive but treated as WIB
+    # Convert to WIB
+    if WIB_TZ:
+        return dt.astimezone(WIB_TZ)
+    # Fallback fixed offset
+    return dt.astimezone(timezone(timedelta(hours=WIB_OFFSET)))
+# Use centered layout on login screen; switch to wide after user logs in.
+_layout_mode = "wide" if st.session_state.get("user") else "centered"
+st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout=_layout_mode)
+
+# --- Compatibility Helpers (Deprecation safe) ---
+def safe_dataframe(df, *, index=True, height=None, key=None, use_container: bool = True, **kwargs):
+    """Wrapper untuk transisi dari use_container_width -> width='stretch'.
+    Param:
+      - use_container: jika True (default) akan pakai width='stretch'.
+      - kwargs lain diteruskan ke st.dataframe.
     """
     try:
-        if path and os.path.exists(path):
-            st.image(path, **kwargs)
+        # Bangun argumen dinamis agar tidak mengirim height=None (menyebabkan StreamlitInvalidHeightError di versi baru)
+        df_args = {}
+        if height is not None:
+            df_args['height'] = height
+        if use_container:
+            # Versi baru menerima width='stretch'; jika tidak didukung akan ditangkap oleh except TypeError
+            return st.dataframe(df, width='stretch', hide_index=not index, key=key, **df_args, **kwargs)
         else:
-            st.write("(logo tidak ditemukan)")
-    except Exception as e:
-        st.write(f"Gagal menampilkan gambar: {e}")
+            return st.dataframe(df, hide_index=not index, key=key, **df_args, **kwargs)
+    except TypeError:
+        # Versi Streamlit lama belum dukung width argumen baru
+        if height is not None:
+            return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
+        return st.dataframe(df, hide_index=not index, key=key, **kwargs)
 
+def safe_image(image, *, caption=None, clamp=False, channels="RGB", output_format="auto", use_container: bool = True, **kwargs):
+    """Wrapper image untuk hindari width=None invalid di versi baru.
+    - Jika use_container True, kita biarkan Streamlit autosize tanpa mengirim width=None eksplisit.
+    - Jika ada argumen width=None, diabaikan.
+    """
+    if 'width' in kwargs and kwargs['width'] is None:
+        kwargs.pop('width')
+    try:
+        return st.sidebar.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
+    except Exception:
+        try:
+            return st.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
+        except Exception:
+            pass
+
+# Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
+def _enforce_page_title():
+    try:
+        import streamlit.components.v1 as components
+        components.html(
+            "<script>window.parent.document.title = 'WIJNA Management System';</script>",
+            height=0,
+        )
+    except Exception:
+        # Non-blocking; fall back to set_page_config title
+        pass
+
+_enforce_page_title()
+
+
+# --- 2. FUNGSI KONEKSI & AUTENTIKASI ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+@st.cache_resource
+def get_credentials():
+    """Membuat object credentials dari secrets."""
+    creds_dict = st.secrets["connections"]["gsheets"]
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+    )
+    return creds
+
+@st.cache_resource
+def get_gsheets_client():
+    """Membuat client untuk gspread menggunakan credentials."""
+    creds = get_credentials()
+    client = gspread.authorize(creds)
+    return client
+
+@st.cache_resource
+def get_gdrive_service():
+    """Membuat service untuk Google Drive API menggunakan credentials."""
+    creds = get_credentials()
+    service = build('drive', 'v3', credentials=creds)
+    return service
+
+
+@st.cache_resource
+def get_spreadsheet():
+    """Cache object Spreadsheet untuk menghindari open_by_url berulang."""
+    client = get_gsheets_client()
+    return client.open_by_url(SPREADSHEET_URL)
+
+
+@st.cache_data(ttl=60, show_spinner=False, max_entries=64)
+def _cached_get_all_records(sheet_name: str, expected_headers: list | None = None):
+    """Ambil seluruh records dari sebuah sheet dengan cache dan retry ringan.
+    - ttl 60s untuk mengurangi beban read
+    - expected_headers bila disediakan akan memaksa mapping kolom
+    """
+    ws = get_spreadsheet().worksheet(sheet_name)
+    # Retry ringan untuk 429/5xx
+    for i in range(3):
+        try:
+            if expected_headers is not None:
+                return ws.get_all_records(expected_headers=expected_headers)
+            return ws.get_all_records()
+        except gspread.exceptions.APIError as e:
+            msg = str(e)
+            if any(code in msg for code in ["429", "500", "503"]):
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise
+    # Fallback terakhir tanpa mapping
+    return ws.get_all_records()
+
+
+def _invalidate_data_cache():
+    """Invalidasi cache data sheet (dipanggil setelah operasi tulis)."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+# --- 3. FUNGSI HELPER & UTILITAS ---
+def hash_password(password: str):
+    """Mengubah password plain text menjadi hash."""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str):
+    """Memverifikasi password dengan hash yang tersimpan."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def send_notification_email(recipient_email, subject, body):
+    """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
+    try:
+        creds = st.secrets.get("email_credentials", {})
+        sender_email = (creds.get("username") or "").strip()
+        sender_password = (creds.get("app_password") or "").strip()
+        if not sender_email or not sender_password:
+            st.toast("Konfigurasi email tidak lengkap (username/app_password).")
+            return False
+
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = recipient_email
+        message["Subject"] = subject
+        message.attach(MIMEText(body or "", "plain"))
+
+        # Coba TLS 587 kemudian fallback ke SSL 465 jika gagal
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+                    server.ehlo()
+                    server.starttls()
+                    server.login(sender_email, sender_password)
+                else:
+                    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+                    server.login(sender_email, sender_password)
+                server.send_message(message)
+                server.quit()
+                st.toast(f"📧 Notifikasi email terkirim ke {recipient_email}")
+                return True
+            except Exception as inner_e:
+                if attempt == 1:
+                    raise inner_e
+                # tunggu sebentar lalu coba SSL
+                try:
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+        return False
+    except Exception as e:
+        st.toast(f"Gagal mengirim email: {e}")
+        return False
+
+def send_notification_bulk(recipients: list[str], subject: str, body: str) -> tuple[int, int]:
+    """Kirim email ke banyak penerima dalam satu sesi SMTP untuk performa lebih baik.
+    Return: (jumlah_terkirim, total_penerima)
+    Catatan: Fungsi ini tidak menampilkan toast per penerima untuk menghindari lag.
+    """
+    try:
+        # Normalisasi dan dedupe
+        recipients = sorted({(e or "").strip() for e in recipients if (e or "").strip()})
+        total = len(recipients)
+        if total == 0:
+            return 0, 0
+
+        creds = st.secrets.get("email_credentials", {})
+        sender_email = (creds.get("username") or "").strip()
+        sender_password = (creds.get("app_password") or "").strip()
+        if not sender_email or not sender_password:
+            return 0, total
+
+        def build_msg(to_addr: str):
+            msg = MIMEMultipart()
+            msg["From"] = sender_email
+            msg["To"] = to_addr or "Undisclosed recipients"
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body or "", "plain"))
+            return msg
+
+        sent = 0
+        # 1) Coba TLS 587 dahulu
+        try:
+            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+            try:
+                server.ehlo()
+                server.starttls()
+                server.login(sender_email, sender_password)
+                for rcpt in recipients:
+                    try:
+                        server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
+                        sent += 1
+                    except Exception:
+                        # lanjut ke penerima berikutnya
+                        pass
+            finally:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+            return sent, total
+        except Exception:
+            # 2) Fallback SSL 465
+            try:
+                server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+                try:
+                    server.login(sender_email, sender_password)
+                    for rcpt in recipients:
+                        try:
+                            server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
+                            sent += 1
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
+                return sent, total
+            except Exception:
+                return 0, total
+    except Exception:
+        return 0, 0
+
+def _send_async(func, *args, **kwargs):
+    """Jalankan fungsi di background thread agar UI tidak menunggu I/O jaringan."""
+    try:
+        t = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+    except Exception:
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            pass
+
+def initialize_users_sheet():
+    """Memastikan sheet 'users' ada dan berisi user default 'admin'."""
+    try:
+        client = get_gsheets_client()
+        spreadsheet = client.open_by_url(SPREADSHEET_URL)
+        
+        try:
+            worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
+            df = pd.DataFrame(worksheet.get_all_records())
+        except gspread.WorksheetNotFound:
+            st.info(f"Sheet '{USERS_SHEET_NAME}' tidak ditemukan. Membuat sheet baru...")
+            worksheet = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows="100", cols="2")
+            headers = ["username", "password_hash"]
+            worksheet.append_row(headers)
+            st.success(f"Sheet '{USERS_SHEET_NAME}' berhasil dibuat.")
+            df = pd.DataFrame(columns=headers)
+
+        if df.empty or 'admin' not in df['username'].values:
+            st.info("User default 'admin' tidak ditemukan. Membuat user...")
+            hashed_admin_pass = hash_password('admin')
+            worksheet.append_row(['admin', hashed_admin_pass])
+            st.success("User default 'admin' dengan password 'admin' berhasil ditambahkan.")
+    except Exception as e:
+        st.error(f"Gagal inisialisasi Google Sheet: {e}")
+
+
+def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
+    """Ensure a worksheet exists and its header row is valid and unique.
+    - If worksheet doesn't exist: create it and set exact headers.
+    - If header row is empty or contains duplicates/whitespace variants: replace with canonical headers.
+    - If some required headers are missing: append them to the end (keeping existing columns).
+    """
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(max(10, len(headers) + 2)))
+        ws.update("A1", [headers])
+        return ws
+
+    # Ensure headers present and unique
+    try:
+        current = ws.row_values(1)
+        if not current:
+            ws.update("A1", [headers])
+            return ws
+
+        # Normalize for duplicate detection
+        curr_norm = [str(h).strip() for h in current]
+        has_duplicates = len(curr_norm) != len(set(curr_norm))
+
+        if has_duplicates:
+            # If duplicates exist (e.g., ['active', 'active']), reset to canonical headers
+            ws.update("A1", [headers])
+            return ws
+
+        # Append any missing required headers (avoid case/whitespace issues)
+        present = set(curr_norm)
+        missing = [h for h in headers if h.strip() not in present]
+        if missing:
+            new_headers = curr_norm + missing
+            ws.update("A1", [new_headers])
+        return ws
+    except Exception:
+        # If header fetch fails for any reason, set headers
+        ws.update("A1", [headers])
+        return ws
+
+
+def ensure_core_sheets():
+    """Initialize required worksheets once; minimize reads to avoid quotas."""
+    if st.session_state.get("_core_sheets_ok"):
+        return
+    try:
+        spreadsheet = get_spreadsheet()
+
+        # Users sheet: create or validate headers only (no full read)
+        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+        users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
+
+        # Lightweight check for at least one data row; only read a tiny range
+        try:
+            data_row2 = users_ws.row_values(2)
+        except Exception:
+            data_row2 = []
+        if not data_row2:
+            # Append a default superuser only if sheet is empty
+            for i in range(3):
+                try:
+                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", now_wib_iso(), 1])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.2 * (i + 1))
+                        continue
+                    raise
+
+        # Cuti sheet
+        cuti_headers = [
+            "id", "nama", "tgl_mulai", "tgl_selesai", "durasi",
+            "kuota_tahunan", "cuti_terpakai", "sisa_kuota", "status",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "alasan", "created_at"
+        ]
+        ensure_sheet_with_headers(spreadsheet, CUTI_SHEET_NAME, cuti_headers)
+
+        # Audit log sheet
+        audit_headers = ["timestamp", "actor", "module", "action", "target", "details"]
+        ensure_sheet_with_headers(spreadsheet, AUDIT_SHEET_NAME, audit_headers)
+
+        # Inventory sheet
+        inv_headers = [
+            "id", "name", "location", "status", "pic", "updated_at",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "file_id", "file_name", "file_link", "loan_info"
+        ]
+        ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
+
+        # Surat Masuk sheet
+        sm_headers = [
+            "id", "nomor", "tanggal", "pengirim", "perihal",
+            "file_id", "file_name", "file_link",
+            "status", "follow_up",
+            "director_approved", "rekap",
+            "created_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, sm_headers)
+
+        # Surat Keluar sheet
+        sk_headers = [
+            "id", "nomor", "tanggal", "ditujukan", "perihal", "pengirim",
+            "status", "follow_up", "director_note", "director_approved",
+            "draft_file_id", "draft_name", "draft_link",
+            "final_file_id", "final_name", "final_link",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, sk_headers)
+
+        # Config sheet for dynamic notification mappings
+        config_headers = ["module", "action", "roles", "active", "updated_at", "updated_by"]
+        ensure_sheet_with_headers(spreadsheet, CONFIG_SHEET_NAME, config_headers)
+
+        # MoU sheet
+        mou_headers = [
+            "id", "nomor", "nama", "pihak", "jenis",
+            "tgl_mulai", "tgl_selesai",
+            "draft_file_id", "draft_file_name", "draft_file_link",
+            "board_note", "board_approved",
+            "final_file_id", "final_file_name", "final_file_link",
+            "due_notified",  # flag otomatis notifikasi jatuh tempo (<=7 hari)
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
+
+        # Cash Advance sheet
+        ca_headers = [
+            "id", "divisi", "items_json", "totals", "tanggal",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, CASH_ADVANCE_SHEET_NAME, ca_headers)
+
+        # PMR sheet
+        pmr_headers = [
+            "id", "nama", "bulan", "file1_id", "file1_name", "file2_id", "file2_name",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tanggal_submit", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, PMR_SHEET_NAME, pmr_headers)
+
+        # Delegasi sheet
+        delegasi_headers = [
+            "id", "judul", "deskripsi", "pic", "tgl_mulai", "tgl_selesai",
+            "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, DELEGASI_SHEET_NAME, delegasi_headers)
+
+        # Flex sheet
+        flex_headers = [
+            "id", "nama", "tanggal", "jam_mulai", "jam_selesai", "alasan",
+            "catatan_finance", "approval_finance", "catatan_director", "approval_director",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, FLEX_SHEET_NAME, flex_headers)
+
+        # Mobil Kantor sheet
+        mobil_headers = [
+            "id", "nama_pengguna", "divisi", "tgl_mulai", "tgl_selesai", "tujuan",
+            "kendaraan", "driver", "status", "finance_note",
+            "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, MOBIL_SHEET_NAME, mobil_headers)
+
+        # Calendar (generic events) sheet
+        calendar_headers = [
+            "id", "jenis", "judul", "nama_divisi", "tgl_mulai", "tgl_selesai",
+            "deskripsi", "file_id", "file_name", "file_link",
+            "is_holiday", "sumber", "ditetapkan_oleh", "tanggal_penetapan", "created_at", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, CALENDAR_SHEET_NAME, calendar_headers)
+
+        # Public holidays (normalized) sheet
+        public_holidays_headers = [
+            "tahun", "tanggal", "nama", "keterangan", "ditetapkan_oleh", "tanggal_penetapan"
+        ]
+        ensure_sheet_with_headers(spreadsheet, PUBLIC_HOLIDAYS_SHEET_NAME, public_holidays_headers)
+
+        # Notulen sheet (meeting minutes) - flexible columns to align with reference
+        notulen_headers = [
+            "id", "judul", "kategori", "divisi", "tanggal_rapat", "tanggal_upload", "file_id", "file_name", "file_link",
+            "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
+        ]
+        ensure_sheet_with_headers(spreadsheet, NOTULEN_SHEET_NAME, notulen_headers)
+
+        # SOP sheet (policies & procedures)
+        sop_headers = [
+            "id", "judul", "tanggal_terbit", "tanggal_upload", "file_id", "file_name", "file_link",
+            "memo", "board_note", "director_approved", "uploaded_by", "created_at", "updated_at"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SOP_SHEET_NAME, sop_headers)
+
+        st.session_state["_core_sheets_ok"] = True
+    except Exception as e:
+        st.error(f"Gagal memastikan sheet inti tersedia: {e}")
 
 
 # --- 4. MANAJEMEN SESSION STATE ---
@@ -752,13 +1260,11 @@ def dashboard():
                 _invalidate_data_cache()
             except Exception:
                 pass
-            st.experimental_rerun()
+            st.rerun()
     with col_time:
         st.write(f"Waktu (WIB): {now_wib_iso()}")
 
-    today = date.today()
-    this_month = today.strftime("%Y-%m")
-
+    # Helper generic loader
     def _load_sheet(name: str, expected: list[str] | None = None) -> pd.DataFrame:
         try:
             ws = _get_ws(name)
@@ -778,310 +1284,255 @@ def dashboard():
         except Exception:
             return pd.DataFrame()
 
-    # Single tabs definition
-    tabs = st.tabs(["KPI", "Surat & MoU", "Cuti & Flex", "Delegasi", "Rekap Bulanan", "Kalender"])
+    today = date.today()
+    this_month = today.strftime("%Y-%m")
 
-    # Simple in-session lazy cache so tiap sheet hanya di-load sekali per render
-    if '_dash_cache' not in st.session_state:
-        st.session_state['_dash_cache'] = {}
-    cache = st.session_state['_dash_cache']
+    # 1) Approvals needed across modules
+    st.markdown("### ✅ Approval Menunggu")
+    approvals = []
+    # Inventory
+    inv = _load_sheet(INVENTORY_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'INVENTORY_SHEET_NAME' in globals() else pd.DataFrame()
+    if not inv.empty:
+        finance_pending = (inv['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in inv.columns else 0
+        director_pending = (inv['director_approved'].astype(str) == '0').sum() if 'director_approved' in inv.columns else 0
+        if finance_pending: approvals.append(("Inventory (Finance)", finance_pending, "Inventory"))
+        if director_pending: approvals.append(("Inventory (Director)", director_pending, "Inventory"))
+    # Surat Masuk
+    sm = _load_sheet(SURAT_MASUK_SHEET_NAME, ["director_approved","id"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sm.empty and 'director_approved' in sm.columns:
+        pending = (sm['director_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("Surat Masuk (Director)", pending, "Surat Masuk"))
+    # Surat Keluar
+    sk = _load_sheet(SURAT_KELUAR_SHEET_NAME, ["director_approved","id"]) if 'SURAT_KELUAR_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sk.empty and 'director_approved' in sk.columns:
+        pending = (sk['director_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("Surat Keluar (Director)", pending, "Surat Keluar"))
+    # MoU
+    mou = _load_sheet(MOU_SHEET_NAME, ["board_approved","id"]) if 'MOU_SHEET_NAME' in globals() else pd.DataFrame()
+    if not mou.empty and 'board_approved' in mou.columns:
+        pending = (mou['board_approved'].astype(str) == '0').sum()
+        if pending: approvals.append(("MoU (Board)", pending, "MoU"))
+    # Cash Advance
+    ca = _load_sheet(CASH_ADVANCE_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'CASH_ADVANCE_SHEET_NAME' in globals() else pd.DataFrame()
+    if not ca.empty:
+        fp = (ca['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in ca.columns else 0
+        dp = (ca['director_approved'].astype(str) == '0').sum() if 'director_approved' in ca.columns else 0
+        if fp: approvals.append(("Cash Advance (Finance)", fp, "Cash Advance"))
+        if dp: approvals.append(("Cash Advance (Director)", dp, "Cash Advance"))
+    # PMR
+    pmr = _load_sheet(PMR_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'PMR_SHEET_NAME' in globals() else pd.DataFrame()
+    if not pmr.empty:
+        fp = (pmr['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in pmr.columns else 0
+        dp = (pmr['director_approved'].astype(str) == '0').sum() if 'director_approved' in pmr.columns else 0
+        if fp: approvals.append(("PMR (Finance)", fp, "PMR"))
+        if dp: approvals.append(("PMR (Director)", dp, "PMR"))
+    # Flex
+    flex = _load_sheet(FLEX_SHEET_NAME, ["approval_finance","approval_director","id"]) if 'FLEX_SHEET_NAME' in globals() else pd.DataFrame()
+    if not flex.empty:
+        fp = (flex['approval_finance'].astype(str) == '0').sum() if 'approval_finance' in flex.columns else 0
+        dp = (flex['approval_director'].astype(str) == '0').sum() if 'approval_director' in flex.columns else 0
+        if fp: approvals.append(("Flex (Finance)", fp, "Flex Time"))
+        if dp: approvals.append(("Flex (Director)", dp, "Flex Time"))
+    # Notulen
+    notulen = _load_sheet(NOTULEN_SHEET_NAME, ["director_approved","id"]) if 'NOTULEN_SHEET_NAME' in globals() else pd.DataFrame()
+    if not notulen.empty and 'director_approved' in notulen.columns:
+        pend = (notulen['director_approved'].astype(str) == '0').sum()
+        if pend: approvals.append(("Notulen (Director)", pend, "Notulen"))
+    # SOP
+    sop = _load_sheet(SOP_SHEET_NAME, ["director_approved","id"]) if 'SOP_SHEET_NAME' in globals() else pd.DataFrame()
+    if not sop.empty and 'director_approved' in sop.columns:
+        pend = (sop['director_approved'].astype(str) == '0').sum()
+        if pend: approvals.append(("SOP (Director)", pend, "SOP"))
+    # Cuti
+    cuti = _load_sheet(CUTI_SHEET_NAME, ["finance_approved","director_approved","status","id"]) if 'CUTI_SHEET_NAME' in globals() else pd.DataFrame()
+    if not cuti.empty:
+        fp = (cuti['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in cuti.columns else 0
+        dp = (cuti['director_approved'].astype(str) == '0').sum() if 'director_approved' in cuti.columns else 0
+        if fp: approvals.append(("Cuti (Finance)", fp, "Cuti"))
+        if dp: approvals.append(("Cuti (Director)", dp, "Cuti"))
 
-    def get_sheet(name: str, expected: list[str] | None = None):
-        key = (name, tuple(expected) if expected else None)
-        if key in cache:
-            return cache[key]
-        df = _load_sheet(name, expected)
-        cache[key] = df
-        return df
-
-    # Datetime parsing cache (avoid repeated heavy parsing across tabs in one session)
-    if '_dt_cache' not in st.session_state:
-        st.session_state['_dt_cache'] = {}
-    def get_parsed_dates(cache_key: str, series: pd.Series, cache_minutes: int = 15) -> pd.Series:
-        """Return a cached parsed datetime Series.
-        cache_key: unique key (e.g., f"mou.tgl_selesai")
-        series: original string series
-        cache_minutes: TTL for reuse
-        """
-        if series is None:
-            return pd.Series(dtype='datetime64[ns]')
-        store = st.session_state['_dt_cache']
-        now_ts = time.time()
-        meta = store.get(cache_key)
-        if meta and (now_ts - meta['ts'] <= cache_minutes*60) and len(meta['raw_hash'])==1:
-            # hash strategy fallback simplified; rely on TTL only to avoid overhead
-            return meta['parsed']
-        try:
-            parsed = pd.to_datetime(series, errors='coerce')
-        except Exception:
-            parsed = pd.to_datetime(pd.Series([None]*len(series)), errors='coerce')
-        store[cache_key] = {'ts': now_ts, 'parsed': parsed, 'raw_hash': {len(series)}}
-        return parsed
-
-    # KPI Tab (all heavy KPI aggregated here only)
-    with tabs[0]:
-        inv = get_sheet(INVENTORY_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'INVENTORY_SHEET_NAME' in globals() else pd.DataFrame()
-        sm = get_sheet(SURAT_MASUK_SHEET_NAME, ["director_approved","status","id"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
-        sk = get_sheet(SURAT_KELUAR_SHEET_NAME, ["director_approved","id"]) if 'SURAT_KELUAR_SHEET_NAME' in globals() else pd.DataFrame()
-        mou = get_sheet(MOU_SHEET_NAME, ["board_approved","tgl_selesai","id","due_notified","nomor","nama"]) if 'MOU_SHEET_NAME' in globals() else pd.DataFrame()
-        ca = get_sheet(CASH_ADVANCE_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'CASH_ADVANCE_SHEET_NAME' in globals() else pd.DataFrame()
-        pmr = get_sheet(PMR_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'PMR_SHEET_NAME' in globals() else pd.DataFrame()
-        flex = get_sheet(FLEX_SHEET_NAME, ["approval_finance","approval_director","tanggal","id"]) if 'FLEX_SHEET_NAME' in globals() else pd.DataFrame()
-        notulen = get_sheet(NOTULEN_SHEET_NAME, ["director_approved","id"]) if 'NOTULEN_SHEET_NAME' in globals() else pd.DataFrame()
-        sop = get_sheet(SOP_SHEET_NAME, ["director_approved","id"]) if 'SOP_SHEET_NAME' in globals() else pd.DataFrame()
-        cuti = get_sheet(CUTI_SHEET_NAME, ["finance_approved","director_approved","status","id"]) if 'CUTI_SHEET_NAME' in globals() else pd.DataFrame()
-
-        approvals: list[tuple[str,int,str]] = []
-        def _collect(label, df, col, page_label):
-            if df.empty or col not in df.columns: return
-            v=(df[col].astype(str)=='0').sum()
-            if v: approvals.append((label,v,page_label))
-            _collect("Inventory (Finance)", inv,'finance_approved','Inventory')
-            _collect("Inventory (Director)", inv,'director_approved','Inventory')
-            _collect("Surat Masuk (Director)", sm,'director_approved','Surat Masuk')
-            _collect("Surat Keluar (Director)", sk,'director_approved','Surat Keluar')
-            _collect("MoU (Board)", mou,'board_approved','MoU')
-            _collect("Cash Advance (Finance)", ca,'finance_approved','Cash Advance')
-            _collect("Cash Advance (Director)", ca,'director_approved','Cash Advance')
-            _collect("PMR (Finance)", pmr,'finance_approved','PMR')
-            _collect("PMR (Director)", pmr,'director_approved','PMR')
-            _collect("Flex (Finance)", flex,'approval_finance','Flex Time')
-            _collect("Flex (Director)", flex,'approval_director','Flex Time')
-            _collect("Notulen (Director)", notulen,'director_approved','Notulen')
-            _collect("SOP (Director)", sop,'director_approved','SOP')
-            _collect("Cuti (Finance)", cuti,'finance_approved','Cuti')
-        _collect("Cuti (Director)", cuti,'director_approved','Cuti')
-
-        total_pending=sum(c for _,c,_ in approvals) if approvals else 0
-        surat_belum = sm['status'].astype(str).str.lower().eq('belum dibahas').sum() if (not sm.empty and 'status' in sm.columns) else 0
-        # MoU due soon (≤7 hari) + notification (only in KPI tab, daily guard)
+        # --- Styled Summary Cards (top KPIs) ---
+        total_pending_approvals = sum(c for _, c, _ in approvals) if approvals else 0
+        # Surat belum dibahas (status == 'Belum Dibahas')
+        surat_belum_dibahas = 0
+        if not sm.empty and 'status' in sm.columns:
+                surat_belum_dibahas = sm['status'].astype(str).str.lower().eq('belum dibahas').sum()
+        # MoU due in <= 7 days
         mou_due7 = 0
         if not mou.empty and 'tgl_selesai' in mou.columns:
-            try:
-                mou['_tgl_selesai_dt']=get_parsed_dates('mou.tgl_selesai', mou['tgl_selesai'])
-                horizon = pd.Timestamp.today()+pd.Timedelta(days=7)
-                due_rows = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt']>=pd.Timestamp.today()) & (mou['_tgl_selesai_dt']<=horizon)]
-                mou_due7 = len(due_rows)
-                if mou_due7>0:
-                    if 'due_notified' not in mou.columns:
-                        mou['due_notified']=""
-                    need_notify = due_rows[due_rows.get('due_notified','').astype(str).str.strip()=='' ]
-                    if not need_notify.empty:
-                        today_key = date.today().isoformat()
-                        last_sent = st.session_state.get('_mou_due_notif_sent')
-                        if last_sent != today_key:
-                            notif_roles = NOTIF_ROLE_MAP.get(("mou","due_soon"), ["director","finance"])
-                            try:
-                                users_df = pd.DataFrame(_get_ws(USERS_SHEET_NAME).get_all_records())
-                            except Exception:
-                                users_df = pd.DataFrame()
-                            recipients=[]
-                            if not users_df.empty and {'email','role'}.issubset(users_df.columns):
-                                for r in notif_roles+["superuser"]:
-                                    recipients.extend(users_df[users_df['role'].astype(str).str.lower()==r]['email'].tolist())
-                            if recipients:
-                                subject=f"[WIJNA] MoU akan jatuh tempo ≤7 hari ({len(need_notify)})"
-                                body=["Daftar MoU yang akan jatuh tempo dalam 7 hari:"]
-                                for _,rw in need_notify.iterrows():
-                                    body.append(f"- {rw.get('nomor','?')} | {rw.get('nama','?')} | {rw.get('tgl_selesai','?')}")
-                                body.append("\nSegera tindaklanjuti.")
-                                _send_async(send_notification_bulk, recipients, subject, "\n".join(body))
-                                st.session_state['_mou_due_notif_sent'] = today_key
-                            try:
-                                ws_mou = _get_ws(MOU_SHEET_NAME)
-                                headers = ws_mou.row_values(1)
-                                if 'due_notified' in headers:
-                                    col_idx=headers.index('due_notified')+1
-                                    for _,rw in need_notify.iterrows():
-                                        cell = ws_mou.find(str(rw.get('id','')))
-                                        if cell:
-                                            a1 = gspread.utils.rowcol_to_a1(cell.row,col_idx)
-                                            ws_mou.update(a1, [[now_wib_iso()]])
-                                    _invalidate_data_cache()
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-        # Render stat cards
-        st.markdown("""<style>.stat-card {background:#fff;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.07);padding:1.25rem 1.4rem;margin-bottom:0.75rem;transition:box-shadow .2s;border:1px solid #f1f5f9;} .stat-flex{display:flex;align-items:center;justify-content:space-between;gap:10px;} .stat-label{font-size:0.95rem;color:#64748b;font-weight:600;margin-bottom:.15rem;} .stat-value{font-size:2.1rem;font-weight:700;margin-bottom:.05rem;line-height:1.1;} .stat-delta{font-size:0.85rem;color:#94a3b8;font-weight:500;} .stat-iconbox{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;} .stat-iconbox.orange{background:#fff7ed;} .stat-iconbox.blue{background:#e6f0fa;} .stat-iconbox.purple{background:#f3e8ff;} .stat-icon.orange{color:#fb923c;} .stat-icon.blue{color:#2563eb;} .stat-icon.purple{color:#a21caf;} .stat-value.orange{color:#fb923c;} .stat-value.blue{color:#2563eb;} .stat-value.purple{color:#a21caf;}</style>""", unsafe_allow_html=True)
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            st.markdown(f"<div class='stat-card'><div class='stat-flex'><div><div class='stat-label'>Approval Menunggu</div><div class='stat-value orange'>{total_pending}</div><div class='stat-delta'>Menunggu persetujuan</div></div><div class='stat-iconbox orange'><svg class='stat-icon orange' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'><circle cx='12' cy='12' r='10'/><polyline points='12,6 12,12 16,14'/></svg></div></div></div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"<div class='stat-card'><div class='stat-flex'><div><div class='stat-label'>Surat Belum Dibahas</div><div class='stat-value blue'>{surat_belum}</div><div class='stat-delta'>Belum diproses</div></div><div class='stat-iconbox blue'><svg class='stat-icon blue' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'><rect x='4' y='4' width='16' height='16' rx='4'/><path d='M9 9h6v6H9z'/></svg></div></div></div>", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"<div class='stat-card'><div class='stat-flex'><div><div class='stat-label'>MoU ≤ 7 hari jatuh tempo</div><div class='stat-value purple'>{mou_due7}</div><div class='stat-delta'>Segera ditindaklanjuti</div></div><div class='stat-iconbox purple'><svg class='stat-icon purple' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'><path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14,2 14,8 20,8'/><line x1='16' y1='13' x2='8' y2='13'/><line x1='16' y1='17' x2='8' y2='17'/></svg></div></div></div>", unsafe_allow_html=True)
-        with st.expander("Detail Approval per Modul"):
-            if approvals:
-                for label,count,_ in approvals:
-                    st.write(f"• {label}: {count}")
-            else:
-                st.write("Tidak ada approval pending.")
-
-    # Surat & MoU Tab
-    with tabs[1]:
-        sm = get_sheet(SURAT_MASUK_SHEET_NAME, ["director_approved","nomor","perihal","tanggal","status"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
-        mou = get_sheet(MOU_SHEET_NAME, ["tgl_selesai","nomor","nama"]) if 'MOU_SHEET_NAME' in globals() else pd.DataFrame()
-        col1,col2 = st.columns(2)
-        with col1:
-            if not sm.empty and 'director_approved' in sm.columns:
-                pending = sm[sm['director_approved'].astype(str)=='0']
-                st.write(f"Surat Masuk pending: {len(pending)}")
-                if not pending.empty:
-                    show = pending.head(8)
-                    cols = [c for c in ['nomor','perihal','tanggal'] if c in show.columns]
-                    if cols:
-                        safe_dataframe(show[cols], index=False, height=230)
-            else:
-                st.write("Tidak ada data surat masuk.")
-        with col2:
-            if not mou.empty and 'tgl_selesai' in mou.columns:
                 try:
-                    mou['tgl_selesai_dt']=get_parsed_dates('mou.tgl_selesai', mou['tgl_selesai'])
-                    soon = mou[mou['tgl_selesai_dt'].notna() & (mou['tgl_selesai_dt'].dt.date>=date.today()) & (mou['tgl_selesai_dt'].dt.date<=date.today()+pd.Timedelta(days=30))].sort_values('tgl_selesai_dt')
-                    st.write(f"MoU hampir jatuh tempo (≤30 hari): {len(soon)}")
-                    if not soon.empty:
-                        safe_dataframe(soon[['nomor','nama','tgl_selesai']].head(8), index=False, height=230)
+                        mou['_tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
+                        upcoming_limit = pd.Timestamp.today() + pd.Timedelta(days=7)
+                        mou_due7 = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)].shape[0]
+                        # --- Automated notification for due <=7 days ---
+                        try:
+                            if mou_due7 > 0:
+                                # Ensure due_notified column exists
+                                if 'due_notified' not in mou.columns:
+                                    mou['due_notified'] = ''
+                                due_rows = mou[(mou['_tgl_selesai_dt'].notna()) & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)]
+                                need_notify = due_rows[due_rows.get('due_notified','').astype(str).str.strip() == '']
+                                if not need_notify.empty:
+                                    # Collect recipients via NOTIF_ROLE_MAP for a new event key (mou,due_soon)
+                                    # Fallback: director + finance + superuser roles
+                                    notif_roles = NOTIF_ROLE_MAP.get(("mou","due_soon"), ["director","finance"])
+                                    # load users sheet to map roles -> emails
+                                    try:
+                                        users_df = pd.DataFrame(_get_ws(USERS_SHEET_NAME).get_all_records())
+                                    except Exception:
+                                        users_df = pd.DataFrame()
+                                    recipients = []
+                                    if not users_df.empty and 'email' in users_df.columns and 'role' in users_df.columns:
+                                        for r in notif_roles + ["superuser"]:
+                                            recipients.extend(users_df[users_df['role'].astype(str).str.lower()==r]['email'].tolist())
+                                    subject = f"[WIJNA] MoU akan jatuh tempo ≤7 hari ({len(need_notify)})"
+                                    body_lines = ["Daftar MoU yang akan jatuh tempo dalam 7 hari:"]
+                                    for _, row in need_notify.iterrows():
+                                        body_lines.append(f"- {row.get('nomor','?')} | {row.get('nama','?')} | berakhir: {row.get('tgl_selesai','?')}")
+                                    body_lines.append("\nSegera lakukan perpanjangan atau tindak lanjut sesuai prosedur.")
+                                    body = "\n".join(body_lines)
+                                    if recipients:
+                                        _send_async(send_notification_bulk, recipients, subject, body)
+                                    # Update due_notified flag in sheet
+                                    try:
+                                        ws_mou = _get_ws(MOU_SHEET_NAME)
+                                        headers_mou = ws_mou.row_values(1)
+                                        if 'due_notified' not in headers_mou:
+                                            # Should have been ensured by ensure_core_sheets, skip if absent
+                                            pass
+                                        else:
+                                            col_idx = headers_mou.index('due_notified') + 1
+                                            for _, row in need_notify.iterrows():
+                                                try:
+                                                    cell = ws_mou.find(str(row.get('id','')))
+                                                    if cell:
+                                                        a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                                                        ws_mou.update(a1, [[now_wib_iso()]])
+                                                except Exception:
+                                                    continue
+                                            _invalidate_data_cache()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                 except Exception:
-                    st.write("Gagal parsing tanggal MoU.")
-            else:
-                st.write("Tidak ada data MoU.")
-
-    # Cuti & Flex Tab
-    with tabs[2]:
-        cuti = get_sheet(CUTI_SHEET_NAME, ["nama","sisa_kuota","created_at"]) if 'CUTI_SHEET_NAME' in globals() else pd.DataFrame()
-        flex = get_sheet(FLEX_SHEET_NAME, ["approval_finance","approval_director","tanggal"]) if 'FLEX_SHEET_NAME' in globals() else pd.DataFrame()
-        c_cuti,c_flex = st.columns([2,1])
-        with c_cuti:
-            if not cuti.empty and 'nama' in cuti.columns:
-                latest = cuti.copy()
-                if 'created_at' in latest.columns:
-                    latest['_created']=get_parsed_dates('cuti.created_at', latest['created_at'])
-                    latest = latest.sort_values('_created')
-                if 'sisa_kuota' in latest.columns:
-                    sisa = latest.groupby('nama')['sisa_kuota'].last().reset_index().rename(columns={'sisa_kuota':'sisa'})
-                    safe_dataframe(sisa, index=False, height=260)
-            else:
-                st.write("Data cuti tidak tersedia.")
-        with c_flex:
-            if not flex.empty:
-                pend_fin = (flex['approval_finance'].astype(str)=='0').sum() if 'approval_finance' in flex.columns else 0
-                pend_dir = (flex['approval_director'].astype(str)=='0').sum() if 'approval_director' in flex.columns else 0
-                approved_month = 0
-                if 'approval_director' in flex.columns and 'tanggal' in flex.columns:
-                    try:
-                        approved_month = ((flex['approval_director'].astype(str)=='1') & (flex['tanggal'].astype(str).str[:7]==this_month)).sum()
-                    except Exception:
                         pass
-                st.metric("Flex Pending (Finance)", pend_fin)
-                st.metric("Flex Pending (Director)", pend_dir)
-                st.metric("Flex Approved Bulan Ini", approved_month)
-            else:
-                st.write("Data flex tidak tersedia.")
 
-    # Delegasi Tab
-    with tabs[3]:
-        delegasi = get_sheet(DELEGASI_SHEET_NAME, ["judul","pic","status","tgl_selesai"]) if 'DELEGASI_SHEET_NAME' in globals() else pd.DataFrame()
-        if not delegasi.empty:
-            active = delegasi[delegasi['status'].astype(str).str.lower().isin(["","proses","progress","ongoing","open","aktif"])]
-            if not active.empty:
-                try:
-                    active['deadline_dt']=get_parsed_dates('delegasi.tgl_selesai', active['tgl_selesai'])
-                except Exception:
-                    active['deadline_dt']=pd.NaT
-                def _color(row):
-                    dl=row.get('deadline_dt')
-                    if pd.isna(dl): return '⬜'
-                    if dl.date()<date.today(): return '🔴'
-                    if dl.date()<=date.today()+timedelta(days=3): return '🟠'
-                    return '🟢'
-                view=[{'judul':r.get('judul'),'pic':r.get('pic'),'deadline':r.get('tgl_selesai'),'status':r.get('status'),'indikator':_color(r)} for _,r in active.head(12).iterrows()]
-                safe_dataframe(pd.DataFrame(view), index=False, height=340)
-            else:
-                st.info("Tidak ada tugas aktif.")
+        # Inject CSS (idempotent)
+        st.markdown("""
+        <style>
+        .stat-card {background:#fff;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.07);padding:1.25rem 1.4rem;margin-bottom:0.75rem;transition:box-shadow .2s;border:1px solid #f1f5f9;}
+        .stat-card:hover {box-shadow:0 6px 18px rgba(0,0,0,0.13);} 
+        .stat-flex {display:flex;align-items:center;justify-content:space-between;gap:10px;}
+        .stat-label {font-size:0.95rem;color:#64748b;font-weight:600;letter-spacing:.3px;margin-bottom:.15rem;}
+        .stat-value {font-size:2.1rem;font-weight:700;margin-bottom:.05rem;line-height:1.1;}
+        .stat-delta {font-size:0.85rem;color:#94a3b8;font-weight:500;}
+        .stat-iconbox {width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;}
+        .stat-iconbox.orange {background:#fff7ed;}
+        .stat-iconbox.blue {background:#e6f0fa;}
+        .stat-iconbox.purple {background:#f3e8ff;}
+        .stat-icon.orange {color:#fb923c;}
+        .stat-icon.blue {color:#2563eb;}
+        .stat-icon.purple {color:#a21caf;}
+        .stat-value.orange {color:#fb923c;}
+        .stat-value.blue {color:#2563eb;}
+        .stat-value.purple {color:#a21caf;}
+        </style>
+        """, unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>Approval Menunggu</div>
+                            <div class='stat-value orange'>{total_pending_approvals}</div>
+                            <div class='stat-delta'>Menunggu persetujuan</div>
+                        </div>
+                        <div class='stat-iconbox orange'>
+                            <svg class='stat-icon orange' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <circle cx='12' cy='12' r='10'/><polyline points='12,6 12,12 16,14'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        with c2:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>Surat Belum Dibahas</div>
+                            <div class='stat-value blue'>{surat_belum_dibahas}</div>
+                            <div class='stat-delta'>Belum diproses</div>
+                        </div>
+                        <div class='stat-iconbox blue'>
+                            <svg class='stat-icon blue' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <rect x='4' y='4' width='16' height='16' rx='4'/><path d='M9 9h6v6H9z'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        with c3:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>MoU ≤ 7 hari jatuh tempo</div>
+                            <div class='stat-value purple'>{mou_due7}</div>
+                            <div class='stat-delta'>Segera ditindaklanjuti</div>
+                        </div>
+                        <div class='stat-iconbox purple'>
+                            <svg class='stat-icon purple' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14,2 14,8 20,8'/><line x1='16' y1='13' x2='8' y2='13'/><line x1='16' y1='17' x2='8' y2='17'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Expandable detailed approvals list (optional)
+        with st.expander("Detail Approval per Modul", expanded=False):
+                if approvals:
+                        for label, count, page_key in approvals:
+                                st.write(f"• {label}: {count}")
+                else:
+                        st.write("Tidak ada approval pending.")
+
+    st.markdown("---")
+    # 2) Status Surat & MoU (mendekati jatuh tempo)
+    st.markdown("### ✉️ Surat & 🤝 MoU")
+    col_surat, col_mou = st.columns(2)
+    with col_surat:
+        if not sm.empty and 'director_approved' in sm.columns:
+            pending_rows = sm[sm['director_approved'].astype(str) == '0']
+            st.write(f"Surat Masuk pending: {len(pending_rows)}")
+            if not pending_rows.empty:
+                show = pending_rows.head(5).copy()
+                cols_show = [c for c in ['nomor','perihal','tanggal'] if c in show.columns]
+                if cols_show:
+                    safe_dataframe(show[cols_show], index=False, height=180)
         else:
-            st.write("Data delegasi tidak tersedia.")
-
-    # Rekap Bulanan Tab
-    with tabs[4]:
-        ca = get_sheet(CASH_ADVANCE_SHEET_NAME, ["tanggal","created_at"]) if 'CASH_ADVANCE_SHEET_NAME' in globals() else pd.DataFrame()
-        pmr = get_sheet(PMR_SHEET_NAME, ["bulan","tanggal_submit"]) if 'PMR_SHEET_NAME' in globals() else pd.DataFrame()
-        inv2 = get_sheet(INVENTORY_SHEET_NAME, ["updated_at"]) if 'INVENTORY_SHEET_NAME' in globals() else pd.DataFrame()
-        sm2 = get_sheet(SURAT_MASUK_SHEET_NAME, ["tanggal","created_at"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
-        sk2 = get_sheet(SURAT_KELUAR_SHEET_NAME, ["tanggal","created_at"]) if 'SURAT_KELUAR_SHEET_NAME' in globals() else pd.DataFrame()
-        not2 = get_sheet(NOTULEN_SHEET_NAME, ["tanggal_rapat","tanggal_upload","created_at"]) if 'NOTULEN_SHEET_NAME' in globals() else pd.DataFrame()
-        sop2 = get_sheet(SOP_SHEET_NAME, ["tanggal_terbit","tanggal_upload","created_at"]) if 'SOP_SHEET_NAME' in globals() else pd.DataFrame()
-        def _mcount(df, fields):
-            if df.empty: return 0
-            for f in fields:
-                if f in df.columns: return (df[f].astype(str).str[:7]==this_month).sum()
-            return 0
-        def _mseries(df, fields, months_back=5):
-            if df.empty: return [0]*(months_back+1)
-            col = next((f for f in fields if f in df.columns), None)
-            if not col: return [0]*(months_back+1)
-            ser = pd.to_datetime(df[col], errors='coerce')
-            base = date.today().replace(day=1)
-            out=[]
-            for i in range(months_back,-1,-1):
-                start = base - pd.DateOffset(months=i)
-                end = start + pd.DateOffset(months=1)
-                out.append(int(((ser>=start)&(ser<end)).sum()))
-            return out
-        def _spark(values):
-            mx=max(values) or 1; w=90; h=28; step=w/max(len(values)-1,1)
-            pts=' '.join(f"{i*step:.1f},{h-(v/mx*h):.1f}" for i,v in enumerate(values))
-            cir=''.join(f"<circle cx='{i*step:.1f}' cy='{h-(v/mx*h):.1f}' r='2' fill='#2563eb'/>" for i,v in enumerate(values))
-            return f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' xmlns='http://www.w3.org/2000/svg'><polyline fill='none' stroke='#2563eb' stroke-width='2' points='{pts}' />{cir}</svg>"
-        data=[
-            ("Cash Advance", _mcount(ca,["tanggal","created_at"]), _mseries(ca,["tanggal","created_at"])) ,
-            ("PMR", _mcount(pmr,["bulan","tanggal_submit"]), _mseries(pmr,["tanggal_submit","bulan"])) ,
-            ("Inventory Update", _mcount(inv2,["updated_at"]), _mseries(inv2,["updated_at"])) ,
-            ("Surat Masuk", _mcount(sm2,["tanggal","created_at"]), _mseries(sm2,["tanggal","created_at"])) ,
-            ("Surat Keluar", _mcount(sk2,["tanggal","created_at"]), _mseries(sk2,["tanggal","created_at"])) ,
-            ("Notulen", _mcount(not2,["tanggal_rapat","tanggal_upload","created_at"]), _mseries(not2,["tanggal_rapat","tanggal_upload","created_at"])) ,
-            ("SOP", _mcount(sop2,["tanggal_terbit","tanggal_upload","created_at"]), _mseries(sop2,["tanggal_terbit","tanggal_upload","created_at"]))
-        ]
-        cols = st.columns(4)
-        for i,(label,val,series) in enumerate(data):
-            with cols[i%4]:
-                st.metric(label,val)
-                try:
-                    st.markdown(f"<div style='margin-top:-10px'>{_spark(series)}</div>", unsafe_allow_html=True)
-                except Exception:
-                    pass
-
-    # Kalender Tab
-    with tabs[5]:
-        cal = get_sheet(CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"]) if 'CALENDAR_SHEET_NAME' in globals() else pd.DataFrame()
-        mobil = get_sheet(MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"]) if 'MOBIL_SHEET_NAME' in globals() else pd.DataFrame()
-        horizon_end = date.today()+timedelta(days=14)
-        events=[]
-        if not cal.empty:
+            st.write("Tidak ada data surat masuk / kolom tidak lengkap.")
+    with col_mou:
+        if not mou.empty and 'tgl_selesai' in mou.columns:
             try:
-                cal['_mulai']=get_parsed_dates('calendar.tgl_mulai', cal['tgl_mulai'])
-                subset=cal[cal['_mulai'].notna() & (cal['_mulai'].dt.date>=date.today()) & (cal['_mulai'].dt.date<=horizon_end)]
-                for _,r in subset.iterrows():
-                    events.append({'jenis':r.get('jenis'),'judul':r.get('judul'),'mulai':r.get('tgl_mulai'),'selesai':r.get('tgl_selesai'),'kategori':'Libur Nasional' if str(r.get('is_holiday'))=='1' else 'Event'})
-            except Exception: pass
-        if not mobil.empty:
-            try:
-                mobil['_mulai']=get_parsed_dates('mobil.tgl_mulai', mobil['tgl_mulai'])
-                subset2=mobil[mobil['_mulai'].notna() & (mobil['_mulai'].dt.date>=date.today()) & (mobil['_mulai'].dt.date<=horizon_end)]
-                for _,r in subset2.iterrows():
-                    events.append({'jenis':'Mobil','judul':f"{r.get('kendaraan')} - {r.get('tujuan')}",'mulai':r.get('tgl_mulai'),'selesai':r.get('tgl_selesai'),'kategori':'Mobil Kantor'})
-            except Exception: pass
-        if events:
-            up_df=pd.DataFrame(events).sort_values('mulai')
-            safe_dataframe(up_df.head(30), index=False, height=360)
-            try:
-                st.download_button("⬇️ Export Upcoming (CSV)", up_df.to_csv(index=False).encode('utf-8'), file_name=f"upcoming_{date.today().isoformat()}.csv")
-            except Exception: pass
+                mou['tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
+                soon = mou[mou['tgl_selesai_dt'].notna() & (mou['tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['tgl_selesai_dt'] <= pd.Timestamp.today() + pd.Timedelta(days=30))]
+                soon = soon.sort_values('tgl_selesai_dt')
+                total_active = mou[mou['tgl_selesai_dt'].notna()].shape[0]
+                due_pct = (len(soon) / total_active * 100) if total_active else 0
+                st.write(f"MoU hampir jatuh tempo (≤30 hari): {len(soon)} dari {total_active} ({due_pct:.1f}%)")
+                st.progress(min(int(due_pct), 100))
+                if not soon.empty:
+                    show = soon[['nomor','nama','tgl_selesai']].head(5)
+                    safe_dataframe(show, index=False, height=180)
+            except Exception:
+                st.write("Gagal parsing tanggal MoU.")
         else:
-            st.info("Tidak ada event mendatang 14 hari ke depan.")
-
-    st.caption("Selesai memuat dashboard tab.")
+            st.write("Tidak ada data MoU / kolom tgl_selesai tidak tersedia.")
 
     st.markdown("---")
     # 3) Cuti & Flex
