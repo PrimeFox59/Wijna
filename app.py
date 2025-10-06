@@ -2920,7 +2920,7 @@ def main():
         /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
             width:100% !important;
-            height:42px !important;
+            height:10px !important;
             min-height:42px !important;
             display:flex !important;
             align-items:center !important;
