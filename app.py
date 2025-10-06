@@ -315,6 +315,65 @@ def verify_password(plain_password: str, hashed_password: str):
     """Memverifikasi password dengan hash yang tersimpan."""
     return pwd_context.verify(plain_password, hashed_password)
 
+# --- Persistent Login Token Helpers ---
+# SECURITY NOTE:
+#   Implementasi ini menggunakan token di query parameter (?auth=...).
+#   Kekurangan: URL bisa tersalin / terbocorkan (history browser, log, sharing).
+#   Untuk produksi lebih aman, pertimbangkan:
+#     1. Simpan token di httpOnly cookie (butuh custom backend / st.experimental_* API).
+#     2. Gunakan token single-use + refresh short-lived.
+#     3. Enkripsi token atau gunakan HMAC dengan secret.
+#   Saat ini cukup untuk kenyamanan internal. Token otomatis kadaluarsa (default 14 hari).
+def _generate_auth_token() -> str:
+    return uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars
+
+def _save_user_token(ws, row_idx: int, token: str, days_valid: int = 14):
+    expires = (now_wib_dt() + timedelta(days=days_valid)).replace(microsecond=0).isoformat()
+    headers = ws.row_values(1)
+    updates = {}
+    if 'auth_token' in headers:
+        updates['auth_token'] = token
+    if 'auth_token_expires' in headers:
+        updates['auth_token_expires'] = expires
+    if updates:
+        _users_update_row(ws, row_idx, updates)
+
+def _clear_user_token(ws, row_idx: int):
+    headers = ws.row_values(1)
+    updates = {}
+    if 'auth_token' in headers:
+        updates['auth_token'] = ''
+    if 'auth_token_expires' in headers:
+        updates['auth_token_expires'] = ''
+    if updates:
+        _users_update_row(ws, row_idx, updates)
+
+def _find_user_by_token(token: str):
+    if not token:
+        return None
+    try:
+        ws, df = _load_users_df()
+        if df.empty:
+            return None
+        if 'auth_token' not in df.columns:
+            return None
+        match = df[df['auth_token'].astype(str) == str(token)]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        # Validate expiry
+        exp_raw = str(row.get('auth_token_expires', '')).strip()
+        if exp_raw:
+            try:
+                exp_dt = parse_wib(exp_raw) or datetime.fromisoformat(exp_raw)
+                if exp_dt < now_wib_dt():
+                    return None
+            except Exception:
+                return None
+        return ws, row
+    except Exception:
+        return None
+
 def send_notification_email(recipient_email, subject, body):
     """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
     try:
@@ -516,7 +575,10 @@ def ensure_core_sheets():
         spreadsheet = get_spreadsheet()
 
         # Users sheet: create or validate headers only (no full read)
-        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+        users_headers = [
+            "email", "password_hash", "full_name", "role", "created_at", "active",
+            "auth_token", "auth_token_expires"
+        ]
         users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
 
         # Lightweight check for at least one data row; only read a tiny range
@@ -626,6 +688,11 @@ def show_login_page():
     if action == "Login":
         st.subheader("Login")
         with st.form("login_form"):
+            # Placeholder form elements (email, password) assumed omitted above; we inject remember checkbox
+            if 'remember_me' not in st.session_state:
+                st.session_state.remember_me = True
+            remember = st.checkbox("Ingat saya (tetap login)", value=st.session_state.remember_me, help="Menyimpan sesi login hingga 14 hari atau sampai Anda logout.")
+            st.session_state.remember_me = remember
             username = st.text_input("Username").lower()
             password = st.text_input("Password", type="password")
             login_button = st.form_submit_button("Login")
@@ -829,6 +896,25 @@ def logout():
             audit_log("auth", "logout", target=user.get("email", ""))
         except Exception:
             pass
+        # Clear token if exists
+        try:
+            ws, df = _load_users_df()
+            email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
+            if email_col:
+                match = df[df[email_col].astype(str).str.lower() == str(user.get('email','')).lower()]
+                if not match.empty:
+                    row_idx = match.index[0] + 2
+                    _clear_user_token(ws, row_idx)
+        except Exception:
+            pass
+        # Remove auth param from URL
+        try:
+            if 'auth' in st.query_params:
+                qp = st.query_params
+                del qp['auth']
+                st.query_params.update(qp)
+        except Exception:
+            pass
     st.session_state.user = None
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -837,7 +923,10 @@ def logout():
 def _load_users_df():
     spreadsheet = get_spreadsheet()
     ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-    users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+    users_headers = [
+        "email", "password_hash", "full_name", "role", "created_at", "active",
+        "auth_token", "auth_token_expires"
+    ]
     try:
         records = _cached_get_all_records(USERS_SHEET_NAME, users_headers)
     except Exception:
@@ -846,7 +935,7 @@ def _load_users_df():
     return ws, df
 
 
-def login_user(email: str, password: str):
+def login_user(email: str, password: str, remember: bool = False):
     try:
         ws, df = _load_users_df()
         email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
@@ -872,6 +961,16 @@ def login_user(email: str, password: str):
         set_current_user(user_obj)
         st.session_state.logged_in = True
         st.session_state.username = user_obj["email"]
+        # If remember me, generate token and store
+        if remember:
+            try:
+                row_idx = row.index[0] + 2  # account for header row (1-based) and zero-based df
+                token = _generate_auth_token()
+                _save_user_token(ws, row_idx, token)
+                # Set query params for future auto-login
+                st.query_params["auth"] = token
+            except Exception:
+                pass
         try:
             notify_event("auth", "login", "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
         except Exception:
@@ -890,7 +989,10 @@ def register_user(email: str, full_name: str, password: str):
     try:
         spreadsheet = get_spreadsheet()
         ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
+        users_headers = [
+            "email", "password_hash", "full_name", "role", "created_at", "active",
+            "auth_token", "auth_token_expires"
+        ]
         try:
             df = pd.DataFrame(_cached_get_all_records(USERS_SHEET_NAME, users_headers))
         except Exception:
@@ -3364,6 +3466,32 @@ def main():
     ensure_core_sheets()
     # --- Sidebar Logo ---
     user = get_current_user()
+    # Auto-login via auth token in query params (if present and not already logged in)
+    if not user:
+        try:
+            token = st.query_params.get("auth") if hasattr(st, 'query_params') else None
+            if token:
+                found = _find_user_by_token(token)
+                if found:
+                    ws_token, row = found
+                    # Build user object
+                    user_obj = {
+                        "email": row.get("email") or row.get("username"),
+                        "full_name": row.get("full_name", ""),
+                        "role": str(row.get("role", "user")).lower() or "user",
+                        "active": int(row.get("active", 1)) if str(row.get("active", 1)).isdigit() else 1,
+                    }
+                    if user_obj["active"]:
+                        set_current_user(user_obj)
+                        st.session_state.logged_in = True
+                        st.session_state.username = user_obj["email"]
+                        user = user_obj
+                        try:
+                            audit_log("auth", "auto_login", target=user_obj["email"], details="via token")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     if not user:
         # --- Full page login/register, no sidebar ---
         st.markdown("""
