@@ -1348,19 +1348,104 @@ def dashboard():
         if fp: approvals.append(("Cuti (Finance)", fp, "Cuti"))
         if dp: approvals.append(("Cuti (Director)", dp, "Cuti"))
 
-    if approvals:
-        # Show as metric grid
-        for i in range(0, len(approvals), 4):
-            row = approvals[i:i+4]
-            cols = st.columns(len(row))
-            for c, (label, count, page_key) in zip(cols, row):
-                with c:
-                    st.metric(label, count)
-                    if st.button(f"➡️ Buka", key=f"go_{label}"):
-                        st.session_state['page'] = page_key
-                        st.experimental_rerun()
-    else:
-        st.info("Tidak ada approval pending.")
+        # --- Styled Summary Cards (top KPIs) ---
+        total_pending_approvals = sum(c for _, c, _ in approvals) if approvals else 0
+        # Surat belum dibahas (status == 'Belum Dibahas')
+        surat_belum_dibahas = 0
+        if not sm.empty and 'status' in sm.columns:
+                surat_belum_dibahas = sm['status'].astype(str).str.lower().eq('belum dibahas').sum()
+        # MoU due in <= 7 days
+        mou_due7 = 0
+        if not mou.empty and 'tgl_selesai' in mou.columns:
+                try:
+                        mou['_tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
+                        upcoming_limit = pd.Timestamp.today() + pd.Timedelta(days=7)
+                        mou_due7 = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)].shape[0]
+                except Exception:
+                        pass
+
+        # Inject CSS (idempotent)
+        st.markdown("""
+        <style>
+        .stat-card {background:#fff;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.07);padding:1.25rem 1.4rem;margin-bottom:0.75rem;transition:box-shadow .2s;border:1px solid #f1f5f9;}
+        .stat-card:hover {box-shadow:0 6px 18px rgba(0,0,0,0.13);} 
+        .stat-flex {display:flex;align-items:center;justify-content:space-between;gap:10px;}
+        .stat-label {font-size:0.95rem;color:#64748b;font-weight:600;letter-spacing:.3px;margin-bottom:.15rem;}
+        .stat-value {font-size:2.1rem;font-weight:700;margin-bottom:.05rem;line-height:1.1;}
+        .stat-delta {font-size:0.85rem;color:#94a3b8;font-weight:500;}
+        .stat-iconbox {width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;}
+        .stat-iconbox.orange {background:#fff7ed;}
+        .stat-iconbox.blue {background:#e6f0fa;}
+        .stat-iconbox.purple {background:#f3e8ff;}
+        .stat-icon.orange {color:#fb923c;}
+        .stat-icon.blue {color:#2563eb;}
+        .stat-icon.purple {color:#a21caf;}
+        .stat-value.orange {color:#fb923c;}
+        .stat-value.blue {color:#2563eb;}
+        .stat-value.purple {color:#a21caf;}
+        </style>
+        """, unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>Approval Menunggu</div>
+                            <div class='stat-value orange'>{total_pending_approvals}</div>
+                            <div class='stat-delta'>Menunggu persetujuan</div>
+                        </div>
+                        <div class='stat-iconbox orange'>
+                            <svg class='stat-icon orange' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <circle cx='12' cy='12' r='10'/><polyline points='12,6 12,12 16,14'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        with c2:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>Surat Belum Dibahas</div>
+                            <div class='stat-value blue'>{surat_belum_dibahas}</div>
+                            <div class='stat-delta'>Belum diproses</div>
+                        </div>
+                        <div class='stat-iconbox blue'>
+                            <svg class='stat-icon blue' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <rect x='4' y='4' width='16' height='16' rx='4'/><path d='M9 9h6v6H9z'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        with c3:
+                st.markdown(f"""
+                <div class='stat-card'>
+                    <div class='stat-flex'>
+                        <div>
+                            <div class='stat-label'>MoU ≤ 7 hari jatuh tempo</div>
+                            <div class='stat-value purple'>{mou_due7}</div>
+                            <div class='stat-delta'>Segera ditindaklanjuti</div>
+                        </div>
+                        <div class='stat-iconbox purple'>
+                            <svg class='stat-icon purple' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14,2 14,8 20,8'/><line x1='16' y1='13' x2='8' y2='13'/><line x1='16' y1='17' x2='8' y2='17'/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Expandable detailed approvals list (optional)
+        with st.expander("Detail Approval per Modul", expanded=False):
+                if approvals:
+                        for label, count, page_key in approvals:
+                                st.write(f"• {label}: {count}")
+                else:
+                        st.write("Tidak ada approval pending.")
 
     st.markdown("---")
     # 2) Status Surat & MoU (mendekati jatuh tempo)
