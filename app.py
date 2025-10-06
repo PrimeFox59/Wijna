@@ -1376,7 +1376,7 @@ def inventory_module():
                 # Tampilkan hanya kolom: id, name, location, status, pic, updated_at
                 cols_show = ["id", "name", "location", "status", "pic", "updated_at"]
                 show_df = filtered_df.reindex(columns=cols_show)
-                st.dataframe(show_df, use_container_width=True)
+                st.dataframe(show_df, width='stretch')
 
                 lampiran_list = [
                     f"{row.get('name')} - {row.get('file_name')}" for _, row in filtered_df.iterrows()
@@ -1748,7 +1748,7 @@ def surat_masuk_module():
         rekap_df = df[df.get("rekap", 0) == 1].copy() if not df.empty else df.copy()
         if not rekap_df.empty:
             # Build download links column via buttons below table
-            st.dataframe(rekap_df[show_cols], use_container_width=True, hide_index=True)
+            st.dataframe(rekap_df[show_cols], width='stretch', hide_index=True)
             # Optional: quick download selector
             files = [
                 f"{r.get('nomor','')}: {r.get('file_name','')}" for _, r in rekap_df.iterrows() if r.get("file_id") and r.get("file_name")
@@ -2059,7 +2059,7 @@ def surat_keluar_module():
             df = df.copy().sort_values(by="tanggal", ascending=False).reset_index(drop=True)
             # Kode referensi tampilan
             df["indeks"] = [f"SK-{i+1:04d}" for i in range(len(df))]
-            st.dataframe(df[[c for c in ["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"] if c in df.columns]], use_container_width=True, hide_index=True)
+            st.dataframe(df[[c for c in ["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"] if c in df.columns]], width='stretch', hide_index=True)
             st.markdown("#### Download File Final Surat Keluar")
             for idx, row in df.iterrows():
                 if row.get("final_file_id") and row.get("final_name"):
@@ -2200,11 +2200,9 @@ def user_setting_module():
     st.markdown("---")
     if str(user.get('role', '')).lower() in ["director", "superuser"]:
         st.subheader("🛠️ Admin Pengguna (Director)")
-        # Simple grid
         df_show = df.copy()
         cols_wanted = [c for c in [email_col, 'full_name', 'role', 'active', 'created_at'] if c in df_show.columns]
-        st.dataframe(df_show[cols_wanted], use_container_width=True)
-
+        st.dataframe(df_show[cols_wanted], width='stretch')
         st.markdown("### Edit User")
         sel_user = st.selectbox("Pilih user", df[email_col].astype(str).tolist())
         if sel_user:
@@ -2311,7 +2309,7 @@ def audit_trail_module():
         except Exception:
             pass
 
-        st.dataframe(fdf, use_container_width=True, hide_index=True)
+        st.dataframe(fdf, width='stretch', hide_index=True)
 
         # Export filtered
         if not fdf.empty:
@@ -2372,7 +2370,7 @@ def superuser_panel():
         if df_cfg.empty:
             st.info("Belum ada data di config sheet.")
         else:
-            st.dataframe(df_cfg[base_cols], use_container_width=True)
+            st.dataframe(df_cfg[base_cols], width='stretch')
             st.caption(f"Total entri: {len(df_cfg)}")
 
     st.markdown("---")
@@ -2711,7 +2709,7 @@ def superuser_panel():
                     emails = []
                 rows.append({"role": r, "jumlah": len(emails), "emails": ", ".join(emails)})
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(rows), width='stretch')
             else:
                 st.info("Tidak ada data untuk roles dipilih.")
 
@@ -2841,7 +2839,7 @@ def main():
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    st.sidebar.image(logo_path, use_container_width=True)
+    st.sidebar.image(logo_path, width=None)  # width None biarkan auto; use_container_width deprecated
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Management System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
@@ -2889,7 +2887,7 @@ def main():
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
         with col:
-            btn = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            btn = st.button(label, key=f"nav_{key}", help=key)
             if btn:
                 st.session_state["page"] = key
                 st.rerun()
@@ -2897,7 +2895,7 @@ def main():
     # --- Logout button at the very bottom ---
     if user:
         st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
-        if st.sidebar.button("Logout", key="sidebar_logout", use_container_width=True):
+    if st.sidebar.button("Logout", key="sidebar_logout"): 
             logout()
             st.rerun()
 
