@@ -159,6 +159,24 @@ def safe_dataframe(df: pd.DataFrame, **kwargs):
     except Exception:
         st.write(df.head())
 
+def safe_image(path: str, **kwargs):
+    """Display an image if available; fallback to a simple placeholder message.
+
+    Parameters
+    ----------
+    path : str
+        Local file path to image.
+    **kwargs : Any
+        Forwarded to st.image.
+    """
+    try:
+        if path and os.path.exists(path):
+            st.image(path, **kwargs)
+        else:
+            st.write("(logo tidak ditemukan)")
+    except Exception as e:
+        st.write(f"Gagal menampilkan gambar: {e}")
+
 
 
 # --- 4. MANAJEMEN SESSION STATE ---
