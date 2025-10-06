@@ -127,6 +127,31 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
 NOTIF_ROLE_MAP = {}
 ALLOWED_ROLES = ["user","finance","director","superuser"]
 
+_SPREADSHEET_CACHE_KEY = "_cached_spreadsheet_obj"
+
+def get_spreadsheet():
+    """Return the gspread Spreadsheet object.
+
+    Uses SPREADSHEET_URL if set; optionally supports SPREADSHEET_KEY env var.
+    Caches the Spreadsheet in st.session_state to avoid repeated open calls.
+    Raises a RuntimeError with a friendly message if credentials or URL missing.
+    """
+    if _SPREADSHEET_CACHE_KEY in st.session_state:
+        return st.session_state[_SPREADSHEET_CACHE_KEY]
+    url = SPREADSHEET_URL.strip()
+    key = os.environ.get("SPREADSHEET_KEY", "").strip()
+    if not url and key:
+        url = f"https://docs.google.com/spreadsheets/d/{key}"
+    if not url:
+        raise RuntimeError("SPREADSHEET_URL (atau SPREADSHEET_KEY) belum dikonfigurasi")
+    try:
+        client = get_gsheets_client()
+        ss = client.open_by_url(url)
+        st.session_state[_SPREADSHEET_CACHE_KEY] = ss
+        return ss
+    except Exception as e:
+        raise RuntimeError(f"Gagal membuka spreadsheet: {e}")
+
 def is_superuser_auto_enabled():
     return True
 
