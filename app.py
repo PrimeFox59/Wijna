@@ -2437,7 +2437,7 @@ def superuser_panel():
                     except Exception:
                         pass
                 _clear_config_cache()
-                st.experimental_rerun()
+                st.rerun()
 
     st.markdown("---")
     st.subheader("🗑️ Hapus Mapping")
@@ -2482,7 +2482,7 @@ def superuser_panel():
                     except Exception:
                         pass
                     _clear_config_cache()
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.warning("Gagal menemukan baris mapping untuk dihapus.")
 
