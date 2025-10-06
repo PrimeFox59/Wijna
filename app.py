@@ -97,6 +97,8 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     # SOP events
     ("sop", "upload"): ["director"],
     ("sop", "director_approval"): ["staff", "finance"],
+    # MoU due soon automatic alert
+    ("mou", "due_soon"): ["director", "finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -633,6 +635,7 @@ def ensure_core_sheets():
             "draft_file_id", "draft_file_name", "draft_file_link",
             "board_note", "board_approved",
             "final_file_id", "final_file_name", "final_file_link",
+            "due_notified",  # flag otomatis notifikasi jatuh tempo (<=7 hari)
             "created_at", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
@@ -1361,6 +1364,57 @@ def dashboard():
                         mou['_tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
                         upcoming_limit = pd.Timestamp.today() + pd.Timedelta(days=7)
                         mou_due7 = mou[mou['_tgl_selesai_dt'].notna() & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)].shape[0]
+                        # --- Automated notification for due <=7 days ---
+                        try:
+                            if mou_due7 > 0:
+                                # Ensure due_notified column exists
+                                if 'due_notified' not in mou.columns:
+                                    mou['due_notified'] = ''
+                                due_rows = mou[(mou['_tgl_selesai_dt'].notna()) & (mou['_tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['_tgl_selesai_dt'] <= upcoming_limit)]
+                                need_notify = due_rows[due_rows.get('due_notified','').astype(str).str.strip() == '']
+                                if not need_notify.empty:
+                                    # Collect recipients via NOTIF_ROLE_MAP for a new event key (mou,due_soon)
+                                    # Fallback: director + finance + superuser roles
+                                    notif_roles = NOTIF_ROLE_MAP.get(("mou","due_soon"), ["director","finance"])
+                                    # load users sheet to map roles -> emails
+                                    try:
+                                        users_df = pd.DataFrame(_get_ws(USERS_SHEET_NAME).get_all_records())
+                                    except Exception:
+                                        users_df = pd.DataFrame()
+                                    recipients = []
+                                    if not users_df.empty and 'email' in users_df.columns and 'role' in users_df.columns:
+                                        for r in notif_roles + ["superuser"]:
+                                            recipients.extend(users_df[users_df['role'].astype(str).str.lower()==r]['email'].tolist())
+                                    subject = f"[WIJNA] MoU akan jatuh tempo ≤7 hari ({len(need_notify)})"
+                                    body_lines = ["Daftar MoU yang akan jatuh tempo dalam 7 hari:"]
+                                    for _, row in need_notify.iterrows():
+                                        body_lines.append(f"- {row.get('nomor','?')} | {row.get('nama','?')} | berakhir: {row.get('tgl_selesai','?')}")
+                                    body_lines.append("\nSegera lakukan perpanjangan atau tindak lanjut sesuai prosedur.")
+                                    body = "\n".join(body_lines)
+                                    if recipients:
+                                        _send_async(send_notification_bulk, recipients, subject, body)
+                                    # Update due_notified flag in sheet
+                                    try:
+                                        ws_mou = _get_ws(MOU_SHEET_NAME)
+                                        headers_mou = ws_mou.row_values(1)
+                                        if 'due_notified' not in headers_mou:
+                                            # Should have been ensured by ensure_core_sheets, skip if absent
+                                            pass
+                                        else:
+                                            col_idx = headers_mou.index('due_notified') + 1
+                                            for _, row in need_notify.iterrows():
+                                                try:
+                                                    cell = ws_mou.find(str(row.get('id','')))
+                                                    if cell:
+                                                        a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                                                        ws_mou.update(a1, [[now_wib_iso()]])
+                                                except Exception:
+                                                    continue
+                                            _invalidate_data_cache()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                 except Exception:
                         pass
 
@@ -1404,6 +1458,16 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+                nav_cols = st.columns(3)
+                with nav_cols[0]:
+                    if st.button("📦", help="Ke Inventory", key="card_inv_nav"):
+                        st.session_state["page"] = "Inventory"; st.experimental_rerun()
+                with nav_cols[1]:
+                    if st.button("💸", help="Ke Cash Advance", key="card_ca_nav"):
+                        st.session_state["page"] = "Cash Advance"; st.experimental_rerun()
+                with nav_cols[2]:
+                    if st.button("📝", help="Ke Delegasi", key="card_del_nav"):
+                        st.session_state["page"] = "Delegasi"; st.experimental_rerun()
         with c2:
                 st.markdown(f"""
                 <div class='stat-card'>
@@ -1421,6 +1485,13 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+                nav_cols2 = st.columns(2)
+                with nav_cols2[0]:
+                    if st.button("📥", help="Ke Surat Masuk", key="card_sm_nav"):
+                        st.session_state["page"] = "Surat Masuk"; st.experimental_rerun()
+                with nav_cols2[1]:
+                    if st.button("📤", help="Ke Surat Keluar", key="card_sk_nav"):
+                        st.session_state["page"] = "Surat Keluar"; st.experimental_rerun()
         with c3:
                 st.markdown(f"""
                 <div class='stat-card'>
@@ -1438,6 +1509,13 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+                nav_cols3 = st.columns(2)
+                with nav_cols3[0]:
+                    if st.button("🤝", help="Ke MoU", key="card_mou_nav"):
+                        st.session_state["page"] = "MoU"; st.experimental_rerun()
+                with nav_cols3[1]:
+                    if st.button("📚", help="Ke SOP", key="card_sop_nav"):
+                        st.session_state["page"] = "SOP"; st.experimental_rerun()
 
         # Expandable detailed approvals list (optional)
         with st.expander("Detail Approval per Modul", expanded=False):
@@ -1468,7 +1546,10 @@ def dashboard():
                 mou['tgl_selesai_dt'] = pd.to_datetime(mou['tgl_selesai'], errors='coerce')
                 soon = mou[mou['tgl_selesai_dt'].notna() & (mou['tgl_selesai_dt'] >= pd.Timestamp.today()) & (mou['tgl_selesai_dt'] <= pd.Timestamp.today() + pd.Timedelta(days=30))]
                 soon = soon.sort_values('tgl_selesai_dt')
-                st.write(f"MoU hampir jatuh tempo (≤30 hari): {len(soon)}")
+                total_active = mou[mou['tgl_selesai_dt'].notna()].shape[0]
+                due_pct = (len(soon) / total_active * 100) if total_active else 0
+                st.write(f"MoU hampir jatuh tempo (≤30 hari): {len(soon)} dari {total_active} ({due_pct:.1f}%)")
+                st.progress(min(int(due_pct), 100))
                 if not soon.empty:
                     show = soon[['nomor','nama','tgl_selesai']].head(5)
                     safe_dataframe(show, index=False, height=180)
@@ -1555,6 +1636,43 @@ def dashboard():
             if f in df.columns:
                 return (df[f].astype(str).str[:7] == this_month).sum()
         return 0
+    # Sparkline helper (last 6 months including this month)
+    def _monthly_series(df: pd.DataFrame, date_fields: list[str], months_back: int = 5) -> list[int]:
+        if df.empty:
+            return [0]*(months_back+1)
+        # find first existing date field
+        date_col = None
+        for f in date_fields:
+            if f in df.columns:
+                date_col = f
+                break
+        if not date_col:
+            return [0]*(months_back+1)
+        ser = pd.to_datetime(df[date_col], errors='coerce')
+        now_month = date.today().replace(day=1)
+        counts = []
+        for i in range(months_back, -1, -1):
+            mstart = (now_month - pd.DateOffset(months=i))
+            mend = (mstart + pd.DateOffset(months=1))
+            mask = (ser >= mstart) & (ser < mend)
+            counts.append(int(mask.sum()))
+        return counts
+    def _sparkline(values: list[int], width: int = 90, height: int = 28, stroke: str = "#2563eb") -> str:
+        if not values:
+            values = [0]
+        mx = max(values) or 1
+        step = width / max(len(values)-1, 1)
+        pts = []
+        for i, v in enumerate(values):
+            x = i*step
+            y = height - (v/mx*height)
+            pts.append(f"{x:.1f},{y:.1f}")
+        polyline = " ".join(pts)
+        circles = ''.join([f"<circle cx='{i*step:.1f}' cy='{height - (v/mx*height):.1f}' r='2' fill='{stroke}'/>" for i, v in enumerate(values)])
+        return f"""<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg'>
+            <polyline fill='none' stroke='{stroke}' stroke-width='2' points='{polyline}' stroke-linejoin='round' stroke-linecap='round' />
+            {circles}
+        </svg>"""
     rekap_data = [
         ("Cash Advance", _monthly_count(ca, ["tanggal","created_at"])),
         ("PMR", _monthly_count(pmr, ["bulan","tanggal_submit"])),
@@ -1565,9 +1683,23 @@ def dashboard():
         ("SOP", _monthly_count(sop, ["tanggal_terbit","tanggal_upload","created_at"]))
     ]
     cols = st.columns(4)
+    series_map = {
+        "Cash Advance": _monthly_series(ca, ["tanggal","created_at"]),
+        "PMR": _monthly_series(pmr, ["tanggal_submit","bulan"]),
+        "Inventory Update": _monthly_series(inv, ["updated_at"]),
+        "Surat Masuk": _monthly_series(sm, ["tanggal","created_at"]),
+        "Surat Keluar": _monthly_series(sk, ["tanggal","created_at"]),
+        "Notulen": _monthly_series(notulen, ["tanggal_rapat","tanggal_upload","created_at"]),
+        "SOP": _monthly_series(sop, ["tanggal_terbit","tanggal_upload","created_at"])
+    }
     for i, (label, val) in enumerate(rekap_data):
         with cols[i % 4]:
             st.metric(label, val)
+            try:
+                svg = _sparkline(series_map.get(label, []))
+                st.markdown(f"<div style='margin-top:-10px'>{svg}</div>", unsafe_allow_html=True)
+            except Exception:
+                pass
 
     st.markdown("---")
     # 6) Kalender Bersama (upcoming events & mobil booking)
