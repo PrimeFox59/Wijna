@@ -2913,31 +2913,17 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS baru: ukuran tombol seragam (single column full width) dengan tinggi konsisten
+    # CSS agar tombol navigasi seragam dan rapi
     st.sidebar.markdown(
         """
         <style>
-        #wijna-nav-area button, #wijna-logout-area button {
+        .wijna-nav-btn > button {
             width: 100% !important;
-            height: 52px !important;
-            min-height: 52px !important;
-            padding: 6px 12px !important;
-            margin-bottom: 8px !important;
-            font-size: 0.96rem !important;
-            font-weight: 600 !important;
-            border-radius: 10px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            line-height: 1.15 !important;
-            white-space: normal !important;
-            text-align: center !important;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+            min-height: 42px !important;
+            font-size: 1.05rem !important;
+            margin-bottom: 6px !important;
+            border-radius: 6px !important;
         }
-        #wijna-nav-area button:hover, #wijna-logout-area button:hover {outline: 2px solid rgba(59,130,246,0.35) !important;}
-        #wijna-nav-area {margin-top:0.25rem;}
-        #wijna-logout-area {margin-top:0.75rem;}
-        </style>
         </style>
         """,
         unsafe_allow_html=True
@@ -2945,20 +2931,21 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Navigasi Modul")
-    st.sidebar.markdown('<div id="wijna-nav-area">', unsafe_allow_html=True)
-    for key, label in menu:
-        if st.sidebar.button(label, key=f"nav_{key}", help=key):
-            st.session_state["page"] = key
-            st.rerun()
-    st.sidebar.markdown('</div>', unsafe_allow_html=True)
+    nav_cols = st.sidebar.columns(2)
+    for idx, (key, label) in enumerate(menu):
+        col = nav_cols[idx % 2]
+        with col:
+            btn = st.button(label, key=f"nav_{key}", help=key)
+            if btn:
+                st.session_state["page"] = key
+                st.rerun()
 
     # --- Logout button at the very bottom ---
     if user:
-        st.sidebar.markdown('<div id="wijna-logout-area">', unsafe_allow_html=True)
-        if st.sidebar.button("🚪 Logout", key="sidebar_logout", help="Keluar aplikasi"):
+        st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
+    if st.sidebar.button("Logout", key="sidebar_logout"): 
             logout()
             st.rerun()
-        st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     choice = st.session_state["page"]
 
