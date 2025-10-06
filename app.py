@@ -1252,18 +1252,8 @@ def _users_delete_row(ws, row_idx: int):
 
 def dashboard():
     st.title("🏠 Dashboard Monitoring")
-    st.caption("Ringkasan cepat status operasional & approvals. Gunakan tombol refresh bila data baru saja berubah.")
-    col_refresh, col_time = st.columns([1,3])
-    with col_refresh:
-        if st.button("🔄 Refresh Data", type="secondary"):
-            try:
-                _invalidate_data_cache()
-                st.session_state["_dash_last_load"] = 0  # force next load
-            except Exception:
-                pass
-            st.rerun()
-    with col_time:
-        st.write(f"Waktu (WIB): {now_wib_iso()}")
+    st.caption("Ringkasan cepat status operasional & approvals.")
+    st.write(f"Waktu (WIB): {now_wib_iso()}")
 
     # Helper generic loader
     def _load_sheet(name: str, expected: list[str] | None = None) -> pd.DataFrame:
