@@ -322,7 +322,7 @@ def get_spreadsheet():
     return client.open_by_url(SPREADSHEET_URL)
 
 
-@st.cache_data(ttl=60, show_spinner=False, max_entries=64)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=64)
 def _cached_get_all_records(sheet_name: str, expected_headers: list | None = None):
     """Ambil seluruh records dari sebuah sheet dengan cache dan retry ringan.
     - ttl 60s untuk mengurangi beban read
@@ -1258,6 +1258,7 @@ def dashboard():
         if st.button("🔄 Refresh Data", type="secondary"):
             try:
                 _invalidate_data_cache()
+                st.session_state["_dash_last_load"] = 0  # force next load
             except Exception:
                 pass
             st.rerun()
@@ -1287,64 +1288,97 @@ def dashboard():
     today = date.today()
     this_month = today.strftime("%Y-%m")
 
+    # Throttle logic: avoid re-fetching all sheets if called again within 10s (unless refresh pressed)
+    now_ts = time.time()
+    last_load = st.session_state.get("_dash_last_load", 0)
+    throttle_active = (now_ts - last_load) < 10
+    if not throttle_active:
+        st.session_state["_dash_last_load"] = now_ts
+
     # 1) Approvals needed across modules
     st.markdown("### ✅ Approval Menunggu")
     approvals = []
-    # Inventory
-    inv = _load_sheet(INVENTORY_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'INVENTORY_SHEET_NAME' in globals() else pd.DataFrame()
+    # Batch load all relevant sheets once to minimize API calls
+    sheet_specs = [
+        (INVENTORY_SHEET_NAME, ["finance_approved","director_approved","id"]),
+        (SURAT_MASUK_SHEET_NAME, ["director_approved","status","id"]),
+        (SURAT_KELUAR_SHEET_NAME, ["director_approved","id"]),
+        (MOU_SHEET_NAME, ["board_approved","tgl_selesai","id","due_notified","nomor","nama"]),
+        (CASH_ADVANCE_SHEET_NAME, ["finance_approved","director_approved","id","tanggal","created_at"]),
+        (PMR_SHEET_NAME, ["finance_approved","director_approved","id","tanggal_submit","bulan"]),
+        (FLEX_SHEET_NAME, ["approval_finance","approval_director","id","tanggal"]),
+        (NOTULEN_SHEET_NAME, ["director_approved","id","tanggal_rapat","tanggal_upload","created_at"]),
+        (SOP_SHEET_NAME, ["director_approved","id","tanggal_terbit","tanggal_upload","created_at"]),
+        (CUTI_SHEET_NAME, ["finance_approved","director_approved","status","id","sisa_kuota","nama","created_at"]),
+        (DELEGASI_SHEET_NAME, ["judul","pic","status","tgl_selesai","id"]),
+        (CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"]),
+        (MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"])
+    ]
+    if throttle_active and "_dash_cache" in st.session_state:
+        loaded = st.session_state["_dash_cache"]
+    else:
+        loaded: dict[str, pd.DataFrame] = {}
+        for title, exp in sheet_specs:
+            try:
+                loaded[title] = _load_sheet(title, exp)
+            except Exception:
+                loaded[title] = pd.DataFrame(columns=exp)
+        st.session_state["_dash_cache"] = loaded
+
+    inv = loaded.get(INVENTORY_SHEET_NAME, pd.DataFrame())
     if not inv.empty:
         finance_pending = (inv['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in inv.columns else 0
         director_pending = (inv['director_approved'].astype(str) == '0').sum() if 'director_approved' in inv.columns else 0
         if finance_pending: approvals.append(("Inventory (Finance)", finance_pending, "Inventory"))
         if director_pending: approvals.append(("Inventory (Director)", director_pending, "Inventory"))
     # Surat Masuk
-    sm = _load_sheet(SURAT_MASUK_SHEET_NAME, ["director_approved","id"]) if 'SURAT_MASUK_SHEET_NAME' in globals() else pd.DataFrame()
+    sm = loaded.get(SURAT_MASUK_SHEET_NAME, pd.DataFrame())
     if not sm.empty and 'director_approved' in sm.columns:
         pending = (sm['director_approved'].astype(str) == '0').sum()
         if pending: approvals.append(("Surat Masuk (Director)", pending, "Surat Masuk"))
     # Surat Keluar
-    sk = _load_sheet(SURAT_KELUAR_SHEET_NAME, ["director_approved","id"]) if 'SURAT_KELUAR_SHEET_NAME' in globals() else pd.DataFrame()
+    sk = loaded.get(SURAT_KELUAR_SHEET_NAME, pd.DataFrame())
     if not sk.empty and 'director_approved' in sk.columns:
         pending = (sk['director_approved'].astype(str) == '0').sum()
         if pending: approvals.append(("Surat Keluar (Director)", pending, "Surat Keluar"))
     # MoU
-    mou = _load_sheet(MOU_SHEET_NAME, ["board_approved","id"]) if 'MOU_SHEET_NAME' in globals() else pd.DataFrame()
+    mou = loaded.get(MOU_SHEET_NAME, pd.DataFrame())
     if not mou.empty and 'board_approved' in mou.columns:
         pending = (mou['board_approved'].astype(str) == '0').sum()
         if pending: approvals.append(("MoU (Board)", pending, "MoU"))
     # Cash Advance
-    ca = _load_sheet(CASH_ADVANCE_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'CASH_ADVANCE_SHEET_NAME' in globals() else pd.DataFrame()
+    ca = loaded.get(CASH_ADVANCE_SHEET_NAME, pd.DataFrame())
     if not ca.empty:
         fp = (ca['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in ca.columns else 0
         dp = (ca['director_approved'].astype(str) == '0').sum() if 'director_approved' in ca.columns else 0
         if fp: approvals.append(("Cash Advance (Finance)", fp, "Cash Advance"))
         if dp: approvals.append(("Cash Advance (Director)", dp, "Cash Advance"))
     # PMR
-    pmr = _load_sheet(PMR_SHEET_NAME, ["finance_approved","director_approved","id"]) if 'PMR_SHEET_NAME' in globals() else pd.DataFrame()
+    pmr = loaded.get(PMR_SHEET_NAME, pd.DataFrame())
     if not pmr.empty:
         fp = (pmr['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in pmr.columns else 0
         dp = (pmr['director_approved'].astype(str) == '0').sum() if 'director_approved' in pmr.columns else 0
         if fp: approvals.append(("PMR (Finance)", fp, "PMR"))
         if dp: approvals.append(("PMR (Director)", dp, "PMR"))
     # Flex
-    flex = _load_sheet(FLEX_SHEET_NAME, ["approval_finance","approval_director","id"]) if 'FLEX_SHEET_NAME' in globals() else pd.DataFrame()
+    flex = loaded.get(FLEX_SHEET_NAME, pd.DataFrame())
     if not flex.empty:
         fp = (flex['approval_finance'].astype(str) == '0').sum() if 'approval_finance' in flex.columns else 0
         dp = (flex['approval_director'].astype(str) == '0').sum() if 'approval_director' in flex.columns else 0
         if fp: approvals.append(("Flex (Finance)", fp, "Flex Time"))
         if dp: approvals.append(("Flex (Director)", dp, "Flex Time"))
     # Notulen
-    notulen = _load_sheet(NOTULEN_SHEET_NAME, ["director_approved","id"]) if 'NOTULEN_SHEET_NAME' in globals() else pd.DataFrame()
+    notulen = loaded.get(NOTULEN_SHEET_NAME, pd.DataFrame())
     if not notulen.empty and 'director_approved' in notulen.columns:
         pend = (notulen['director_approved'].astype(str) == '0').sum()
         if pend: approvals.append(("Notulen (Director)", pend, "Notulen"))
     # SOP
-    sop = _load_sheet(SOP_SHEET_NAME, ["director_approved","id"]) if 'SOP_SHEET_NAME' in globals() else pd.DataFrame()
+    sop = loaded.get(SOP_SHEET_NAME, pd.DataFrame())
     if not sop.empty and 'director_approved' in sop.columns:
         pend = (sop['director_approved'].astype(str) == '0').sum()
         if pend: approvals.append(("SOP (Director)", pend, "SOP"))
     # Cuti
-    cuti = _load_sheet(CUTI_SHEET_NAME, ["finance_approved","director_approved","status","id"]) if 'CUTI_SHEET_NAME' in globals() else pd.DataFrame()
+    cuti = loaded.get(CUTI_SHEET_NAME, pd.DataFrame())
     if not cuti.empty:
         fp = (cuti['finance_approved'].astype(str) == '0').sum() if 'finance_approved' in cuti.columns else 0
         dp = (cuti['director_approved'].astype(str) == '0').sum() if 'director_approved' in cuti.columns else 0
@@ -1570,7 +1604,7 @@ def dashboard():
     st.markdown("---")
     # 4) Delegasi Tugas Aktif
     st.markdown("### 🗂️ Delegasi Tugas Aktif")
-    delegasi = _load_sheet(DELEGASI_SHEET_NAME, ["judul","pic","status","tgl_selesai","id"]) if 'DELEGASI_SHEET_NAME' in globals() else pd.DataFrame()
+    delegasi = loaded.get(DELEGASI_SHEET_NAME, pd.DataFrame())
     if not delegasi.empty:
         active = delegasi[delegasi['status'].astype(str).str.lower().isin(["", "proses", "progress", "ongoing", "open", "aktif"])]
         if not active.empty:
@@ -1680,8 +1714,8 @@ def dashboard():
     st.markdown("---")
     # 6) Kalender Bersama (upcoming events & mobil booking)
     st.markdown("### 📅 Kalender & Event Mendatang (14 hari)")
-    cal = _load_sheet(CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"]) if 'CALENDAR_SHEET_NAME' in globals() else pd.DataFrame()
-    mobil = _load_sheet(MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"]) if 'MOBIL_SHEET_NAME' in globals() else pd.DataFrame()
+    cal = loaded.get(CALENDAR_SHEET_NAME, pd.DataFrame())
+    mobil = loaded.get(MOBIL_SHEET_NAME, pd.DataFrame())
     horizon_end = today + timedelta(days=14)
     upcoming_rows = []
     if not cal.empty:
