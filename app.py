@@ -34,6 +34,7 @@ SURAT_KELUAR_SHEET_NAME = "surat_keluar"
 CONFIG_SHEET_NAME = "config"
 MOU_SHEET_NAME = "mou"
 CASH_ADVANCE_SHEET_NAME = "cash_advance"
+PMR_SHEET_NAME = "pmr"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -65,6 +66,10 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("cash_advance", "create"): ["finance"],
     ("cash_advance", "finance_review"): ["director"],
     ("cash_advance", "director_approval"): ["finance"],
+    # PMR events
+    ("pmr", "upload"): ["finance"],
+    ("pmr", "finance_review"): ["director"],
+    ("pmr", "director_approval"): ["finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -605,6 +610,14 @@ def ensure_core_sheets():
             "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
         ]
         ensure_sheet_with_headers(spreadsheet, CASH_ADVANCE_SHEET_NAME, ca_headers)
+
+        # PMR sheet
+        pmr_headers = [
+            "id", "nama", "bulan", "file1_id", "file1_name", "file2_id", "file2_name",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tanggal_submit", "updated_at", "submitted_by"
+        ]
+        ensure_sheet_with_headers(spreadsheet, PMR_SHEET_NAME, pmr_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -2861,8 +2874,261 @@ def cash_advance_module():
 
 
 def pmr_module():
+    user = require_login()
     st.header("📑 PMR")
-    st.info("Module coming soon (Sheets + Drive)")
+
+    def _pmr_headers():
+        return [
+            "id", "nama", "bulan", "file1_id", "file1_name", "file2_id", "file2_name",
+            "finance_note", "finance_approved", "director_note", "director_approved",
+            "tanggal_submit", "updated_at", "submitted_by"
+        ]
+
+    def _pmr_ws():
+        try:
+            return _get_ws(PMR_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), PMR_SHEET_NAME, _pmr_headers())
+
+    def _pmr_read_df():
+        ws = _pmr_ws()
+        headers = _pmr_headers()
+        try:
+            records = _cached_get_all_records(PMR_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = "" if h not in ("finance_approved", "director_approved") else 0
+        for col in ["finance_approved", "director_approved"]:
+            df[col] = pd.to_numeric(df.get(col), errors='coerce').fillna(0).astype(int)
+        return ws, df
+
+    def _pmr_append(row: dict):
+        ws = _pmr_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.2 * (i + 1))
+                    continue
+                raise
+
+    def _pmr_update_by_id(pid: str, updates: dict):
+        ws = _pmr_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(pid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _upload_file(file):
+        if not file:
+            return None, None, None
+        try:
+            drive = get_gdrive_service()
+            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            meta = {'name': file.name, 'parents': [GDRIVE_FOLDER_ID]}
+            created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
+            return created.get('id'), file.name, created.get('webViewLink')
+        except Exception:
+            return None, None, None
+
+    tab_upload, tab_finance, tab_director, tab_rekap = st.tabs([
+        "📝 Upload Laporan Bulanan (Staf)",
+        "💰 Review & Approval Finance",
+        "✅ Approval Director PMR",
+        "📋 Daftar & Rekap PMR"
+    ])
+
+    # --- Upload (Staf) ---
+    with tab_upload:
+        st.markdown("### Upload Laporan Bulanan (Staf)")
+        with st.form("pmr_add", clear_on_submit=True):
+            nama = st.text_input("Nama Pegawai")
+            year_now = date.today().year
+            bulan_opts = [f"{y}-{m:02d}" for y in range(year_now - 1, year_now + 2) for m in range(1, 13)]
+            bulan = st.selectbox("Bulan (YYYY-MM)", options=bulan_opts, index=bulan_opts.index(f"{year_now}-{date.today().month:02d}") if f"{year_now}-{date.today().month:02d}" in bulan_opts else 0)
+            f1 = st.file_uploader("File Laporan 1 (wajib)", key="pmr_file1")
+            f2 = st.file_uploader("File Laporan 2 (opsional)", key="pmr_file2")
+            # Duplicate check
+            _, df_pmr = _pmr_read_df()
+            duplicate = False
+            if nama and bulan and not df_pmr.empty:
+                duplicate = not df_pmr[(df_pmr['nama'].astype(str).str.lower() == nama.lower()) & (df_pmr['bulan'] == bulan)].empty
+            submit = st.form_submit_button("Submit")
+            if submit:
+                if not nama or not bulan:
+                    st.error("Nama dan Bulan wajib diisi.")
+                elif duplicate:
+                    st.error("Sudah ada laporan bulan ini untuk nama tersebut.")
+                elif not f1:
+                    st.error("Minimal 1 file wajib diupload.")
+                else:
+                    pid = gen_id("pmr")
+                    fid1, fname1, link1 = _upload_file(f1)
+                    fid2, fname2, link2 = (None, None, None)
+                    if f2:
+                        fid2, fname2, link2 = _upload_file(f2)
+                    row = {
+                        "id": pid,
+                        "nama": nama,
+                        "bulan": bulan,
+                        "file1_id": fid1 or "",
+                        "file1_name": fname1 or "",
+                        "file2_id": fid2 or "",
+                        "file2_name": fname2 or "",
+                        "finance_note": "",
+                        "finance_approved": 0,
+                        "director_note": "",
+                        "director_approved": 0,
+                        "tanggal_submit": now_wib_iso(),
+                        "updated_at": now_wib_iso(),
+                        "submitted_by": (get_current_user() or {}).get("email", "")
+                    }
+                    _pmr_append(row)
+                    try:
+                        audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={fname1}; file2={fname2 or '-'}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event("pmr", "upload", subject="Upload PMR Baru", body=f"PMR {pid} oleh {nama} bulan {bulan}")
+                    except Exception:
+                        pass
+                    st.success("Laporan bulanan berhasil diupload.")
+                    st.rerun()
+
+    # --- Finance Review ---
+    with tab_finance:
+        st.markdown("### Review & Approval Finance")
+        st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Superuser yang dapat mengakses.")
+        if user.get("role") in ["finance", "superuser"]:
+            _, df_fin = _pmr_read_df()
+            if df_fin.empty:
+                st.info("Belum ada laporan.")
+            else:
+                try:
+                    df_fin = df_fin.sort_values(by="tanggal_submit", ascending=False)
+                except Exception:
+                    pass
+                for idx, row in df_fin.iterrows():
+                    with st.expander(f"{row['nama']} | {row['bulan']}"):
+                        st.write(f"File 1: {row.get('file1_name','-')}")
+                        if row.get('file2_name'):
+                            st.write(f"File 2: {row.get('file2_name')}")
+                        st.write(f"Catatan: {row.get('finance_note','')}")
+                        note = st.text_area("Catatan Finance", value=row.get('finance_note',''), key=f"fin_note_{row['id']}")
+                        colA, colB = st.columns(2)
+                        with colA:
+                            ajukan = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                        with colB:
+                            kembalikan = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                        if ajukan:
+                            _pmr_update_by_id(row['id'], {"finance_note": note, "finance_approved": 1, "updated_at": now_wib_iso()})
+                            try:
+                                audit_log("pmr", "finance_review", target=row['id'], details=f"approve=1; note={note}")
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("pmr", "finance_review", subject="PMR ke Director", body=f"PMR {row['id']} diajukan ke Director")
+                            except Exception:
+                                pass
+                            st.success("Diajukan ke Director.")
+                            st.rerun()
+                        if kembalikan:
+                            _pmr_update_by_id(row['id'], {"finance_note": note + "\n[Perlu revisi oleh user]", "finance_approved": 0, "updated_at": now_wib_iso()})
+                            try:
+                                audit_log("pmr", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                            except Exception:
+                                pass
+                            st.warning("Dikembalikan ke user peminta.")
+                            st.rerun()
+        else:
+            st.info("Hanya Finance yang dapat review di sini.")
+
+    # --- Director Approval ---
+    with tab_director:
+        st.markdown("### Approval Director PMR")
+        st.caption("Director melakukan approval akhir dan memberi catatan. Hanya Director/Superuser yang dapat mengakses.")
+        if user.get("role") in ["director", "superuser"]:
+            _, df_dir = _pmr_read_df()
+            if df_dir.empty:
+                st.info("Belum ada laporan.")
+            else:
+                try:
+                    df_dir = df_dir.sort_values(by="tanggal_submit", ascending=False)
+                except Exception:
+                    pass
+                for idx, row in df_dir.iterrows():
+                    with st.expander(f"{row['nama']} | {row['bulan']}"):
+                        st.write(f"File 1: {row.get('file1_name','-')}")
+                        if row.get('file2_name'):
+                            st.write(f"File 2: {row.get('file2_name')}")
+                        st.write(f"Finance Approved: {'Ya' if row.get('finance_approved') else 'Belum'}")
+                        st.write(f"Catatan: {row.get('director_note','')}")
+                        note = st.text_area("Catatan Director", value=row.get('director_note',''), key=f"dir_note_{row['id']}")
+                        approve = st.checkbox("Approve Director", value=bool(row.get('director_approved')), key=f"dir_approved_{row['id']}")
+                        if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                            _pmr_update_by_id(row['id'], {"director_note": note, "director_approved": 1 if approve else 0, "updated_at": now_wib_iso()})
+                            try:
+                                audit_log("pmr", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                            except Exception:
+                                pass
+                            try:
+                                notify_event("pmr", "director_approval", subject="PMR Director", body=f"Director update untuk {row['id']} approve={bool(approve)}")
+                            except Exception:
+                                pass
+                            st.success("Approval Director disimpan.")
+                            st.rerun()
+        else:
+            st.info("Hanya Director yang dapat approve di sini.")
+
+    # --- Rekap ---
+    with tab_rekap:
+        if user.get("role") in ["finance", "director", "superuser"]:
+            st.markdown("### Daftar & Rekap PMR")
+            _, df_all = _pmr_read_df()
+            if df_all.empty:
+                st.info("Belum ada data PMR.")
+            else:
+                # Filter bulan
+                bulan_list = sorted(df_all['bulan'].dropna().unique().tolist(), reverse=True)
+                filter_bulan = st.selectbox("Pilih Bulan", bulan_list, index=0 if bulan_list else None, key="rekap_bulan")
+                if filter_bulan:
+                    df_month = df_all[df_all['bulan'] == filter_bulan].copy()
+                else:
+                    df_month = pd.DataFrame(columns=df_all.columns)
+                st.write(f"Total laporan bulan ini: {len(df_month)}")
+                if not df_month.empty:
+                    df_month['Status'] = df_month.apply(lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else ('Proses Finance' if not x['finance_approved'] else 'Proses Director'), axis=1)
+                    show_cols = ["nama", "bulan", "tanggal_submit", "Status", "file1_name", "file2_name"]
+                    st.dataframe(df_month[show_cols], width='stretch', hide_index=True)
+        else:
+            st.info("Hanya Finance/Director yang dapat melihat rekap PMR.")
 
 
 def flex_module():
