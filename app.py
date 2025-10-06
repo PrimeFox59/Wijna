@@ -1356,51 +1356,300 @@ def dashboard():
 
     cal, mobil = _load_calendar_and_mobil()
    
-    # 6) Kalender Bersama (upcoming events & mobil booking)
-    st.markdown("### 📅 Kalender & Event Mendatang (14 hari)")
-    # Data sudah diambil lewat cache khusus
-    horizon_end = today + timedelta(days=14)
-    upcoming_rows = []
-    if not cal.empty:
-        try:
-            cal['_mulai'] = pd.to_datetime(cal['tgl_mulai'], errors='coerce')
-            cal['_selesai'] = pd.to_datetime(cal['tgl_selesai'], errors='coerce')
-            filt = cal[cal['_mulai'].notna() & (cal['_mulai'].dt.date >= today) & (cal['_mulai'].dt.date <= horizon_end)]
-            for _, r in filt.iterrows():
-                upcoming_rows.append({
-                    'jenis': r.get('jenis'),
-                    'judul': r.get('judul'),
-                    'mulai': r.get('tgl_mulai'),
-                    'selesai': r.get('tgl_selesai'),
-                    'kategori': 'Libur Nasional' if str(r.get('is_holiday')) == '1' else 'Event'
-                })
-        except Exception:
-            pass
-    if not mobil.empty:
-        try:
-            mobil['_mulai'] = pd.to_datetime(mobil['tgl_mulai'], errors='coerce')
-            mobil['_selesai'] = pd.to_datetime(mobil['tgl_selesai'], errors='coerce')
-            filt2 = mobil[mobil['_mulai'].notna() & (mobil['_mulai'].dt.date >= today) & (mobil['_mulai'].dt.date <= horizon_end)]
-            for _, r in filt2.iterrows():
-                upcoming_rows.append({
-                    'jenis': 'Mobil',
-                    'judul': f"{r.get('kendaraan')} - {r.get('tujuan')}",
-                    'mulai': r.get('tgl_mulai'),
-                    'selesai': r.get('tgl_selesai'),
-                    'kategori': 'Mobil Kantor'
-                })
-        except Exception:
-            pass
-    if upcoming_rows:
-        up_df = pd.DataFrame(upcoming_rows)
-        up_df = up_df.sort_values('mulai')
-        safe_dataframe(up_df.head(25), index=False, height=320)
-        try:
-            st.download_button("⬇️ Export Upcoming (CSV)", up_df.to_csv(index=False).encode('utf-8'), file_name=f"upcoming_events_{today.isoformat()}.csv")
-        except Exception:
-            pass
+    # 6) Kalender Bersama (30 Hari) – gabungan multi sumber sebagai bullet list berwarna
+    st.markdown('<div class="wijna-section-title">📅 Kalender Bersama (30 Hari)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wijna-section-desc">Event & hari libur 30 hari ke depan (cuti, flex, delegasi, rapat, mobil kantor, libur nasional).</div>', unsafe_allow_html=True)
+    horizon_end = today + timedelta(days=30)
+
+    # Ambil data tambahan via sheet langsung (menghindari kueri DB, konsisten dengan arsitektur gsheet)
+    def _sheet_df(sheet_name: str, expected: list[str]):
+        df_ = _load_sheet(sheet_name, expected)
+        return df_ if not df_.empty else pd.DataFrame(columns=expected)
+
+    df_cuti = _sheet_df(CUTI_SHEET_NAME, ["nama","tgl_mulai","tgl_selesai","director_approved"])
+    if not df_cuti.empty:
+        df_cuti = df_cuti[pd.to_numeric(df_cuti.get('director_approved'), errors='coerce').fillna(0).astype(int) == 1]
+        df_cuti = df_cuti.rename(columns={"nama":"judul"})
+        df_cuti['jenis'] = 'Cuti'
+        df_cuti['nama_divisi'] = df_cuti.get('judul', '')
+
+    df_flex = _sheet_df(FLEX_SHEET_NAME, ["nama","tanggal","approval_director","jam_mulai","jam_selesai"])  # flex adalah per tanggal
+    if not df_flex.empty:
+        df_flex = df_flex[pd.to_numeric(df_flex.get('approval_director'), errors='coerce').fillna(0).astype(int) == 1]
+        df_flex = df_flex.rename(columns={"nama":"judul","tanggal":"tgl_mulai"})
+        df_flex['tgl_selesai'] = df_flex['tgl_mulai']
+        df_flex['jenis'] = 'Flex Time'
+        df_flex['nama_divisi'] = df_flex.get('judul','')
+
+    df_delegasi = _sheet_df(DELEGASI_SHEET_NAME, ["judul","pic","tgl_mulai","tgl_selesai"])  # semua delegasi tampil
+    if not df_delegasi.empty:
+        df_delegasi = df_delegasi.rename(columns={"pic":"nama_divisi"})
+        df_delegasi['jenis'] = 'Delegasi'
+
+    df_cal_rapat = cal[cal['jenis'].astype(str).str.lower() == 'rapat'].copy() if not cal.empty else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
+    if not df_cal_rapat.empty:
+        if 'nama_divisi' not in df_cal_rapat.columns:
+            df_cal_rapat['nama_divisi'] = ''
+
+    df_mobil = mobil.copy()
+    if not df_mobil.empty:
+        df_mobil = df_mobil.rename(columns={"tujuan":"judul","kendaraan":"nama_divisi"})
+        df_mobil['jenis'] = 'Mobil Kantor'
+
+    df_libur = cal[cal['is_holiday'].astype(str) == '1'].copy() if not cal.empty else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
+    if not df_libur.empty:
+        if 'jenis' not in df_libur.columns:
+            df_libur['jenis'] = 'Libur Nasional'
+        else:
+            df_libur['jenis'] = 'Libur Nasional'
+        if 'nama_divisi' not in df_libur.columns:
+            df_libur['nama_divisi'] = ''
+
+    # Normalisasi kolom minimal
+    frames = []
+    for df_part in [df_cuti, df_flex, df_delegasi, df_cal_rapat, df_mobil, df_libur]:
+        if df_part is None or df_part.empty:
+            continue
+        needed = ["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"]
+        for c in needed:
+            if c not in df_part.columns:
+                df_part[c] = ''
+        frames.append(df_part[needed].copy())
+    cal30 = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
+
+    if not cal30.empty:
+        # Parse dates
+        for col in ["tgl_mulai","tgl_selesai"]:
+            cal30[col] = pd.to_datetime(cal30[col], errors='coerce')
+        cal30 = cal30[cal30['tgl_mulai'].notna() & cal30['tgl_selesai'].notna()]
+        # filter overlap 30 hari window
+        mask = (cal30['tgl_selesai'].dt.date >= today) & (cal30['tgl_mulai'].dt.date <= horizon_end)
+        cal30 = cal30.loc[mask].copy()
+        cal30 = cal30.sort_values('tgl_mulai')
+        if not cal30.empty:
+            def label_color(jenis: str) -> str:
+                color_map = {
+                    'Cuti': '#f59e42',
+                    'Flex Time': '#38bdf8',
+                    'Delegasi': '#a78bfa',
+                    'Rapat': '#f472b6',
+                    'Mobil Kantor': '#34d399',
+                    'Libur Nasional': '#ef4444',
+                }
+                return f"<span style='background:{color_map.get(jenis,'#9ca3af')};color:#fff;padding:2px 10px;border-radius:8px;font-size:0.75rem;font-weight:600'>{jenis}</span>"
+
+            st.markdown("<ul style='padding-left:1.1em;margin-top:0.5rem'>", unsafe_allow_html=True)
+            for _, r in cal30.iterrows():
+                try:
+                    t1 = r['tgl_mulai'].strftime('%d-%m-%Y')
+                    t2 = r['tgl_selesai'].strftime('%d-%m-%Y')
+                except Exception:
+                    continue
+                tgl_str = t1 if t1 == t2 else f"{t1} s/d {t2}"
+                jenis_lbl = label_color(str(r.get('jenis','')))
+                judul = (r.get('judul') or '').strip() or '(Tanpa Judul)'
+                st.markdown(f"<li style='margin-bottom:4px'><b>{judul}</b> {jenis_lbl} <span style='color:#2563eb;font-size:0.8rem'>({tgl_str})</span></li>", unsafe_allow_html=True)
+            st.markdown("</ul>", unsafe_allow_html=True)
+        else:
+            st.info("Tidak ada event 30 hari ke depan.")
     else:
-        st.info("Tidak ada event mendatang 14 hari ke depan.")
+        st.info("Tidak ada event 30 hari ke depan.")
+
+    try:
+        if not cal30.empty:
+            csv_bytes = cal30.assign(
+                tgl_mulai=cal30['tgl_mulai'].dt.strftime('%Y-%m-%d'),
+                tgl_selesai=cal30['tgl_selesai'].dt.strftime('%Y-%m-%d')
+            ).to_csv(index=False).encode('utf-8')
+            st.download_button("⬇️ Export Kalender 30 Hari (CSV)", data=csv_bytes, file_name=f"kalender_30hari_{today.isoformat()}.csv", mime="text/csv")
+    except Exception:
+        pass
+
+    # --- Section: Visualisasi List Berwarna (lazy) ---
+    st.markdown("---")
+    with st.expander("🎨 Visualisasi Status (Kode Warna)", expanded=False):
+        st.caption("Ringkasan multi-modul dengan kode warna untuk prioritas & status.")
+        # Legend
+        legend_items = [
+            ("Merah", "Pending kritikal / terlambat / MoU lewat jatuh tempo"),
+            ("Oranye", "Tugas ≤3 hari ke deadline (peringatan kuat)"),
+            ("Kuning", "MoU mendekati jatuh tempo / tugas ≤7 hari"),
+            ("Hijau", "Tugas / item selesai / approved penuh"),
+            ("Biru", "Cuti"),
+            ("Ungu", "Flex Time"),
+            ("Abu-abu", "Booking Mobil Kantor"),
+        ]
+        # Render legend as horizontal badges
+        legend_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'>"
+        color_map = {
+            "Merah": "#dc2626",
+            "Oranye": "#ea580c",
+            "Kuning": "#d97706",
+            "Hijau": "#16a34a",
+            "Biru": "#2563eb",
+            "Ungu": "#6d28d9",
+            "Abu-abu": "#374151",
+        }
+        for nama, desc in legend_items:
+            legend_html += f"<div title='{desc}' style='background:{color_map.get(nama,'#999')};color:#fff;padding:4px 10px;border-radius:14px;font-size:12px;font-weight:600'>{nama}</div>"
+        legend_html += "</div>"
+        st.markdown(legend_html, unsafe_allow_html=True)
+
+        # Data aggregator (lightweight reads; guarded by cache)
+        @st.cache_data(ttl=60, show_spinner=False)
+        def _collect_status_lists():
+            data = []  # list of dict(label, warna, modul, ref, mulai, selesai)
+            today_local = date.today()
+            try:
+                # Delegasi (deadline based)
+                try:
+                    ws = _get_ws(DELEGASI_SHEET_NAME)
+                    delegasi = pd.DataFrame(ws.get_all_records())
+                except Exception:
+                    delegasi = pd.DataFrame()
+                if not delegasi.empty:
+                    for _, r in delegasi.iterrows():
+                        judul = r.get('judul') or '(Tanpa Judul)'
+                        tgl_selesai = r.get('tgl_selesai') or ''
+                        warna = None
+                        try:
+                            if tgl_selesai:
+                                dline = datetime.fromisoformat(str(tgl_selesai)).date()
+                                delta = (dline - today_local).days
+                                status = (r.get('status') or '').strip().lower()
+                                if status in ('done','selesai','complete','completed'):
+                                    warna = 'Hijau'
+                                else:
+                                    if delta < 0:
+                                        warna = 'Merah'
+                                    elif delta <= 3:
+                                        warna = 'Oranye'
+                                    elif delta <= 7:
+                                        warna = 'Kuning'
+                        except Exception:
+                            pass
+                        if warna:
+                            data.append({
+                                'label': f"Delegasi: {judul}",
+                                'warna': warna,
+                                'modul': 'Delegasi',
+                                'ref': r.get('id',''),
+                            })
+                # MoU (jatuh tempo tgl_selesai)
+                try:
+                    ws = _get_ws(MOU_SHEET_NAME)
+                    mou_df = pd.DataFrame(ws.get_all_records())
+                except Exception:
+                    mou_df = pd.DataFrame()
+                if not mou_df.empty:
+                    for _, r in mou_df.iterrows():
+                        tgl_selesai = r.get('tgl_selesai') or ''
+                        warna = None
+                        judul = r.get('nama') or r.get('nomor') or '(MoU)'
+                        try:
+                            if tgl_selesai:
+                                dline = datetime.fromisoformat(str(tgl_selesai)).date()
+                                delta = (dline - today_local).days
+                                if delta < 0:
+                                    warna = 'Merah'
+                                elif delta <= 7:
+                                    warna = 'Kuning'
+                        except Exception:
+                            pass
+                        if warna:
+                            data.append({
+                                'label': f"MoU: {judul}",
+                                'warna': warna,
+                                'modul': 'MoU',
+                                'ref': r.get('id',''),
+                            })
+                # Cuti (warna Biru)
+                try:
+                    ws = _get_ws(CUTI_SHEET_NAME)
+                    cuti_df = pd.DataFrame(ws.get_all_records())
+                except Exception:
+                    cuti_df = pd.DataFrame()
+                if not cuti_df.empty:
+                    # tampilkan hanya yang dalam rentang sekarang (tgl_mulai <= today <= tgl_selesai)
+                    for _, r in cuti_df.iterrows():
+                        try:
+                            mulai = r.get('tgl_mulai') or ''
+                            selesai = r.get('tgl_selesai') or ''
+                            if mulai and selesai:
+                                d1 = datetime.fromisoformat(str(mulai)).date()
+                                d2 = datetime.fromisoformat(str(selesai)).date()
+                                if d1 <= today_local <= d2:
+                                    data.append({
+                                        'label': f"Cuti: {r.get('nama','')}",
+                                        'warna': 'Biru',
+                                        'modul': 'Cuti',
+                                        'ref': r.get('id',''),
+                                    })
+                        except Exception:
+                            continue
+                # Flex Time (warna Ungu) hari ini saja
+                try:
+                    ws = _get_ws(FLEX_SHEET_NAME)
+                    flex_df = pd.DataFrame(ws.get_all_records())
+                except Exception:
+                    flex_df = pd.DataFrame()
+                if not flex_df.empty:
+                    for _, r in flex_df.iterrows():
+                        try:
+                            tgl = r.get('tanggal')
+                            if tgl and datetime.fromisoformat(str(tgl)).date() == today_local:
+                                data.append({
+                                    'label': f"Flex: {r.get('nama','')} ({r.get('jam_mulai','')}-{r.get('jam_selesai','')})",
+                                    'warna': 'Ungu',
+                                    'modul': 'Flex Time',
+                                    'ref': r.get('id',''),
+                                })
+                        except Exception:
+                            continue
+                # Mobil Kantor (Abu-abu) — aktif dalam rentang
+                try:
+                    ws = _get_ws(MOBIL_SHEET_NAME)
+                    mob_df = pd.DataFrame(ws.get_all_records())
+                except Exception:
+                    mob_df = pd.DataFrame()
+                if not mob_df.empty:
+                    for _, r in mob_df.iterrows():
+                        try:
+                            mulai = r.get('tgl_mulai'); selesai = r.get('tgl_selesai')
+                            if mulai and selesai:
+                                d1 = datetime.fromisoformat(str(mulai)).date()
+                                d2 = datetime.fromisoformat(str(selesai)).date()
+                                if d1 <= today_local <= d2:
+                                    data.append({
+                                        'label': f"Mobil: {r.get('kendaraan','')} - {r.get('tujuan','')}",
+                                        'warna': 'Abu-abu',
+                                        'modul': 'Mobil Kantor',
+                                        'ref': r.get('id',''),
+                                    })
+                        except Exception:
+                            continue
+                return data
+            except Exception:
+                return []
+
+        items = _collect_status_lists()
+        if not items:
+            st.info("Belum ada item untuk divisualisasikan.")
+        else:
+            # Kelompokkan berdasar warna untuk memudahkan scanning
+            df_items = pd.DataFrame(items)
+            order = ["Merah","Oranye","Kuning","Hijau","Biru","Ungu","Abu-abu"]
+            df_items['__order'] = df_items['warna'].applSy(lambda w: order.index(w) if w in order else 999)
+            df_items = df_items.sort_values(['__order','label'])
+
+            # Tampilkan sebagai HTML custom agar warna blok jelas
+            html = "<div style='display:flex;flex-direction:column;gap:4px;margin-top:4px;'>"
+            for _, r in df_items.iterrows():
+                c = color_map.get(r['warna'], '#6b7280')
+                html += f"<div style='background:{c};color:#fff;padding:6px 10px;border-radius:6px;font-size:13px;font-weight:500;display:flex;justify-content:space-between;'>"
+                html += f"<span>{r['label']}</span><span style='opacity:.85;font-size:11px'>{r['modul']}</span></div>"
+            html += "</div>"
+            st.markdown(html, unsafe_allow_html=True)
 
     # --- Section: Dokumen Perlu Approval (lazy) ---
     st.markdown("---")
