@@ -50,6 +50,30 @@ SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 ADMIN_EMAIL_RECIPIENT = ""
 ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser", "board"]
 
+# Centralized create permissions matrix per module (draft/input capability)
+# Keys use internal module identifiers; adjust as business rules evolve.
+CREATE_ACCESS: dict[str, set[str]] = {
+    "inventory": {"staff", "finance", "director", "superuser"},
+    "surat_masuk": {"staff", "finance", "director", "superuser"},
+    "surat_keluar": {"staff", "finance", "director", "superuser"},
+    "mou": {"staff", "finance", "director", "superuser"},
+    "cash_advance": {"staff", "finance", "director", "superuser"},
+    "pmr": {"staff", "finance", "director", "superuser"},
+    "cuti": {"staff", "finance", "director", "superuser"},
+    "flex": {"staff", "finance", "director", "superuser"},
+    "delegasi": {"staff", "finance", "director", "superuser"},
+    "notulen": {"staff", "director", "superuser"},  # finance tidak bisa input notulen
+    "calendar_mobil": {"finance", "director", "superuser"},
+    "calendar_libur": {"director", "superuser"},
+    "sop": {"director", "superuser"},
+    "laporan_tahunan": {"director", "superuser"},
+}
+
+def can_create(module_key: str, user: dict | None) -> bool:
+    role = (user or {}).get("role", "").lower()
+    allow = CREATE_ACCESS.get(module_key, set())
+    return role in allow
+
 # Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
 # Catatan: superuser selalu otomatis ditambahkan oleh helper.
 # Tambahkan / ubah sesuai kebutuhan bisnis Anda.
@@ -1175,7 +1199,34 @@ def gen_id(prefix: str):
 
 def _get_ws(name: str):
     spreadsheet = get_spreadsheet()
+    # Basic call (kept for compatibility); higher-level wrappers will add retry.
     return spreadsheet.worksheet(name)
+
+def _safe_get_ws(name: str, retries: int = 3, delay: float = 1.0):
+    """Dapatkan worksheet dengan retry sederhana untuk menangani APIError sementara.
+    Mengembalikan worksheet atau melempar exception terakhir jika gagal permanen.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return _get_ws(name)
+        except gspread.WorksheetNotFound as e:  # sheet memang tidak ada
+            raise e
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            msg = str(e)
+            # Jika quota (429) atau 5xx, coba ulang
+            if any(code in msg for code in ["429", "500", "503"]):
+                time.sleep(delay * (attempt + 1))
+                continue
+            raise
+        except Exception as e:  # error lain (network transient)
+            last_err = e
+            time.sleep(delay * (attempt + 1))
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("Gagal mendapatkan worksheet tanpa error terdeteksi")
 
 
 def audit_log(module: str, action: str, target: str = "", details: str = ""):
@@ -1477,10 +1528,25 @@ def inventory_module():
 
     # Helpers for inventory sheet
     def _inv_ws():
-        return _get_ws(INVENTORY_SHEET_NAME)
+        try:
+            return _safe_get_ws(INVENTORY_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            st.error("Sheet INVENTORY tidak ditemukan. Pastikan sudah dibuat.")
+            raise
+        except Exception as e:
+            st.warning(f"Inventory sementara tidak dapat diakses: {e}")
+            raise
 
     def _inv_read_df():
-        ws = _inv_ws()
+        try:
+            ws = _inv_ws()
+        except Exception:
+            # Kembalikan df kosong agar modul tidak crash total
+            return None, pd.DataFrame(columns=[
+                "id", "name", "location", "status", "pic", "updated_at",
+                "finance_note", "finance_approved", "director_note", "director_approved",
+                "file_id", "file_name", "file_link", "loan_info"
+            ])
         inv_headers = [
             "id", "name", "location", "status", "pic", "updated_at",
             "finance_note", "finance_approved", "director_note", "director_approved",
@@ -1488,8 +1554,12 @@ def inventory_module():
         ]
         try:
             df = pd.DataFrame(_cached_get_all_records(INVENTORY_SHEET_NAME, inv_headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
+        except Exception as e:
+            try:
+                df = pd.DataFrame(ws.get_all_records()) if ws else pd.DataFrame()
+            except Exception:
+                st.warning(f"Gagal membaca data inventory: {e}")
+                df = pd.DataFrame(columns=inv_headers)
         # Ensure all expected columns exist to avoid KeyError in filters
         for h in inv_headers:
             if h not in df.columns:
@@ -1599,6 +1669,8 @@ def inventory_module():
 
     # Prepare monthly rekap
     _, df_all = _inv_read_df()
+    if df_all is None or df_all.empty:
+        st.info("Inventory tidak tersedia atau kosong saat ini.")
     this_month = date.today().strftime("%Y-%m")
     df_month = df_all.copy()
     if not df_month.empty and 'updated_at' in df_month.columns:
@@ -1608,7 +1680,7 @@ def inventory_module():
     tab_contents = []
 
     # Staff tab: tambah barang
-    if user.get("role") in ["staff", "superuser"]:
+    if can_create("inventory", user):
         tab_labels.append("➕ Tambah Barang")
 
         def staff_tab():
@@ -2663,7 +2735,10 @@ def mou_module():
 
     # TAB 1: Input Draft
     with tab1:
-        st.markdown("### Input Draft MoU (Staf)")
+        st.markdown("### Input Draft MoU (Draft Baru)")
+        if not can_create("mou", user):
+            st.info("Peran Anda tidak memiliki akses membuat draft MoU.")
+            return
         with st.form("mou_add", clear_on_submit=True):
             nomor = st.text_input("Nomor MoU")
             nama = st.text_input("Nama MoU")
@@ -3413,14 +3488,18 @@ def pmr_module():
 
     # --- Rekap ---
     with tab_rekap:
-        if user.get("role") in ["finance", "director", "superuser"]:
+        # Hanya Finance / Director / Superuser yang dapat melihat rekap
+        if user.get("role") in ["finance", "director", "superuser"]:  # review scope tetap
             st.markdown("### Daftar & Rekap PMR")
             _, df_all = _pmr_read_df()
             if df_all.empty:
                 st.info("Belum ada data PMR.")
             else:
                 # Filter bulan
-                bulan_list = sorted(df_all['bulan'].dropna().unique().tolist(), reverse=True)
+                try:
+                    bulan_list = sorted(df_all['bulan'].dropna().unique().tolist(), reverse=True)
+                except Exception:
+                    bulan_list = []
                 filter_bulan = st.selectbox("Pilih Bulan", bulan_list, index=0 if bulan_list else None, key="rekap_bulan")
                 if filter_bulan:
                     df_month = df_all[df_all['bulan'] == filter_bulan].copy()
@@ -3428,9 +3507,17 @@ def pmr_module():
                     df_month = pd.DataFrame(columns=df_all.columns)
                 st.write(f"Total laporan bulan ini: {len(df_month)}")
                 if not df_month.empty:
-                    df_month['Status'] = df_month.apply(lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else ('Proses Finance' if not x['finance_approved'] else 'Proses Director'), axis=1)
-                    show_cols = ["nama", "bulan", "tanggal_submit", "Status", "file1_name", "file2_name"]
-                    st.dataframe(df_month[show_cols], width='stretch', hide_index=True)
+                    try:
+                        df_month['Status'] = df_month.apply(
+                            lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else (
+                                'Proses Finance' if not x['finance_approved'] else 'Proses Director'
+                            ), axis=1
+                        )
+                    except Exception:
+                        df_month['Status'] = ''
+                    show_cols = [c for c in ["nama", "bulan", "tanggal_submit", "Status", "file1_name", "file2_name"] if c in df_month.columns]
+                    if show_cols:
+                        st.dataframe(df_month[show_cols], width='stretch', hide_index=True)
         else:
             st.info("Hanya Finance/Director yang dapat melihat rekap PMR.")
 
