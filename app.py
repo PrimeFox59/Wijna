@@ -30,6 +30,7 @@ SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
 # khusus (misal selalu kirim ke tim IT), isi dengan alamat distribution list.
 ADMIN_EMAIL_RECIPIENT = ""
+ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser"]
 
 # Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
 # Catatan: superuser selalu otomatis ditambahkan oleh helper.
@@ -106,6 +107,25 @@ def notify_event(module: str, action: str, subject: str, body: str, roles: list[
         _notify_roles(list(set(target_roles)), subject, body)
     except Exception:
         pass
+
+def _load_settings_row() -> dict:
+    """Read special settings row from config sheet where module='__settings__'. Returns dict."""
+    try:
+        ws = _get_ws(CONFIG_SHEET_NAME)
+        records = ws.get_all_records()
+        for rec in records:
+            if str(rec.get("module", "")).strip().lower() == "__settings__":
+                return rec
+    except Exception:
+        return {}
+    return {}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def is_superuser_auto_enabled() -> bool:
+    """Check settings to decide whether superuser auto inclusion is active. Default True if not set."""
+    row = _load_settings_row()
+    val = str(row.get("superuser_auto", "1")) if row else "1"
+    return val.strip().lower() in ("1", "true", "yes", "y")
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 # Use centered layout on login screen; switch to wide after user logs in.
 _layout_mode = "wide" if st.session_state.get("user") else "centered"
@@ -898,7 +918,9 @@ def _notify_role(role: str, subject: str, body: str):
 
 def _notify_roles(roles: list[str], subject: str, body: str):
     """Kirim email ke gabungan beberapa role (dedupe), selalu menyertakan superuser. Async + bulk."""
-    unique_roles = {*(r.strip().lower() for r in roles if r), "superuser"}
+    unique_roles = {*(r.strip().lower() for r in roles if r)}
+    if is_superuser_auto_enabled():
+        unique_roles.add("superuser")
     all_emails: set[str] = set()  # Initialize a set to store unique emails
     for r in unique_roles:
         try:
@@ -2351,26 +2373,39 @@ def superuser_panel():
 
     st.markdown("---")
     st.subheader("➕ Tambah / Update Mapping")
+    # Derive existing modules and actions for convenience
+    existing_modules = sorted(set(str(m).strip().lower() for m in df_cfg.get('module', []) if m and not str(m).startswith('__')))
+    existing_actions = sorted(set(str(a).strip().lower() for a in df_cfg.get('action', []) if a))
+    default_modules = sorted({m for (m, _) in NOTIF_ROLE_MAP.keys()})
+    module_options = sorted(set(existing_modules) | set(default_modules)) + ["(Custom)"]
+    action_options = sorted(set(existing_actions) | {a for (_, a) in NOTIF_ROLE_MAP.keys()}) + ["(Custom)"]
+
     with st.form("cfg_add_update", clear_on_submit=False):
-        colA, colB = st.columns(2)
-        with colA:
-            mod_in = st.text_input("Module", placeholder="misal: inventory")
-        with colB:
-            act_in = st.text_input("Action", placeholder="misal: create")
-        roles_in = st.text_input("Roles (pisahkan koma)", placeholder="finance,director")
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_mod = st.selectbox("Pilih Module", module_options, key="cfg_sel_mod")
+            if sel_mod == "(Custom)":
+                mod_in = st.text_input("Module Baru", placeholder="misal: cash_advance").strip().lower()
+            else:
+                mod_in = sel_mod.strip().lower()
+        with c2:
+            sel_act = st.selectbox("Pilih Action", action_options, key="cfg_sel_act")
+            if sel_act == "(Custom)":
+                act_in = st.text_input("Action Baru", placeholder="misal: submitted").strip().lower()
+            else:
+                act_in = sel_act.strip().lower()
+        roles_multi = st.multiselect("Pilih Roles", ALLOWED_ROLES, default=[r for r in ["finance"] if r in ALLOWED_ROLES])
         active_in = st.checkbox("Active", value=True)
         submitted = st.form_submit_button("Simpan / Update Mapping")
         if submitted:
             mod = mod_in.strip().lower()
             act = act_in.strip().lower()
-            roles_raw = roles_in.strip()
-            if not mod or not act or not roles_raw:
-                st.warning("Module, Action, dan Roles wajib diisi.")
+            valid_roles = [r for r in roles_multi if r in ALLOWED_ROLES]
+            if not mod or not act or not valid_roles:
+                st.warning("Module, Action, dan minimal satu Role valid wajib diisi.")
             else:
-                roles_clean = ",".join(sorted({r.strip().lower() for r in roles_raw.split(',') if r.strip()}))
-                # Upsert logic: find existing row with same module+action
+                roles_clean = ",".join(sorted(set(valid_roles)))
                 headers = ws.row_values(1)
-                # Ensure headers correctness (should already exist)
                 try:
                     module_col = headers.index('module') + 1
                     action_col = headers.index('action') + 1
@@ -2379,7 +2414,6 @@ def superuser_panel():
                     st.stop()
                 target_row = None
                 try:
-                    # brute force find; gspread find can't search two columns simultaneously
                     all_vals = ws.get_all_values()
                     for ridx, row_vals in enumerate(all_vals[1:], start=2):
                         try:
@@ -2401,7 +2435,6 @@ def superuser_panel():
                     'updated_by': updated_by
                 }
                 if target_row:
-                    # update existing
                     for k, v in row_payload.items():
                         if k in headers:
                             a1 = gspread.utils.rowcol_to_a1(target_row, headers.index(k) + 1)
@@ -2420,7 +2453,6 @@ def superuser_panel():
                     except Exception:
                         pass
                 else:
-                    # append new
                     values = [row_payload.get(h, "") for h in headers]
                     for i in range(3):
                         try:
@@ -2490,6 +2522,115 @@ def superuser_panel():
     if st.button("🔄 Refresh Mapping Cache"):
         _clear_config_cache()
         st.success("Cache dynamic mapping dibersihkan.")
+
+    st.markdown("---")
+    st.subheader("⚙️ Pengaturan Tambahan")
+    # Superuser auto toggle
+    cur_auto = is_superuser_auto_enabled()
+    new_auto = st.checkbox("Sertakan superuser otomatis pada semua notifikasi", value=cur_auto, help="Jika dimatikan, superuser hanya menerima notifikasi jika termasuk dalam roles mapping.")
+    if new_auto != cur_auto:
+        # Write/update settings row
+        try:
+            headers = ws.row_values(1)
+            # ensure settings headers contain superuser_auto column (optional)
+            if 'superuser_auto' not in headers:
+                headers.append('superuser_auto')
+                ws.update('A1', [headers])
+            all_vals = ws.get_all_values()
+            module_idx = headers.index('module') if 'module' in headers else None
+            found_row = None
+            if module_idx is not None:
+                for ridx, row_vals in enumerate(all_vals[1:], start=2):
+                    if len(row_vals) > module_idx and str(row_vals[module_idx]).strip().lower() == '__settings__':
+                        found_row = ridx
+                        break
+            updated_at = datetime.utcnow().isoformat()
+            updater = (get_current_user() or {}).get('email', 'system')
+            settings_payload = {
+                'module': '__settings__',
+                'action': 'global',
+                'roles': '',
+                'active': '1',
+                'updated_at': updated_at,
+                'updated_by': updater,
+                'superuser_auto': '1' if new_auto else '0'
+            }
+            # Align headers again (in case added)
+            headers = ws.row_values(1)
+            if found_row:
+                # update columns
+                for k, v in settings_payload.items():
+                    if k in headers:
+                        a1 = gspread.utils.rowcol_to_a1(found_row, headers.index(k) + 1)
+                        for i in range(3):
+                            try:
+                                ws.update(a1, v)
+                                break
+                            except gspread.exceptions.APIError as e:
+                                if '429' in str(e):
+                                    time.sleep(1 + i)
+                                    continue
+                                raise
+            else:
+                row_vals = [settings_payload.get(h, '') for h in headers]
+                for i in range(3):
+                    try:
+                        ws.append_row(row_vals)
+                        break
+                    except gspread.exceptions.APIError as e:
+                        if '429' in str(e):
+                            time.sleep(1 + i)
+                            continue
+                        raise
+            try:
+                audit_log('config', 'settings_update', target='__settings__', details=f"superuser_auto={int(new_auto)}")
+            except Exception:
+                pass
+            # Clear caches
+            try:
+                is_superuser_auto_enabled.clear()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            _clear_config_cache()
+            st.success("Pengaturan superuser_auto diperbarui.")
+        except Exception as e:
+            st.error(f"Gagal menyimpan pengaturan: {e}")
+
+    st.markdown("---")
+    st.subheader("🧪 Test Kirim Email Dummy")
+    with st.form("test_email_form"):
+        test_subject = st.text_input("Subject", value="[TEST] Notifikasi Dummy")
+        test_body = st.text_area("Body", value="Ini hanya email percobaan.")
+        # Pilih mapping yang ada
+        active_map = load_config_notif_map()
+        map_labels = [f"{m}:{a}" for (m, a) in sorted(active_map.keys())]
+        use_mapping = st.selectbox("Gunakan Mapping (opsional)", ["(Manual Roles)"] + map_labels)
+        manual_roles = []
+        if use_mapping == "(Manual Roles)":
+            manual_roles = st.multiselect("Manual Roles", ALLOWED_ROLES, default=["finance"])
+        send_btn = st.form_submit_button("Kirim Email Uji")
+        if send_btn:
+            try:
+                if use_mapping != "(Manual Roles)":
+                    # parse mapping
+                    parts = use_mapping.split(":", 1)
+                    if len(parts) == 2:
+                        m_sel, a_sel = parts[0], parts[1]
+                        roles = active_map.get((m_sel, a_sel), [])
+                        if not roles:
+                            st.warning("Mapping tidak memiliki roles aktif.")
+                        else:
+                            notify_event(m_sel, a_sel, test_subject, test_body, roles=None)  # dynamic lookup
+                            st.success("Email test berdasarkan mapping dikirim (cek inbox).")
+                else:
+                    valid_roles = [r for r in manual_roles if r in ALLOWED_ROLES]
+                    if not valid_roles:
+                        st.warning("Pilih minimal satu role valid untuk manual.")
+                    else:
+                        notify_event("test", "manual", test_subject, test_body, roles=valid_roles)
+                        st.success("Email test manual dikirim (cek inbox).")
+            except Exception as e:
+                st.error(f"Gagal mengirim email test: {e}")
 
 
 def _cuti_read_df():
