@@ -53,20 +53,32 @@ ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser", "board"]
 # Centralized create permissions matrix per module (draft/input capability)
 # Keys use internal module identifiers; adjust as business rules evolve.
 CREATE_ACCESS: dict[str, set[str]] = {
+    # (Menu: "📦 Inventory")
     "inventory": {"staff", "finance", "director", "superuser"},
+    # (Menu: "📥 Surat Masuk")
     "surat_masuk": {"staff", "finance", "director", "superuser"},
+    # (Menu: "📤 Surat Keluar")
     "surat_keluar": {"staff", "finance", "director", "superuser"},
+    # (Menu: "🤝 MoU")
     "mou": {"staff", "finance", "director", "superuser"},
+    # (Menu: "💸 Cash Advance")
     "cash_advance": {"staff", "finance", "director", "superuser"},
+    # (Menu: "📑 PMR")
     "pmr": {"staff", "finance", "director", "superuser"},
+    # (Menu: "🌴 Cuti")
     "cuti": {"staff", "finance", "director", "superuser"},
+    # (Menu: "⏰ Flex Time")
     "flex": {"staff", "finance", "director", "superuser"},
+    # (Menu: "📝 Delegasi")
     "delegasi": {"staff", "finance", "director", "superuser"},
-    "notulen": {"staff", "director", "superuser"},  # finance tidak bisa input notulen
-    "calendar_mobil": {"finance", "director", "superuser"},
-    "calendar_libur": {"director", "superuser"},
+    # (Menu: "🚗 Mobil Kantor") – sebelumnya key terpisah calendar_mobil
+    "mobil": {"finance", "director", "superuser"},
+    # (Menu: "📅 Kalender Bersama") – sebelumnya calendar_libur (hanya director & superuser yang dapat buat event/libur)
+    "calendar": {"director", "superuser"},
+    # (Menu: "📚 SOP")
     "sop": {"director", "superuser"},
-    "laporan_tahunan": {"director", "superuser"},
+    # (Menu: "🗒️ Notulen") – finance tidak input notulen
+    "notulen": {"staff", "director", "superuser"},
 }
 
 def can_create(module_key: str, user: dict | None) -> bool:
