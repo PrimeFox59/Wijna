@@ -2913,75 +2913,80 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS agar tombol navigasi seragam dan rapi
+    # CSS navigasi sidebar profesional & konsisten
     st.sidebar.markdown(
         """
         <style>
-        /* Uniform sidebar navigation buttons */
+        .sidebar-section-title {font-size:10px;font-weight:700;letter-spacing:1px;color:#64748b;text-transform:uppercase;margin:4px 4px 6px 4px;}
+        .sidebar-nav-wrapper {margin:0 0 6px 0; max-height:calc(100vh - 340px); overflow-y:auto; padding-right:4px;}
+        .sidebar-nav-wrapper::-webkit-scrollbar {width:6px;}
+        .sidebar-nav-wrapper::-webkit-scrollbar-track {background:transparent;}
+        .sidebar-nav-wrapper::-webkit-scrollbar-thumb {background:#d3dce4;border-radius:3px;}
+        .sidebar-nav-wrapper::-webkit-scrollbar-thumb:hover {background:#94a3b8;}
+        .wijna-nav-btn {margin:0 0 4px 0;}
         .wijna-nav-btn > button {
             width:100% !important;
-            height:34px !important;
-            min-height:34px !important;
+            height:38px !important;
+            padding:0 14px !important;
+            border-radius:9px !important;
+            font-size:0.9rem !important;
+            font-weight:600 !important;
             display:flex !important;
             align-items:center !important;
-            justify-content:center !important;
-            font-size:0.88rem !important;
-            font-weight:600 !important;
-            padding:0 8px !important;
-            margin:0 0 1px 0 !important;
-            border-radius:5px !important;
-            line-height:1.0 !important;
-            white-space:nowrap !important;
+            justify-content:flex-start !important;
+            gap:10px !important;
+            background:linear-gradient(180deg,#ffffff,#f8fafc) !important;
+            border:1px solid #d9e2ec !important;
+            color:#1e293b !important;
+            box-shadow:0 1px 2px rgba(0,0,0,0.04) !important;
+            transition:all .18s ease !important;
+            letter-spacing:.25px;
         }
-        .wijna-nav-btn.active-nav > button {
-            background:#2563eb !important;
-            color:#ffffff !important;
-            border:1px solid #1d4ed8 !important;
-            box-shadow:0 0 0 1px rgba(37,99,235,0.35) inset;
-        }
-        .wijna-nav-btn > button:hover {
-            border:1px solid #2563eb !important;
-        }
-        /* Compact sidebar heading & separator */
-        .sidebar-section-title { 
-            font-size:0.78rem; 
-            font-weight:700; 
-            letter-spacing:0.5px; 
-            color:#475569; 
-            text-transform:uppercase; 
-            margin:4px 0 6px 0 !important;
-        }
-        .sidebar-thin-sep { 
-            height:1px; 
-            background:linear-gradient(90deg,#cbd5e1,#f1f5f9); 
-            margin:6px 0 4px 0; 
-            border-radius:1px;
-        }
+        .wijna-nav-btn > button:hover {background:#eef3f8 !important; border-color:#b8c5d3 !important;}
+        .wijna-nav-btn.active-nav > button {background:linear-gradient(90deg,#2563eb,#1d4ed8) !important; color:#fff !important; border:1px solid #1d4ed8 !important; box-shadow:0 2px 6px -1px rgba(29,78,216,0.45),0 1px 3px rgba(0,0,0,0.08) !important;}
+        .wijna-nav-btn.active-nav > button:hover {background:linear-gradient(90deg,#1d4ed8,#1e40af) !important; border-color:#1e40af !important;}
+        .wijna-nav-btn > button:focus-visible {outline:2px solid #2563eb !important; outline-offset:2px !important;}
+        .wijna-icon {font-size:1.1rem; width:22px; text-align:center; opacity:.92;}
+        .wijna-nav-btn.active-nav .wijna-icon {opacity:1;}
+        .logout-btn > button {width:100% !important; height:40px !important; display:flex !important; align-items:center !important; justify-content:center !important; gap:8px !important; font-weight:600 !important; border-radius:9px !important; background:linear-gradient(180deg,#ffffff,#faf5f5) !important; border:1px solid #f1d6d6 !important; color:#b91c1c !important; transition:all .18s ease !important;}
+        .logout-btn > button:hover {background:#ffe5e5 !important; border-color:#f87171 !important;}
+        .logout-btn > button:active {background:#fecaca !important;}
+        .logout-btn > button:focus-visible {outline:2px solid #dc2626 !important;}
         </style>
         """,
         unsafe_allow_html=True
     )
 
-    # Compact separator & heading
-    st.sidebar.markdown('<div class="sidebar-thin-sep"></div><div class="sidebar-section-title">Navigasi Modul</div>', unsafe_allow_html=True)
-    nav_cols = st.sidebar.columns(2)
-    for idx, (key, label) in enumerate(menu):
-        col = nav_cols[idx % 2]
-        with col:
-            active_class = 'active-nav' if st.session_state.get("page") == key else ''
-            st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
-            clicked = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            if clicked:
-                st.session_state["page"] = key
-                st.rerun()
+    # Section title & daftar menu
+    st.sidebar.markdown('<div class="sidebar-section-title">Navigasi</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="sidebar-nav-wrapper">', unsafe_allow_html=True)
+    for key, label in menu:
+        active_class = 'active-nav' if st.session_state.get("page") == key else ''
+        icon_part = ''
+        text_part = label
+        if ' ' in label:
+            first_token = label.split(' ')[0]
+            if len(first_token) <= 3:  # heuristik emoji
+                icon_part = first_token
+                text_part = label[len(first_token):].strip()
+        st.markdown(f'<div class="wijna-nav-btn {active_class}">', unsafe_allow_html=True)
+        btn_label = f"{icon_part}  {text_part}" if icon_part else text_part
+        clicked = st.button(btn_label, key=f"nav_{key}", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        if clicked:
+            st.session_state["page"] = key
+            st.rerun()
+    st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-    # --- Logout button at the very bottom ---
+    # --- Logout button (seragam style) ---
     if user:
-        st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
-    if st.sidebar.button("Logout", key="sidebar_logout"): 
+        st.sidebar.markdown('<div style="margin-top:8px;">', unsafe_allow_html=True)
+        st.sidebar.markdown('<div class="logout-btn">', unsafe_allow_html=True)
+        if st.button("🚪 Logout", key="sidebar_logout", use_container_width=True):
             logout()
             st.rerun()
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     choice = st.session_state["page"]
 
