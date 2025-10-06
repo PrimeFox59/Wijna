@@ -1253,7 +1253,6 @@ def _users_delete_row(ws, row_idx: int):
 def dashboard():
     st.title("🏠 Dashboard Monitoring")
     st.caption("Ringkasan cepat status operasional & approvals.")
-    st.write(f"Waktu (WIB): {now_wib_iso()}")
 
     # Helper generic loader
     def _load_sheet(name: str, expected: list[str] | None = None) -> pd.DataFrame:
@@ -1417,7 +1416,6 @@ def dashboard():
         st.info("Tidak ada event mendatang 14 hari ke depan.")
 
     st.markdown("---")
-    st.caption("Selesai memuat ringkasan dashboard.")
 
 
 def inventory_module():
