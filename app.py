@@ -41,6 +41,7 @@ MOBIL_SHEET_NAME = "mobil"
 CALENDAR_SHEET_NAME = "calendar"
 PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
 NOTULEN_SHEET_NAME = "notulen"
+SOP_SHEET_NAME = "sop"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -92,6 +93,9 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     # Notulen events
     ("notulen", "upload"): ["director"],
     ("notulen", "director_approval"): ["staff", "finance"],  # optional broadcast; uploader akan tetap dapat email jika masuk role
+    # SOP events
+    ("sop", "upload"): ["director"],
+    ("sop", "director_approval"): ["staff", "finance"],
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -691,6 +695,13 @@ def ensure_core_sheets():
             "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
         ]
         ensure_sheet_with_headers(spreadsheet, NOTULEN_SHEET_NAME, notulen_headers)
+
+        # SOP sheet (policies & procedures)
+        sop_headers = [
+            "id", "judul", "tanggal_terbit", "tanggal_upload", "file_id", "file_name", "file_link",
+            "memo", "board_note", "director_approved", "uploaded_by", "created_at", "updated_at"
+        ]
+        ensure_sheet_with_headers(spreadsheet, SOP_SHEET_NAME, sop_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -4365,8 +4376,259 @@ def calendar_module():
 
 
 def sop_module():
-    st.header("📚 SOP")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.header("📚 Kebijakan & SOP")
+
+    # Helpers
+    def _sop_headers():
+        return [
+            "id", "judul", "tanggal_terbit", "tanggal_upload", "file_id", "file_name", "file_link",
+            "memo", "board_note", "director_approved", "uploaded_by", "created_at", "updated_at"
+        ]
+
+    def _sop_ws():
+        try:
+            return _get_ws(SOP_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), SOP_SHEET_NAME, _sop_headers())
+
+    def _sop_read_df():
+        ws = _sop_ws()
+        headers = _sop_headers()
+        try:
+            records = _cached_get_all_records(SOP_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
+        return ws, df
+
+    def _sop_append(row: dict):
+        ws = _sop_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    def _sop_update_by_id(sid: str, updates: dict):
+        ws = _sop_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(sid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _upload_sop_file(file) -> tuple[str, str, str]:
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            fname = file.name
+            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
+            metadata = {"name": fname, "parents": [GDRIVE_FOLDER_ID]}
+            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name").execute()
+            fid = created.get('id','')
+            link = created.get('webViewLink','')
+            return fid, fname, link
+        except Exception as e:
+            st.error(f"Gagal upload file SOP: {e}")
+            return "", "", ""
+
+    # Introspeksi: gunakan tanggal_terbit jika ada data valid, fallback ke tanggal_upload
+    tab_upload, tab_daftar, tab_approve = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director"])
+
+    # --- Tab 1: Upload SOP ---
+    with tab_upload:
+        st.subheader("Upload SOP / Kebijakan")
+        _, df_sop = _sop_read_df()
+        headers = list(df_sop.columns)
+        has_tanggal_terbit = 'tanggal_terbit' in headers
+        has_tanggal_upload = 'tanggal_upload' in headers
+        has_director_approved = 'director_approved' in headers
+        with st.form("sop_add", clear_on_submit=True):
+            judul = st.text_input("Judul Kebijakan / SOP")
+            tgl_terbit = st.date_input("Tanggal Terbit", value=date.today()) if has_tanggal_terbit else None
+            f = st.file_uploader("Upload File SOP (PDF/DOC)")
+            submit = st.form_submit_button("💾 Simpan")
+            if submit:
+                if not judul or not f:
+                    st.warning("Judul dan file wajib diisi.")
+                else:
+                    sid = gen_id("sop")
+                    fid, fname, flink = _upload_sop_file(f)
+                    now_iso = now_wib_iso()
+                    row = {
+                        "id": sid,
+                        "judul": judul,
+                        "file_id": fid,
+                        "file_name": fname,
+                        "file_link": flink,
+                        "uploaded_by": (get_current_user() or {}).get("email"),
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
+                    }
+                    if has_tanggal_terbit and tgl_terbit:
+                        row['tanggal_terbit'] = tgl_terbit.isoformat()
+                    elif has_tanggal_upload:
+                        row['tanggal_upload'] = now_iso
+                    if 'memo' in headers:
+                        row['memo'] = ""
+                    if 'board_note' in headers:
+                        row['board_note'] = ""
+                    if has_director_approved:
+                        row['director_approved'] = 0
+                    _sop_append(row)
+                    try:
+                        audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event("sop", "upload", subject=f"SOP Baru: {judul}", body=f"Judul: {judul}\nUploader: {(get_current_user() or {}).get('email')}\nLink: {flink}")
+                    except Exception:
+                        pass
+                    st.success("SOP berhasil diupload. Menunggu approval Director.")
+
+    # --- Tab 2: Daftar & Rekap ---
+    with tab_daftar:
+        st.subheader("Daftar SOP")
+        _, df_sop = _sop_read_df()
+        if df_sop.empty:
+            st.info("Belum ada SOP.")
+        else:
+            # Pilih kolom tanggal utama
+            date_col = 'tanggal_terbit' if 'tanggal_terbit' in df_sop.columns and df_sop['tanggal_terbit'].astype(str).str.len().gt(0).any() else ('tanggal_upload' if 'tanggal_upload' in df_sop.columns else None)
+            col1, col2, col3 = st.columns([2,2,2])
+            with col1:
+                q = st.text_input("Cari Judul", "")
+            with col2:
+                status_opt = ["Semua", "Approved", "Belum"] if 'director_approved' in df_sop.columns else ["Semua"]
+                status_sel = st.selectbox("Status", status_opt)
+            with col3:
+                if date_col and not df_sop.empty:
+                    try:
+                        df_sop['_dc'] = pd.to_datetime(df_sop[date_col], errors='coerce')
+                        min_d = df_sop['_dc'].min().date() if pd.notna(df_sop['_dc'].min()) else date.today()
+                        max_d = df_sop['_dc'].max().date() if pd.notna(df_sop['_dc'].max()) else date.today()
+                        dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
+                    except Exception:
+                        dr = None
+                else:
+                    dr = None
+            dff = df_sop.copy()
+            if q:
+                dff = dff[dff['judul'].astype(str).str.contains(q, case=False, na=False)]
+            if status_sel != "Semua" and 'director_approved' in dff.columns:
+                dff = dff[dff['director_approved'] == (1 if status_sel == 'Approved' else 0)]
+            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and date_col and date_col in dff.columns:
+                try:
+                    s, e = dr
+                    dff['_dc'] = pd.to_datetime(dff[date_col], errors='coerce')
+                    dff = dff[(dff['_dc'] >= pd.to_datetime(s)) & (dff['_dc'] <= pd.to_datetime(e))]
+                except Exception:
+                    pass
+            if not dff.empty:
+                show = dff.copy()
+                if 'director_approved' in show.columns:
+                    show['Status'] = show['director_approved'].map({1: "✅ Approved", 0: "🕒 Proses"})
+                cols_show = ['judul']
+                if date_col: cols_show.append(date_col)
+                for c in ['file_name','Status']:
+                    if c in show.columns:
+                        cols_show.append(c)
+                safe_dataframe(show[cols_show], index=False)
+                try:
+                    st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode('utf-8'), file_name="daftar_sop.csv")
+                except Exception:
+                    pass
+                # Pilih file untuk buka link (Drive)
+                if 'file_name' in show.columns and 'file_link' in show.columns:
+                    opsi = {f"{r['judul']} — {r.get(date_col,'')} ({r.get('file_name') or '-'})": r['file_link'] for _, r in show.iterrows() if r.get('file_link')}
+                    if opsi:
+                        pilih = st.selectbox("Buka File SOP", [""] + list(opsi.keys()))
+                        if pilih:
+                            st.markdown(f"📄 <a href='{opsi[pilih]}' target='_blank'>Buka File</a>", unsafe_allow_html=True)
+            else:
+                st.info("Belum ada SOP sesuai filter.")
+
+            # Rekap Bulanan SOP
+            st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
+            this_month = date.today().strftime("%Y-%m")
+            if not dff.empty and date_col and date_col in dff.columns:
+                df_month = dff[dff[date_col].astype(str).str[:7] == this_month]
+            else:
+                df_month = pd.DataFrame()
+            st.write(f"Total SOP/Kebijakan bulan ini: {len(df_month)}")
+
+    # --- Tab 3: Approval Director ---
+    with tab_approve:
+        _, df_sop = _sop_read_df()
+        headers = list(df_sop.columns)
+        if user.get('role') not in ['director','superuser']:
+            st.info("Hanya Director/Superuser yang dapat meng-approve.")
+        elif 'director_approved' not in headers:
+            st.info("Kolom director_approved belum tersedia pada sheet SOP.")
+        else:
+            date_col = 'tanggal_terbit' if 'tanggal_terbit' in headers and df_sop['tanggal_terbit'].astype(str).str.len().gt(0).any() else ('tanggal_upload' if 'tanggal_upload' in headers else None)
+            pending = df_sop[df_sop['director_approved'] == 0].copy()
+            if date_col and not pending.empty:
+                try:
+                    pending = pending.sort_values(by=date_col, ascending=False)
+                except Exception:
+                    pass
+            if pending.empty:
+                st.success("Tidak ada item menunggu approval.")
+            else:
+                for _, r in pending.iterrows():
+                    title = f"{r['judul']}" + (f" | {r.get(date_col)}" if date_col and r.get(date_col) else "")
+                    with st.expander(title):
+                        st.write(f"File: {r.get('file_name') or '-'}")
+                        if r.get('file_link'):
+                            st.markdown(f"📄 <a href='{r['file_link']}' target='_blank'>Buka di Drive</a>", unsafe_allow_html=True)
+                        note_val = st.text_area("Catatan Director (opsional)", value=r.get('memo') or "", key=f"sop_note_{r['id']}")
+                        if st.button("✅ Approve", key=f"sop_appr_{r['id']}"):
+                            updates = {"director_approved": 1, "updated_at": now_wib_iso()}
+                            if 'memo' in headers:
+                                updates['memo'] = note_val
+                            if _sop_update_by_id(r['id'], updates):
+                                try:
+                                    audit_log("sop", "director_approval", target=r['id'], details=f"note={note_val}")
+                                except Exception:
+                                    pass
+                                try:
+                                    notify_event("sop", "director_approval", subject=f"SOP Disetujui: {r['judul']}", body=f"Judul: {r['judul']}\nCatatan: {note_val}")
+                                except Exception:
+                                    pass
+                                st.success("SOP approved.")
+                                st.rerun()
 
 
 def notulen_module():
