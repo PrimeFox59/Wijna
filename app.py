@@ -2431,31 +2431,47 @@ def superuser_panel():
         acts |= dynamic_actions_by_module.get(mod, set())
         return sorted(acts)
 
+    # Pemilihan module diletakkan di luar form agar perubahan langsung memicu rerun dan memfilter daftar action
+    sel_mod = st.selectbox(
+        "Pilih Module",
+        module_options,
+        key="cfg_sel_mod",
+        help="Pilih module. Daftar action otomatis difilter sesuai module. Gunakan (Custom) untuk module baru."
+    )
+    # Reset action selection jika module berubah
+    if 'cfg_last_mod' not in st.session_state or st.session_state.cfg_last_mod != sel_mod:
+        st.session_state.cfg_last_mod = sel_mod
+        if 'cfg_sel_act' in st.session_state:
+            del st.session_state['cfg_sel_act']
+    # Tentukan module input final
+    if sel_mod == "(Custom)":
+        mod_in = st.text_input("Module Baru", key="cfg_mod_custom", placeholder="misal: cash_advance").strip().lower()
+        # kumpulkan semua action unik sebagai referensi (tidak dipakai langsung kecuali user ingin lihat)
+        all_actions_flat = sorted({a for s in static_actions_by_module.values() for a in s} | {a for s in dynamic_actions_by_module.values() for a in s})
+        filtered_actions = all_actions_flat
+    else:
+        mod_in = sel_mod.strip().lower()
+        filtered_actions = _actions_for_module(mod_in)
+    if not filtered_actions:
+        filtered_actions = []
+    filtered_actions_with_custom = filtered_actions + ["(Custom)"]
+
     with st.form("cfg_add_update", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
-            sel_mod = st.selectbox("Pilih Module", module_options, key="cfg_sel_mod", help="Pilih module. Daftar action di sebelah kanan otomatis difilter sesuai module.")
-            if sel_mod == "(Custom)":
-                mod_in = st.text_input("Module Baru", placeholder="misal: cash_advance").strip().lower()
-                # Untuk module custom, kumpulkan semua action unik agar user bisa pilih referensi atau buat baru
-                all_actions_flat = sorted({a for s in static_actions_by_module.values() for a in s} | {a for s in dynamic_actions_by_module.values() for a in s})
-                filtered_actions = all_actions_flat
-            else:
-                mod_in = sel_mod.strip().lower()
-                filtered_actions = _actions_for_module(mod_in)
-            # Fallback: jika module belum punya action sama sekali (kosong), pakai list kosong dulu (akan jadi hanya (Custom))
-            if not filtered_actions:
-                filtered_actions = []
-            # Tambahkan opsi custom di akhir
-            filtered_actions_with_custom = filtered_actions + ["(Custom)"]
-        with c2:
-            sel_act = st.selectbox("Pilih Action", filtered_actions_with_custom, key="cfg_sel_act", help="Action hanya menampilkan yang relevan dengan module terpilih. Gunakan (Custom) untuk menambah baru.")
+            sel_act = st.selectbox(
+                "Pilih Action",
+                filtered_actions_with_custom,
+                key="cfg_sel_act",
+                help="Action difilter oleh module. Pilih (Custom) untuk menambah action baru."
+            )
             if sel_act == "(Custom)":
-                act_in = st.text_input("Action Baru", placeholder="misal: submitted").strip().lower()
+                act_in = st.text_input("Action Baru", key="cfg_act_custom", placeholder="misal: submitted").strip().lower()
             else:
                 act_in = sel_act.strip().lower()
-        roles_multi = st.multiselect("Pilih Roles", ALLOWED_ROLES, default=[r for r in ["finance"] if r in ALLOWED_ROLES])
-        active_in = st.checkbox("Active", value=True)
+        with c2:
+            roles_multi = st.multiselect("Pilih Roles", ALLOWED_ROLES, default=[r for r in ["finance"] if r in ALLOWED_ROLES])
+            active_in = st.checkbox("Active", value=True)
         submitted = st.form_submit_button("Simpan / Update Mapping")
         if submitted:
             mod = mod_in.strip().lower()
