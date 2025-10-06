@@ -3101,45 +3101,12 @@ def main():
     st.sidebar.markdown(
         """
         <style>
-        /* Uniform sidebar navigation buttons */
         .wijna-nav-btn > button {
-            width:100% !important;
-            height:34px !important;
-            min-height:34px !important;
-            display:flex !important;
-            align-items:center !important;
-            justify-content:center !important;
-            font-size:0.88rem !important;
-            font-weight:600 !important;
-            padding:0 8px !important;
-            margin:0 0 1px 0 !important;
-            border-radius:5px !important;
-            line-height:1.0 !important;
-            white-space:nowrap !important;
-        }
-        .wijna-nav-btn.active-nav > button {
-            background:#2563eb !important;
-            color:#ffffff !important;
-            border:1px solid #1d4ed8 !important;
-            box-shadow:0 0 0 1px rgba(37,99,235,0.35) inset;
-        }
-        .wijna-nav-btn > button:hover {
-            border:1px solid #2563eb !important;
-        }
-        /* Compact sidebar heading & separator */
-        .sidebar-section-title { 
-            font-size:0.78rem; 
-            font-weight:700; 
-            letter-spacing:0.5px; 
-            color:#475569; 
-            text-transform:uppercase; 
-            margin:4px 0 6px 0 !important;
-        }
-        .sidebar-thin-sep { 
-            height:1px; 
-            background:linear-gradient(90deg,#cbd5e1,#f1f5f9); 
-            margin:6px 0 4px 0; 
-            border-radius:1px;
+            width: 100% !important;
+            min-height: 42px !important;
+            font-size: 1.05rem !important;
+            margin-bottom: 6px !important;
+            border-radius: 6px !important;
         }
         </style>
         """,
