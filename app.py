@@ -2913,14 +2913,14 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS navigasi + logout seragam 2-grid
+    # CSS baru: ukuran tombol seragam single-column penuh
     st.sidebar.markdown(
         """
         <style>
-        #wijna-nav-area button, #wijna-logout-area button {
+        #wijna-nav-area button {
             width: 100% !important;
-            height: 48px !important;
-            min-height: 48px !important;
+            height: 50px !important;
+            min-height: 50px !important;
             padding: 4px 8px !important;
             margin-bottom: 6px !important;
             font-size: 0.95rem !important;
@@ -2929,54 +2929,32 @@ def main():
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
-            line-height: 1.15 !important;
+            line-height: 1.1 !important;
             white-space: normal !important;
             text-align: center !important;
         }
-        #wijna-nav-area button:hover, #wijna-logout-area button:hover {outline:2px solid rgba(59,130,246,0.35)!important;}
-        #wijna-nav-area [data-testid=column] {padding-right:4px !important; padding-left:4px !important;}
+        #wijna-nav-area button:hover {outline: 2px solid rgba(59,130,246,0.35) !important;}
+        #wijna-nav-area [data-testid="column"] {padding-right:4px !important; padding-left:4px !important;}
         #wijna-nav-area {margin-top:0.25rem;}
-        /* Active highlight injection via inline style per button id */
         </style>
         """,
         unsafe_allow_html=True
     )
 
-    def _render_nav_button(key_page: str, label: str):
-        btn_id = f"nav_{key_page}"
-        clicked = st.button(label, key=btn_id, help=key_page)
-        if st.session_state.get("page") == key_page:
-            st.markdown(
-                f"<style>button#{btn_id} {{background:linear-gradient(90deg,#2563eb,#3b82f6)!important;color:#fff!important;}}</style>",
-                unsafe_allow_html=True,
-            )
-        if clicked:
-            st.session_state["page"] = key_page
-            st.rerun()
-
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Navigasi Modul")
     st.sidebar.markdown('<div id="wijna-nav-area">', unsafe_allow_html=True)
-    nav_cols = st.sidebar.columns(2)
-    for idx, (key_page, label) in enumerate(menu):
-        with nav_cols[idx % 2]:
-            _render_nav_button(key_page, label)
+    for key, label in menu:
+        if st.sidebar.button(label, key=f"nav_{key}", help=key):
+            st.session_state["page"] = key
+            st.rerun()
+    st.sidebar.markdown('<hr style="margin:6px 0 10px 0;" />', unsafe_allow_html=True)
+    if st.sidebar.button("🚪 Logout", key="nav_full_logout"):
+        logout()
+        st.rerun()
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-    # Logout penuh dua kolom (render setelah spacer kecil)
-    st.sidebar.markdown('<div id="wijna-logout-area">', unsafe_allow_html=True)
-    logout_cols = st.sidebar.columns(2)
-    with logout_cols[0]:
-        if st.button("Logout", key="sidebar_logout_left"):
-            logout()
-            st.rerun()
-    with logout_cols[1]:
-        if st.button("Logout", key="sidebar_logout_right"):
-            logout()
-            st.rerun()
-    # Samakan kedua tombol visual (pengguna bisa klik salah satu). Jika ingin benar-benar satu tombol melintang, perlu komponen custom.
-    st.sidebar.markdown("""<style>button#sidebar_logout_left,button#sidebar_logout_right{background:#ef4444!important;color:#fff!important;}button#sidebar_logout_left:hover,button#sidebar_logout_right:hover{background:#dc2626!important;}</style>""", unsafe_allow_html=True)
-    st.sidebar.markdown('</div>', unsafe_allow_html=True)
+    # (Logout sudah ditangani dalam wrapper navigasi di atas)
 
     choice = st.session_state["page"]
 
