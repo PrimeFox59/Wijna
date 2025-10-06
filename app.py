@@ -2150,7 +2150,28 @@ def mou_module():
 
     # Helpers
     def _mou_ws():
-        return _get_ws(MOU_SHEET_NAME)
+        """Return worksheet for MoU, create if not exists (idempotent)."""
+        try:
+            return _get_ws(MOU_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            # Kemungkinan flag _core_sheets_ok sudah True sebelum penambahan sheet MoU.
+            # Buat sheet baru dengan header standar.
+            try:
+                spreadsheet = get_spreadsheet()
+                mou_headers = [
+                    "id", "nomor", "nama", "pihak", "jenis",
+                    "tgl_mulai", "tgl_selesai",
+                    "draft_file_id", "draft_file_name", "draft_file_link",
+                    "board_note", "board_approved",
+                    "final_file_id", "final_file_name", "final_file_link",
+                    "created_at", "updated_at", "submitted_by"
+                ]
+                ws = ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
+                st.toast("Sheet MoU dibuat otomatis.")
+                return ws
+            except Exception as e:
+                st.error(f"Gagal membuat sheet MoU: {e}")
+                raise
 
     def _mou_headers():
         return [
