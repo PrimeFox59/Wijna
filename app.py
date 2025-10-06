@@ -40,6 +40,7 @@ FLEX_SHEET_NAME = "flex"
 MOBIL_SHEET_NAME = "mobil"
 CALENDAR_SHEET_NAME = "calendar"
 PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
+NOTULEN_SHEET_NAME = "notulen"
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -88,6 +89,9 @@ NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
     ("mobil", "delete"): ["finance"],
     # Calendar events
     ("calendar", "add_holiday"): ["director"],
+    # Notulen events
+    ("notulen", "upload"): ["director"],
+    ("notulen", "director_approval"): ["staff", "finance"],  # optional broadcast; uploader akan tetap dapat email jika masuk role
 }
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -680,6 +684,13 @@ def ensure_core_sheets():
             "tahun", "tanggal", "nama", "keterangan", "ditetapkan_oleh", "tanggal_penetapan"
         ]
         ensure_sheet_with_headers(spreadsheet, PUBLIC_HOLIDAYS_SHEET_NAME, public_holidays_headers)
+
+        # Notulen sheet (meeting minutes) - flexible columns to align with reference
+        notulen_headers = [
+            "id", "judul", "kategori", "divisi", "tanggal_rapat", "tanggal_upload", "file_id", "file_name", "file_link",
+            "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
+        ]
+        ensure_sheet_with_headers(spreadsheet, NOTULEN_SHEET_NAME, notulen_headers)
 
         st.session_state["_core_sheets_ok"] = True
     except Exception as e:
@@ -4359,8 +4370,356 @@ def sop_module():
 
 
 def notulen_module():
-    st.header("🗒️ Notulen")
-    st.info("Module coming soon (Sheets + Drive)")
+    user = require_login()
+    st.header("🗒️ Notulen Rapat Rutin")
+
+    # Helpers
+    def _not_headers():
+        return [
+            "id", "judul", "kategori", "divisi", "tanggal_rapat", "tanggal_upload", "file_id", "file_name", "file_link",
+            "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
+        ]
+
+    def _not_ws():
+        try:
+            return _get_ws(NOTULEN_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            return ensure_sheet_with_headers(get_spreadsheet(), NOTULEN_SHEET_NAME, _not_headers())
+
+    def _not_read_df():
+        ws = _not_ws()
+        headers = _not_headers()
+        try:
+            records = _cached_get_all_records(NOTULEN_SHEET_NAME, headers)
+        except Exception:
+            records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        # Normalisasi
+        df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
+        return ws, df
+
+    def _not_append(row: dict):
+        ws = _not_ws()
+        headers = ws.row_values(1)
+        values = [row.get(h, "") for h in headers]
+        for i in range(3):
+            try:
+                ws.append_row(values)
+                _invalidate_data_cache()
+                break
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    time.sleep(1.0 * (i + 1))
+                    continue
+                raise
+
+    def _not_update_by_id(nid: str, updates: dict):
+        ws = _not_ws()
+        headers = ws.row_values(1)
+        try:
+            cell = ws.find(nid)
+        except Exception:
+            return False
+        if not cell:
+            return False
+        row_idx = cell.row
+        for k, v in updates.items():
+            if k not in headers:
+                continue
+            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+            for i in range(3):
+                try:
+                    ws.update(a1, [[v]])
+                    break
+                except gspread.exceptions.APIError as e:
+                    if "429" in str(e):
+                        time.sleep(1.0 * (i + 1))
+                        continue
+                    raise
+        _invalidate_data_cache()
+        return True
+
+    def _upload_notulen_file(file) -> tuple[str, str, str]:
+        if not file:
+            return "", "", ""
+        try:
+            service = get_gdrive_service()
+            fname = file.name
+            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
+            metadata = {"name": fname, "parents": [GDRIVE_FOLDER_ID]}
+            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name").execute()
+            fid = created.get('id','')
+            link = created.get('webViewLink','')
+            return fid, fname, link
+        except Exception as e:
+            st.error(f"Gagal upload file notulen: {e}")
+            return "", "", ""
+
+    # Tanggal referensi: jika tanggal_rapat kosong, gunakan tanggal_upload
+    tab_upload, tab_list, tab_rekap = st.tabs(["🆕 Upload Notulen", "📋 Daftar Notulen", "📅 Rekap Bulanan Notulen"])
+
+    # --- Tab 1: Upload ---
+    with tab_upload:
+        st.subheader("🆕 Upload Notulen (Staf upload, Director approve final)")
+        _, df_nt = _not_read_df()
+        headers = list(df_nt.columns)
+        has_tanggal_rapat = 'tanggal_rapat' in headers
+        has_follow_up = 'follow_up' in headers
+        has_deadline = 'deadline' in headers
+        has_director_note = 'director_note' in headers
+        has_director_approved = 'director_approved' in headers
+        with st.form("not_add", clear_on_submit=True):
+            judul = st.text_input("Judul Rapat")
+            kategori = st.text_input("Kategori (opsional)") if 'kategori' in headers else None
+            divisi = st.text_input("Divisi / Departemen (opsional)") if 'divisi' in headers else None
+            tgl_rapat = st.date_input("Tanggal Rapat", value=date.today()) if has_tanggal_rapat else None
+            file_up = st.file_uploader("File Notulen (PDF/DOC/IMG)")
+            follow_up = st.text_area("Catatan Follow Up (opsional)") if has_follow_up else None
+            deadline = st.date_input("Deadline / Tindak Lanjut", value=date.today()) if has_deadline else None
+            submit_btn = st.form_submit_button("💾 Upload Notulen")
+            if submit_btn:
+                if not judul or not file_up:
+                    st.warning("Judul dan file wajib diisi.")
+                else:
+                    nid = gen_id("not")
+                    fid, fname, flink = _upload_notulen_file(file_up)
+                    now_iso = now_wib_iso()
+                    row = {
+                        "id": nid,
+                        "judul": judul,
+                        "kategori": kategori or "" if 'kategori' in headers else "",
+                        "divisi": divisi or "" if 'divisi' in headers else "",
+                        "file_id": fid,
+                        "file_name": fname,
+                        "file_link": flink,
+                        "uploaded_by": (get_current_user() or {}).get("full_name") or (get_current_user() or {}).get("email"),
+                        "version": 1 if 'version' in headers else "",
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
+                    }
+                    if has_tanggal_rapat and tgl_rapat:
+                        row["tanggal_rapat"] = tgl_rapat.isoformat()
+                    else:
+                        row["tanggal_upload"] = now_iso
+                    if has_follow_up:
+                        row["follow_up"] = follow_up or ""
+                    if has_deadline and deadline:
+                        row["deadline"] = deadline.isoformat()
+                    if has_director_note:
+                        row["director_note"] = ""
+                    if has_director_approved:
+                        row["director_approved"] = 0
+                    _not_append(row)
+                    try:
+                        audit_log("notulen", "upload", target=nid, details=f"{judul} {tgl_rapat or ''}; file={fname}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_event("notulen", "upload", subject=f"Notulen Baru: {judul}", body=f"Judul: {judul}\nTanggal: {tgl_rapat or now_iso}\nUploader: {(get_current_user() or {}).get('email')}\nLink: {flink}")
+                    except Exception:
+                        pass
+                    st.success("Notulen berhasil diupload. Menunggu approval Director.")
+
+    # --- Tab 2: Daftar ---
+    with tab_list:
+        st.subheader("📋 Daftar Notulen")
+        _, df_nt = _not_read_df()
+        if df_nt.empty:
+            st.info("Belum ada notulen.")
+        else:
+            # Tentukan kolom tanggal utama
+            date_col = "tanggal_rapat" if 'tanggal_rapat' in df_nt.columns and df_nt['tanggal_rapat'].astype(str).str.len().gt(0).any() else ("tanggal_upload" if 'tanggal_upload' in df_nt.columns else None)
+            # Filter UI (judul, status, tanggal, kategori, divisi, uploader)
+            c1, c2, c3 = st.columns([2,2,3])
+            with c1:
+                q = st.text_input("Cari Judul", "")
+                uploader_filter = st.text_input("Filter Uploader", "") if 'uploaded_by' in df_nt.columns else ""
+            with c2:
+                status_sel = st.selectbox("Status", ["Semua","Approved","Belum"]) if 'director_approved' in df_nt.columns else "Semua"
+                kategori_sel = st.selectbox("Kategori", ["Semua"] + sorted([k for k in df_nt.get('kategori', pd.Series(dtype=str)).dropna().unique() if str(k).strip()])) if 'kategori' in df_nt.columns else "Semua"
+            with c3:
+                divisi_sel = st.selectbox("Divisi", ["Semua"] + sorted([d for d in df_nt.get('divisi', pd.Series(dtype=str)).dropna().unique() if str(d).strip()])) if 'divisi' in df_nt.columns else "Semua"
+                if date_col and not df_nt.empty:
+                    try:
+                        df_nt['_dc'] = pd.to_datetime(df_nt[date_col], errors='coerce')
+                        min_d = df_nt['_dc'].min().date() if pd.notna(df_nt['_dc'].min()) else date.today()
+                        max_d = df_nt['_dc'].max().date() if pd.notna(df_nt['_dc'].max()) else date.today()
+                        dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
+                    except Exception:
+                        dr = None
+                else:
+                    dr = None
+            dff = df_nt.copy()
+            if q:
+                dff = dff[dff['judul'].astype(str).str.contains(q, case=False, na=False)]
+            if uploader_filter and 'uploaded_by' in dff.columns:
+                dff = dff[dff['uploaded_by'].astype(str).str.contains(uploader_filter, case=False, na=False)]
+            if status_sel != "Semua" and 'director_approved' in dff.columns:
+                dff = dff[dff['director_approved'] == (1 if status_sel == 'Approved' else 0)]
+            if kategori_sel != "Semua" and 'kategori' in dff.columns:
+                dff = dff[dff['kategori'].astype(str).str.lower() == kategori_sel.lower()]
+            if divisi_sel != "Semua" and 'divisi' in dff.columns:
+                dff = dff[dff['divisi'].astype(str).str.lower() == divisi_sel.lower()]
+            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and date_col and date_col in dff.columns:
+                try:
+                    s, e = dr
+                    dff['_dc'] = pd.to_datetime(dff[date_col], errors='coerce')
+                    dff = dff[(dff['_dc'] >= pd.to_datetime(s)) & (dff['_dc'] <= pd.to_datetime(e))]
+                except Exception:
+                    pass
+            if not dff.empty:
+                show = dff.copy()
+                if 'director_approved' in show.columns:
+                    show['Status'] = show['director_approved'].map({1: "✅ Approved", 0: "🕒 Proses"})
+                cols_show = ['judul']
+                for c in ['kategori','divisi']:
+                    if c in show.columns:
+                        cols_show.append(c)
+                if date_col:
+                    cols_show.append(date_col)
+                for c in ['uploaded_by','deadline','file_name','version','Status']:
+                    if c in show.columns:
+                        cols_show.append(c)
+                safe_dataframe(show[cols_show], index=False)
+
+                # Download pilihan (link Drive langsung)
+                if 'file_name' in show.columns and 'file_link' in show.columns:
+                    opsi = {f"{r['judul']} — {r.get(date_col,'')}" + (f" ({r['file_name']})" if r.get('file_name') else ""): r['file_link'] for _, r in show.iterrows() if r.get('file_link')}
+                    if opsi:
+                        pilih = st.selectbox("Pilih notulen (link Drive)", [""] + list(opsi.keys()))
+                        if pilih:
+                            st.markdown(f"➡️ <a href='{opsi[pilih]}' target='_blank'>Buka File</a>", unsafe_allow_html=True)
+
+                # Approval Director
+                if user.get('role') in ['director','superuser'] and 'director_approved' in df_nt.columns:
+                    st.markdown("#### ✅ Approval Director (Pending)")
+                    pending = df_nt[df_nt['director_approved'] == 0].copy()
+                    if date_col and not pending.empty:
+                        try:
+                            pending = pending.sort_values(by=date_col, ascending=False)
+                        except Exception:
+                            pass
+                    if pending.empty:
+                        st.info("Tidak ada notulen menunggu approval.")
+                    else:
+                        for _, r in pending.iterrows():
+                            title = f"{r['judul']}" + (f" | {r.get(date_col)}" if date_col and r.get(date_col) else "")
+                            with st.expander(title):
+                                st.write(f"File: {r.get('file_name') or '-'}")
+                                if r.get('file_link'):
+                                    st.markdown(f"📄 <a href='{r['file_link']}' target='_blank'>Buka di Drive</a>", unsafe_allow_html=True)
+                                note_val = st.text_area("Catatan Director (opsional)", value=r.get('director_note') or "", key=f"not_note_{r['id']}")
+                                if st.button("Approve Notulen", key=f"not_appr_{r['id']}"):
+                                    updates = {"director_approved": 1, "updated_at": now_wib_iso()}
+                                    if 'director_note' in df_nt.columns:
+                                        updates['director_note'] = note_val
+                                    if _not_update_by_id(r['id'], updates):
+                                        try:
+                                            audit_log("notulen", "director_approval", target=r['id'], details=f"note={note_val}")
+                                        except Exception:
+                                            pass
+                                        # Notify uploader
+                                        try:
+                                            uploader_email = r.get('uploaded_by') or ''
+                                            if uploader_email:
+                                                notify_event("notulen", "director_approval", subject=f"Notulen Disetujui: {r['judul']}", body=f"Notulen '{r['judul']}' telah disetujui. Catatan: {note_val}")
+                                        except Exception:
+                                            pass
+                                        st.success("Notulen approved.")
+                                        st.rerun()
+                                # Edit follow_up / deadline (sebelum approval)
+                                if 'follow_up' in df_nt.columns or 'deadline' in df_nt.columns:
+                                    with st.form(f"edit_fu_{r['id']}"):
+                                        if 'follow_up' in df_nt.columns:
+                                            new_fu = st.text_area("Update Follow Up", value=r.get('follow_up') or "")
+                                        else:
+                                            new_fu = None
+                                        if 'deadline' in df_nt.columns:
+                                            try:
+                                                current_deadline = None
+                                                if r.get('deadline'):
+                                                    current_deadline = date.fromisoformat(str(r.get('deadline'))[:10])
+                                            except Exception:
+                                                current_deadline = date.today()
+                                            new_deadline = st.date_input("Update Deadline", value=current_deadline or date.today())
+                                        else:
+                                            new_deadline = None
+                                        if st.form_submit_button("💾 Simpan Update Follow Up/Deadline"):
+                                            upd = {"updated_at": now_wib_iso()}
+                                            if new_fu is not None:
+                                                upd['follow_up'] = new_fu
+                                            if new_deadline is not None:
+                                                upd['deadline'] = new_deadline.isoformat()
+                                            if _not_update_by_id(r['id'], upd):
+                                                st.success("Follow up / deadline diperbarui.")
+                                                st.rerun()
+                                # Reupload (versi baru)
+                                if 'version' in df_nt.columns:
+                                    with st.form(f"reup_{r['id']}"):
+                                        new_file = st.file_uploader("Re-upload File Notulen (versi baru)", key=f"reup_file_{r['id']}")
+                                        if st.form_submit_button("⬆️ Reupload (Tambah Versi)") and new_file:
+                                            nf_id, nf_name, nf_link = _upload_notulen_file(new_file)
+                                            new_ver = 1
+                                            try:
+                                                cur_v = int(r.get('version') or 1)
+                                                new_ver = cur_v + 1
+                                            except Exception:
+                                                new_ver = 1
+                                            upd2 = {
+                                                'file_id': nf_id,
+                                                'file_name': nf_name,
+                                                'file_link': nf_link,
+                                                'version': new_ver,
+                                                'updated_at': now_wib_iso(),
+                                            }
+                                            if _not_update_by_id(r['id'], upd2):
+                                                try:
+                                                    audit_log("notulen", "reupload", target=r['id'], details=f"version={new_ver}; file={nf_name}")
+                                                except Exception:
+                                                    pass
+                                                st.success(f"Reupload sukses. Versi sekarang: v{new_ver}")
+                                                st.rerun()
+            else:
+                st.info("Tidak ada notulen sesuai filter.")
+
+    # --- Tab 3: Rekap ---
+    with tab_rekap:
+        st.subheader("📅 Rekap Bulanan Notulen (Otomatis)")
+        _, df_nt = _not_read_df()
+        if df_nt.empty:
+            st.info("Belum ada data notulen.")
+        else:
+            date_col = "tanggal_rapat" if 'tanggal_rapat' in df_nt.columns and df_nt['tanggal_rapat'].astype(str).str.len().gt(0).any() else ("tanggal_upload" if 'tanggal_upload' in df_nt.columns else None)
+            this_month = date.today().strftime("%Y-%m")
+            if date_col:
+                df_month = df_nt[df_nt[date_col].astype(str).str[:7] == this_month].copy()
+            else:
+                df_month = pd.DataFrame()
+            st.write(f"Total notulen bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                cols_show = ['judul']
+                for extra in ['kategori','divisi','version']:
+                    if extra in df_month.columns:
+                        cols_show.append(extra)
+                if date_col:
+                    cols_show.append(date_col)
+                safe_dataframe(df_month[cols_show], index=False)
+                # Ringkasan per kategori
+                if 'kategori' in df_month.columns:
+                    st.markdown("#### Ringkasan per Kategori")
+                    kc = df_month.groupby(df_month['kategori'].replace('', 'Tanpa Kategori')).size().reset_index(name='jumlah')
+                    safe_dataframe(kc, index=False)
+                if 'divisi' in df_month.columns:
+                    st.markdown("#### Ringkasan per Divisi")
+                    dv = df_month.groupby(df_month['divisi'].replace('', 'Tanpa Divisi')).size().reset_index(name='jumlah')
+                    safe_dataframe(dv, index=False)
+                try:
+                    st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month[cols_show].to_csv(index=False).encode('utf-8'), file_name=f"rekap_notulen_{this_month}.csv")
+                except Exception:
+                    pass
 
 
 def user_setting_module():
