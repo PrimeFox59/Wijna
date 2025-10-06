@@ -1260,7 +1260,7 @@ def dashboard():
                 _invalidate_data_cache()
             except Exception:
                 pass
-            st.experimental_rerun()
+            st.rerun()
     with col_time:
         st.write(f"Waktu (WIB): {now_wib_iso()}")
 
@@ -1458,16 +1458,6 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                nav_cols = st.columns(3)
-                with nav_cols[0]:
-                    if st.button("📦", help="Ke Inventory", key="card_inv_nav"):
-                        st.session_state["page"] = "Inventory"; st.experimental_rerun()
-                with nav_cols[1]:
-                    if st.button("💸", help="Ke Cash Advance", key="card_ca_nav"):
-                        st.session_state["page"] = "Cash Advance"; st.experimental_rerun()
-                with nav_cols[2]:
-                    if st.button("📝", help="Ke Delegasi", key="card_del_nav"):
-                        st.session_state["page"] = "Delegasi"; st.experimental_rerun()
         with c2:
                 st.markdown(f"""
                 <div class='stat-card'>
@@ -1485,13 +1475,6 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                nav_cols2 = st.columns(2)
-                with nav_cols2[0]:
-                    if st.button("📥", help="Ke Surat Masuk", key="card_sm_nav"):
-                        st.session_state["page"] = "Surat Masuk"; st.experimental_rerun()
-                with nav_cols2[1]:
-                    if st.button("📤", help="Ke Surat Keluar", key="card_sk_nav"):
-                        st.session_state["page"] = "Surat Keluar"; st.experimental_rerun()
         with c3:
                 st.markdown(f"""
                 <div class='stat-card'>
@@ -1509,13 +1492,6 @@ def dashboard():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                nav_cols3 = st.columns(2)
-                with nav_cols3[0]:
-                    if st.button("🤝", help="Ke MoU", key="card_mou_nav"):
-                        st.session_state["page"] = "MoU"; st.experimental_rerun()
-                with nav_cols3[1]:
-                    if st.button("📚", help="Ke SOP", key="card_sop_nav"):
-                        st.session_state["page"] = "SOP"; st.experimental_rerun()
 
         # Expandable detailed approvals list (optional)
         with st.expander("Detail Approval per Modul", expanded=False):
@@ -2991,7 +2967,7 @@ def mou_module():
                     except Exception:
                         pass
                     st.success("MoU tersimpan (draft).")
-                    st.experimental_rerun()
+                    st.rerun()
 
     # TAB 2: Review Board
     with tab2:
@@ -3026,7 +3002,7 @@ def mou_module():
                                 except Exception:
                                     pass
                                 st.success("Review Board disimpan.")
-                                st.experimental_rerun()
+                                st.rerun()
                             except Exception as e:
                                 st.error(f"Gagal menyimpan: {e}")
         else:
