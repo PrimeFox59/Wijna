@@ -4453,51 +4453,58 @@ def kalender_pemakaian_mobil_kantor():
                 status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
                 finance_note = st.text_area("Catatan")
                 submitted_btn = st.form_submit_button("Simpan Jadwal Mobil")
+
                 if submitted_btn:
                     if not (nama_pengguna and kendaraan and tujuan):
                         st.warning("Nama, Kendaraan, Tujuan wajib diisi.")
                     elif tgl_selesai < tgl_mulai:
                         st.warning("Tanggal selesai harus >= tanggal mulai.")
                     else:
-                        # Overlap prevention
-                        has_conflict, conflicts = _mobil_has_overlap(kendaraan, tgl_mulai, tgl_selesai)
-                        if has_conflict:
-                            st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Periksa daftar berikut dan pilih tanggal lain.")
-                            try:
-                                safe_dataframe(conflicts, index=False)
-                            except Exception:
-                                st.write(conflicts)
-                            try:
-                                audit_log("mobil", "overlap_block", target=kendaraan, details=f"create {tgl_mulai}..{tgl_selesai}")
-                            except Exception:
-                                pass
+                        # Cek kendaraan duplikat (nama kendaraan sudah ada di sheet, tanpa memperhatikan waktu)
+                        _, df_all = _mobil_read_df()
+                        kendaraan_sama = df_all[df_all['kendaraan'].astype(str).str.lower() == (kendaraan or '').lower()]
+                        if not kendaraan_sama.empty:
+                            st.warning(f"Kendaraan '{kendaraan}' sudah pernah diinput pada jadwal lain. Pastikan tidak input kendaraan yang sama dua kali. Jika ingin menambah jadwal, gunakan menu edit/hapus.")
                         else:
-                            mid = gen_id("mobil")
-                            row = {
-                                "id": mid,
-                                "nama_pengguna": nama_pengguna,
-                                "divisi": divisi,
-                                "tgl_mulai": tgl_mulai.isoformat(),
-                                "tgl_selesai": tgl_selesai.isoformat(),
-                                "tujuan": tujuan,
-                                "kendaraan": kendaraan,
-                                "driver": driver,
-                                "status": status,
-                                "finance_note": finance_note,
-                                "created_at": now_wib_iso(),
-                                "updated_at": now_wib_iso(),
-                                "submitted_by": (get_current_user() or {}).get("email", ""),
-                            }
-                            _mobil_append(row)
-                            try:
-                                audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("mobil", "create", subject="Booking Mobil Baru", body=f"{kendaraan} {tgl_mulai}..{tgl_selesai} oleh {nama_pengguna}")
-                            except Exception:
-                                pass
-                            st.success("Jadwal mobil berhasil disimpan.")
+                            # Overlap prevention
+                            has_conflict, conflicts = _mobil_has_overlap(kendaraan, tgl_mulai, tgl_selesai)
+                            if has_conflict:
+                                st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Periksa daftar berikut dan pilih tanggal lain.")
+                                try:
+                                    safe_dataframe(conflicts, index=False)
+                                except Exception:
+                                    st.write(conflicts)
+                                try:
+                                    audit_log("mobil", "overlap_block", target=kendaraan, details=f"create {tgl_mulai}..{tgl_selesai}")
+                                except Exception:
+                                    pass
+                            else:
+                                mid = gen_id("mobil")
+                                row = {
+                                    "id": mid,
+                                    "nama_pengguna": nama_pengguna,
+                                    "divisi": divisi,
+                                    "tgl_mulai": tgl_mulai.isoformat(),
+                                    "tgl_selesai": tgl_selesai.isoformat(),
+                                    "tujuan": tujuan,
+                                    "kendaraan": kendaraan,
+                                    "driver": driver,
+                                    "status": status,
+                                    "finance_note": finance_note,
+                                    "created_at": now_wib_iso(),
+                                    "updated_at": now_wib_iso(),
+                                    "submitted_by": (get_current_user() or {}).get("email", ""),
+                                }
+                                _mobil_append(row)
+                                try:
+                                    audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
+                                except Exception:
+                                    pass
+                                try:
+                                    notify_event("mobil", "create", subject="Booking Mobil Baru", body=f"{kendaraan} {tgl_mulai}..{tgl_selesai} oleh {nama_pengguna}")
+                                except Exception:
+                                    pass
+                                st.success("Jadwal mobil berhasil disimpan.")
             # Edit / Hapus jadwal
             st.markdown("#### ✏️ Edit / 🗑️ Hapus Jadwal Mobil")
             _, df_all = _mobil_read_df()
