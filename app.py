@@ -2322,7 +2322,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status review finance diperbarui.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # --- Tab 3: Approval Director ---
     with tabs[2]:
@@ -2346,7 +2346,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status approval director diperbarui.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # --- Tab 4: Daftar Flex ---
     with tabs[3]:
@@ -2421,7 +2421,7 @@ def kalender_pemakaian_mobil_kantor():
                         except Exception:
                             pass
                         st.success("Jadwal dihapus.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # Tab 2: Daftar Booking & Filter (semua user)
     with tab2:
@@ -3222,7 +3222,7 @@ def dashboard():
         with col_gen:
             if st.button("⚙️ Generate / Refresh Rekap Bulan Ini", key="gen_rekap_ca"):
                 generate_cashadvance_monthly_rekap()
-                st.experimental_rerun()
+                st.rerun()
         try:
             df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", conn)
             if not df_ca_rekap.empty:
@@ -3603,3 +3603,4 @@ def audit_trail_module():
 if __name__ == "__main__":
     ensure_db()
     main()
+
