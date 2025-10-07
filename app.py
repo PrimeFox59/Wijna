@@ -2322,7 +2322,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status review finance diperbarui.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # --- Tab 3: Approval Director ---
     with tabs[2]:
@@ -2346,7 +2346,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status approval director diperbarui.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # --- Tab 4: Daftar Flex ---
     with tabs[3]:
@@ -2421,7 +2421,7 @@ def kalender_pemakaian_mobil_kantor():
                         except Exception:
                             pass
                         st.success("Jadwal dihapus.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # Tab 2: Daftar Booking & Filter (semua user)
     with tab2:
@@ -3137,29 +3137,167 @@ def dashboard():
     </style>
     """, unsafe_allow_html=True)
 
-    # --- GRID 2x2 RINGKASAN ---
-    grid1, grid2 = st.columns(2)
-    with grid1:
+    # --------------------------------------------------
+    # 1. Daftar Approval Menunggu (semua modul)
+    # --------------------------------------------------
+    st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="wijna-section-title">🛎️ List Approval Menunggu</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wijna-section-desc">Ringkasan entitas yang butuh tindakan (limit 5 per modul).</div>', unsafe_allow_html=True)
+    pending_specs = [
+        ("inventory", "SELECT id,name as info,status FROM inventory WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
+        ("cash_advance", "SELECT id,divisi as info, totals as status FROM cash_advance WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
+        ("pmr", "SELECT id,nama as info, bulan as status FROM pmr WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
+        ("cuti", "SELECT id,nama as info,status FROM cuti WHERE director_approved=0 LIMIT 5"),
+        ("surat_keluar", "SELECT id,perihal as info,status FROM surat_keluar WHERE director_approved=0 LIMIT 5"),
+        ("mou", "SELECT id,nama as info,tgl_selesai as status FROM mou WHERE director_approved=0 LIMIT 5"),
+        ("sop", "SELECT id,judul as info,'pending' as status FROM sop WHERE director_approved=0 LIMIT 5"),
+        ("notulen", "SELECT id,judul as info,'pending' as status FROM notulen WHERE director_approved=0 LIMIT 5"),
+        ("flex", "SELECT id,nama as info, CASE WHEN approval_finance=0 THEN 'Finance' ELSE 'Director' END as status FROM flex WHERE (approval_finance=0 OR approval_director=0) LIMIT 5"),
+        ("mobil", "SELECT id,kendaraan || ' - ' || tujuan as info,status FROM mobil WHERE status='Menunggu Approve' LIMIT 5"),
+    ]
+    pend_rows = []
+    for modul, q in pending_specs:
+        try:
+            dfp = pd.read_sql_query(q, conn)
+            if not dfp.empty:
+                for _, r in dfp.iterrows():
+                    pend_rows.append({"modul": modul, "id": r.get("id"), "info": r.get("info"), "status": r.get("status")})
+        except Exception:
+            continue
+    if pend_rows:
+        dfp_all = pd.DataFrame(pend_rows)
+        st.dataframe(dfp_all, use_container_width=True, hide_index=True)
+    else:
+        st.info("Tidak ada approval menunggu saat ini.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --------------------------------------------------
+    # 2. Status Surat & MoU
+    # --------------------------------------------------
+    st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="wijna-section-title">📄 Status Surat & MoU</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wijna-section-desc">Surat Masuk belum dibahas & MoU mendekati jatuh tempo (≤30 hari).</div>', unsafe_allow_html=True)
+    try:
+        df_surat_pending = pd.read_sql_query("SELECT id, nomor, pengirim, perihal, tanggal FROM surat_masuk WHERE status='Belum Dibahas' ORDER BY tanggal DESC LIMIT 8", conn)
+    except Exception:
+        df_surat_pending = pd.DataFrame()
+    try:
+        df_mou_due = pd.read_sql_query("SELECT id, nomor, nama, tgl_selesai FROM mou WHERE date(tgl_selesai) BETWEEN date('now') AND date('now','+30 day') ORDER BY tgl_selesai ASC LIMIT 8", conn)
+    except Exception:
+        df_mou_due = pd.DataFrame()
+    cols_status = st.columns(2)
+    with cols_status[0]:
+        st.markdown("**Surat Belum Dibahas**")
+        if df_surat_pending.empty:
+            st.write("-")
+        else:
+            st.dataframe(df_surat_pending, use_container_width=True, hide_index=True)
+    with cols_status[1]:
+        st.markdown("**MoU Mendekati Jatuh Tempo (≤30 hari)**")
+        if df_mou_due.empty:
+            st.write("-")
+        else:
+            st.dataframe(df_mou_due, use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- GRID: Cuti & Flex (kiri) + Rekap Multi Modul (kanan) ---
+    grid_cf, grid_rekap = st.columns(2)
+    with grid_cf:
         st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-title">🌴 Cuti & Flex — Ringkasan</div>', unsafe_allow_html=True)
-        st.markdown('<div class="wijna-section-desc">Rekap pengajuan cuti dan total durasi per pegawai.</div>', unsafe_allow_html=True)
-        df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) as total_pengajuan, SUM(durasi) as total_durasi FROM cuti GROUP BY nama", conn)
-        for col in df_cuti.columns:
-            if 'tanggal' in col or 'tgl' in col:
-                df_cuti[col] = df_cuti[col].apply(format_datetime_wib)
+        st.markdown('<div class="wijna-section-desc">Rekap pengajuan cuti dan total durasi per pegawai serta daftar flex approved.</div>', unsafe_allow_html=True)
+        try:
+            df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) as total_pengajuan, SUM(durasi) as total_durasi FROM cuti GROUP BY nama", conn)
+        except Exception:
+            df_cuti = pd.DataFrame(columns=["nama","total_pengajuan","total_durasi"])
         st.dataframe(df_cuti, use_container_width=True, hide_index=True)
+        try:
+            df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 10", conn)
+        except Exception:
+            df_flex_ok = pd.DataFrame(columns=["nama","tanggal","jam_mulai","jam_selesai"])
+        if not df_flex_ok.empty:
+            st.markdown("**Flex Disetujui (10 terbaru)**")
+            st.dataframe(df_flex_ok, use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
-
-    with grid2:
+    with grid_rekap:
+        # --------------------------------------------------
+        # 5. Rekap Bulanan Multi-Modul (Cash Advance, PMR, Inventory, Surat, MoU)
+        # (menggantikan tampilan lama rekap tunggal)
+        # --------------------------------------------------
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">📊 Rekap Bulanan Multi-Modul</div>', unsafe_allow_html=True)
+        this_month = date.today().strftime('%Y-%m')
+        rekap_data = []
+        # Cash Advance
+        try:
+            df_ca_m = pd.read_sql_query("SELECT totals, finance_approved, director_approved, tanggal FROM cash_advance WHERE substr(tanggal,1,7)=?", conn, params=(this_month,))
+            total_ca = len(df_ca_m)
+            cair = len(df_ca_m[(df_ca_m['finance_approved']==1) & (df_ca_m['director_approved']==1)]) if not df_ca_m.empty else 0
+            sum_ca = float(df_ca_m['totals'].sum()) if not df_ca_m.empty else 0
+            rekap_data.append({"Modul":"Cash Advance","Jumlah": total_ca, "Selesai": cair, "Nominal": sum_ca})
+        except Exception:
+            pass
+        # PMR
+        try:
+            df_pmr_m = pd.read_sql_query("SELECT id, nama, bulan, finance_approved, director_approved FROM pmr WHERE substr(bulan,1,7)=?", conn, params=(this_month,))
+            total_pmr = len(df_pmr_m)
+            approved_pmr = len(df_pmr_m[(df_pmr_m['finance_approved']==1) & (df_pmr_m['director_approved']==1)]) if not df_pmr_m.empty else 0
+            rekap_data.append({"Modul":"PMR","Jumlah": total_pmr, "Selesai": approved_pmr, "Nominal": '-'})
+        except Exception:
+            pass
+        # Inventory (updated this month)
+        try:
+            inv_count = pd.read_sql_query("SELECT COUNT(*) as c FROM inventory WHERE substr(updated_at,1,7)=?", conn, params=(this_month,)).iloc[0]['c']
+            rekap_data.append({"Modul":"Inventory Updated","Jumlah": inv_count, "Selesai": '-', "Nominal": '-'})
+        except Exception:
+            pass
+        # Surat Masuk
+        try:
+            sm_df = pd.read_sql_query("SELECT id, status, tanggal FROM surat_masuk WHERE substr(tanggal,1,7)=?", conn, params=(this_month,))
+            rekap_data.append({"Modul":"Surat Masuk","Jumlah": len(sm_df), "Selesai": (sm_df['status'].str.lower()!='belum dibahas').sum() if not sm_df.empty else 0, "Nominal": '-'})
+        except Exception:
+            pass
+        # Surat Keluar
+        try:
+            sk_df = pd.read_sql_query("SELECT id, status, tanggal FROM surat_keluar WHERE substr(tanggal,1,7)=?", conn, params=(this_month,))
+            final_cnt = (sk_df['status'].str.lower()=="final").sum() if not sk_df.empty else 0
+            rekap_data.append({"Modul":"Surat Keluar","Jumlah": len(sk_df), "Selesai": final_cnt, "Nominal": '-'})
+        except Exception:
+            pass
+        # MoU aktif bulan ini (mulai atau selesai di bulan ini)
+        try:
+            mou_df = pd.read_sql_query("SELECT id, tgl_mulai, tgl_selesai FROM mou WHERE substr(tgl_mulai,1,7)=? OR substr(tgl_selesai,1,7)=?", conn, params=(this_month,this_month))
+            rekap_data.append({"Modul":"MoU","Jumlah": len(mou_df), "Selesai": '-', "Nominal": '-'})
+        except Exception:
+            pass
+        if rekap_data:
+            df_rekap_multi = pd.DataFrame(rekap_data)
+            # Format nominal Rp
+            if 'Nominal' in df_rekap_multi.columns:
+                df_rekap_multi['Nominal'] = df_rekap_multi['Nominal'].apply(lambda v: (f"Rp {v:,.0f}".replace(",",".")) if isinstance(v,(int,float)) else v)
+            st.dataframe(df_rekap_multi, use_container_width=True, hide_index=True)
+        else:
+            st.info("Belum ada data rekap bulan ini.")
+        st.markdown('</div>', unsafe_allow_html=True)
+    # Delegasi + Kalender (dua kolom baru)
+    grid_del, grid_cal = st.columns(2)
+    with grid_del:
         st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-title">🗂️ Delegasi Tugas — Aktif</div>', unsafe_allow_html=True)
-        st.markdown('<div class="wijna-section-desc">Daftar delegasi tugas yang sedang berjalan.</div>', unsafe_allow_html=True)
-        df_del = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", conn)
-        for col in df_del.columns:
-            if 'tanggal' in col or 'tgl' in col:
-                df_del[col] = df_del[col].apply(format_datetime_wib)
+        st.markdown('<div class="wijna-section-desc">Daftar delegasi berjalan & status.</div>', unsafe_allow_html=True)
+        try:
+            df_del = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", conn)
+            for col in df_del.columns:
+                if 'tanggal' in col or 'tgl' in col:
+                    df_del[col] = df_del[col].apply(format_datetime_wib)
+        except Exception:
+            df_del = pd.DataFrame(columns=["id","judul","pic","tgl_mulai","tgl_selesai","status"])
         st.dataframe(df_del, use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+    with grid_cal:
+        # Placeholder; kalender 30 hari block below will follow after this patch context
+        pass
 
     grid3, grid4 = st.columns(2)
     with grid3:
@@ -3222,7 +3360,7 @@ def dashboard():
         with col_gen:
             if st.button("⚙️ Generate / Refresh Rekap Bulan Ini", key="gen_rekap_ca"):
                 generate_cashadvance_monthly_rekap()
-                st.rerun()
+                st.experimental_rerun()
         try:
             df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", conn)
             if not df_ca_rekap.empty:
@@ -3603,4 +3741,3 @@ def audit_trail_module():
 if __name__ == "__main__":
     ensure_db()
     main()
-
