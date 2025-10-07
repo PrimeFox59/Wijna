@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import gspread
@@ -840,7 +841,7 @@ def show_login_page():
         with st.form("login_form"):
             username = st.text_input("Username").lower()
             password = st.text_input("Password", type="password")
-            login_button = st.form_submit_button("Login", key="login_btn")
+            login_button = st.form_submit_button("Login")
 
             if login_button:
                 if not username or not password:
@@ -877,7 +878,7 @@ def show_login_page():
             new_username = st.text_input("Username Baru").lower()
             new_password = st.text_input("Password Baru", type="password")
             confirm_password = st.text_input("Konfirmasi Password", type="password")
-            register_button = st.form_submit_button("Register", key="register_btn")
+            register_button = st.form_submit_button("Register")
 
             if register_button:
                 if not new_username or not new_password or not confirm_password:
@@ -903,12 +904,30 @@ def show_login_page():
                     except Exception:
                         pass
 
+def show_main_app():
+    """Menampilkan aplikasi utama setelah user berhasil login."""
+    st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
+    if st.sidebar.button("Logout"):
+        
+        # Kirim notifikasi ke seluruh SUPERUSER saat LOGOUT
+        email_subject = "Notifikasi: User Logout"
+        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
+        try:
+            notify_event("auth", "logout", email_subject, email_body)
+        except Exception:
+            pass
+        
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.rerun()
 
 def get_current_user():
     return st.session_state.get("user")
 
+
 def set_current_user(user_obj):
     st.session_state.user = user_obj
+
 
 def logout():
     user = get_current_user()
@@ -927,7 +946,9 @@ def logout():
     st.session_state.logged_in = False
     st.session_state.username = ""
 
+
 from auth import login_user, register_user  # type: ignore
+
 
 def auth_sidebar():
     user = get_current_user()
@@ -954,6 +975,7 @@ def auth_sidebar():
                         unsafe_allow_html=True,
                 )
 
+
 def _get_emails_by_role(role: str) -> list[str]:
     try:
         ws = get_spreadsheet().worksheet(USERS_SHEET_NAME)
@@ -971,6 +993,7 @@ def _get_emails_by_role(role: str) -> list[str]:
         )
     except Exception:
         return []
+
 
 def _notify_role(role: str, subject: str, body: str):
     """Kirim email ke semua user dengan role tersebut (async + bulk)."""
@@ -4325,7 +4348,7 @@ def kalender_pemakaian_mobil_kantor():
                 driver = st.text_input("Driver")
                 status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
                 finance_note = st.text_area("Catatan")
-                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil", key="submit_jadwal_mobil")
+                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil")
 
                 if submitted_btn:
                     if not (nama_pengguna and kendaraan and tujuan):
@@ -6284,7 +6307,7 @@ def main():
             st.warning(f"Inisialisasi sheet tertunda: {e}")
     # Lanjut ke aplikasi utama (misal dashboard / file management)
     try:
-        main_app()
+        show_main_app()
     except Exception as e:
         st.error(f"Terjadi kesalahan di aplikasi utama: {e}")
 
