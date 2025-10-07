@@ -1584,6 +1584,159 @@ def dashboard():
 
     # --- Section: Dokumen Perlu Approval (lazy) ---
     st.markdown("---")
+    # === Bulk Activate Notifications ===
+    with st.expander("🚀 Aktifkan Semua Notifikasi Default per Role", expanded=False):
+        st.caption("Generate/aktifkan mapping notifikasi standar untuk tiap kategori: input baru, perubahan status, mendekati / lewat tenggat, penetapan libur nasional, bentrok jadwal mobil, review & approval.")
+        st.markdown("""
+        Checklist kategori di bawah akan membuat (atau meng-update) baris mapping di sheet `config`.
+        Jika baris sudah ada, hanya kolom roles / active yang diperbarui.
+        Sumber role awal diambil dari NOTIF_ROLE_MAP (fallback) lalu bisa ditimpa template.
+        """)
+        # Definisikan template kategori -> daftar (module, action, default_roles)
+        bulk_templates = {
+            "Input Baru": [
+                ("inventory","create", ["finance"]),
+                ("cash_advance","create", ["finance"]),
+                ("delegasi","create", ["director"]),
+                ("flex","create", ["finance"]),
+                ("mobil","create", ["finance"]),
+                ("notulen","upload", ["director"]),
+                ("sop","upload", ["director"]),
+                ("pmr","upload", ["finance"]),
+                ("surat_masuk","draft", ["director"]),
+                ("surat_keluar","draft", ["director"]),
+                ("cuti","submit", ["finance"]),
+            ],
+            "Perubahan Status": [
+                ("inventory","finance_review", ["director"]),
+                ("inventory","director_approved", ["finance"]),
+                ("inventory","director_reject", ["finance"]),
+                ("cash_advance","finance_review", ["director"]),
+                ("cash_advance","director_approval", ["finance"]),
+                ("pmr","finance_review", ["director"]),
+                ("pmr","director_approval", ["finance"]),
+                ("flex","finance_review", ["director"]),
+                ("flex","director_approval", ["finance"]),
+                ("cuti","finance_review", ["director"]),
+                ("cuti","director_approved", ["finance"]),
+                ("cuti","director_reject", ["finance"]),
+                ("notulen","director_approval", ["staff","finance"]),
+                ("sop","director_approval", ["staff","finance"]),
+            ],
+            "Due Soon / Overdue": [
+                ("mou","due_soon", ["director","finance"]),
+            ],
+            "Libur Nasional": [
+                ("calendar","add_holiday", ["director"]),
+            ],
+            "Konflik Jadwal Mobil": [
+                # aksi hipotetis; jika ada deteksi konflik, bisa panggil notify_event("mobil","conflict",...)
+                ("mobil","conflict", ["finance","director"]),
+            ],
+            "Review & Approval": [
+                # sebagian overlap dengan Perubahan Status; disediakan jika ingin pisahkan paket
+                ("delegasi","update", ["director"]),
+            ],
+            "Autentikasi": [
+                ("auth","login", ["superuser"]),
+                ("auth","logout", ["superuser"]),
+                ("users","register", ["superuser"]),
+            ],
+        }
+        cols_sel = st.columns(3)
+        selected_categories = []
+        flat_keys = list(bulk_templates.keys())
+        for idx, cat in enumerate(flat_keys):
+            with cols_sel[idx % 3]:
+                if st.checkbox(cat, value=False, key=f"bulk_cat_{cat}"):
+                    selected_categories.append(cat)
+        st.markdown("---")
+        st.caption("Opsional override roles default (kosongkan untuk pakai default per action). Pisahkan dengan koma.")
+        role_override = st.text_input("Override Roles (misal: finance,director)", value="")
+        activate = st.checkbox("Set active=1 untuk semua entri", value=True)
+        if st.button("Generate / Update Mapping", type="primary"):
+            if not selected_categories:
+                st.warning("Pilih minimal satu kategori.")
+            else:
+                try:
+                    headers = ws.row_values(1)
+                    if 'module' not in headers or 'action' not in headers:
+                        st.error("Sheet config belum memiliki kolom module/action.")
+                    else:
+                        all_vals = ws.get_all_values()
+                        # index lookup
+                        col_index = {h: i for i, h in enumerate(headers)}
+                        updated_at = now_wib_iso()
+                        updater = (get_current_user() or {}).get('email','system')
+                        override_roles_clean = []
+                        if role_override.strip():
+                            override_roles_clean = [r.strip() for r in role_override.split(',') if r.strip() in ALLOWED_ROLES]
+                        total_created = 0; total_updated = 0
+                        existing_map = {}
+                        for ridx, row_vals in enumerate(all_vals[1:], start=2):
+                            try:
+                                m = str(row_vals[col_index['module']]).strip().lower()
+                                a = str(row_vals[col_index['action']]).strip().lower()
+                                if m and a:
+                                    existing_map[(m,a)] = ridx
+                            except Exception:
+                                continue
+                        # iterate selections
+                        for cat in selected_categories:
+                            for (mod, act, def_roles) in bulk_templates.get(cat, []):
+                                mod_l = mod.lower(); act_l = act.lower()
+                                roles_use = override_roles_clean if override_roles_clean else def_roles
+                                roles_use = [r for r in roles_use if r in ALLOWED_ROLES]
+                                if not roles_use:
+                                    continue
+                                payload = {
+                                    'module': mod_l,
+                                    'action': act_l,
+                                    'roles': ",".join(sorted(set(roles_use))),
+                                    'active': '1' if activate else '0',
+                                    'updated_at': updated_at,
+                                    'updated_by': updater
+                                }
+                                if (mod_l, act_l) in existing_map:
+                                    row_no = existing_map[(mod_l, act_l)]
+                                    # update row
+                                    for k,v in payload.items():
+                                        if k in col_index:
+                                            a1 = gspread.utils.rowcol_to_a1(row_no, col_index[k]+1)
+                                            for i in range(3):
+                                                try:
+                                                    ws.update(a1, v)
+                                                    break
+                                                except gspread.exceptions.APIError as e:
+                                                    if '429' in str(e):
+                                                        time.sleep(1+i)
+                                                        continue
+                                                    raise
+                                    total_updated += 1
+                                else:
+                                    # append new line with all headers order
+                                    row_values = [payload.get(h, '') for h in headers]
+                                    for i in range(3):
+                                        try:
+                                            ws.append_row(row_values)
+                                            break
+                                        except gspread.exceptions.APIError as e:
+                                            if '429' in str(e):
+                                                time.sleep(1+i)
+                                                continue
+                                            raise
+                                    total_created += 1
+                        try:
+                            audit_log('config','bulk_apply', target='bulk_notif', details=f"cat={len(selected_categories)} created={total_created} updated={total_updated}")
+                        except Exception:
+                            pass
+                        load_config_notif_map.clear()  # type: ignore[attr-defined]
+                        st.success(f"Selesai. Created: {total_created} | Updated: {total_updated}")
+                except Exception as e:
+                    st.error(f"Gagal bulk generate: {e}")
+        st.caption("Gunakan fitur ini dengan hati-hati. Anda dapat re-run untuk menyesuaikan roles.")
+
+    st.markdown("---")
     user = get_current_user() or {}
     user_role = (user.get("role") or "").lower()
     with st.expander("📄 Dokumen Menunggu Approval", expanded=False):
