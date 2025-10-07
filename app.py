@@ -442,6 +442,14 @@ def ensure_db():
             final_name TEXT
         )
         """)
+        # Migration: ensure new optional column draft_url exists (for link-based drafts)
+        try:
+            cur.execute("PRAGMA table_info(surat_keluar)")
+            sk_cols = {row[1] for row in cur.fetchall()}
+            if "draft_url" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_url TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS mou (
             id TEXT PRIMARY KEY,
