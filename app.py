@@ -1470,25 +1470,36 @@ def dashboard():
     with st.expander("🎨 Visualisasi Status (Kode Warna)", expanded=False):
         st.caption("Ringkasan multi-modul dengan kode warna untuk prioritas & status.")
         # Legend
+        # Ganti label warna menjadi nama modul/menu representatif
+        # Mapping sebelumnya:
+        # Merah   -> kondisi kritikal / overdue
+        # Oranye  -> approaching (<=3 hari)
+        # Kuning  -> warning (<=7 hari)
+        # Hijau   -> selesai/approved
+        # Biru    -> Cuti
+        # Ungu    -> Flex Time
+        # Abu-abu -> Mobil Kantor
+        # Diminta: gunakan nama masing-masing modul/menu, jadi kita pakai istilah ringkas modul.
         legend_items = [
-            ("Merah", "Pending kritikal / terlambat / MoU lewat jatuh tempo"),
-            ("Oranye", "Tugas ≤3 hari ke deadline (peringatan kuat)"),
-            ("Kuning", "MoU mendekati jatuh tempo / tugas ≤7 hari"),
-            ("Hijau", "Tugas / item selesai / approved penuh"),
-            ("Biru", "Cuti"),
-            ("Ungu", "Flex Time"),
-            ("Abu-abu", "Booking Mobil Kantor"),
+            ("Overdue", "Item kritikal / terlambat / melewati due date (Merah)"),
+            ("Due ≤3 Hari", "Item mendekati deadline ≤3 hari (Oranye)"),
+            ("Due ≤7 Hari", "Item mendekati deadline ≤7 hari (Kuning)"),
+            ("Selesai", "Item/ dokumen sudah complete / approved (Hijau)"),
+            ("Cuti", "Pengajuan atau periode cuti (Biru)"),
+            ("Flex Time", "Jadwal fleksibel hari ini (Ungu)"),
+            ("Mobil Kantor", "Booking kendaraan aktif (Abu-abu)"),
         ]
         # Render legend as horizontal badges
         legend_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'>"
+        # Gunakan warna tetap, mapping ke label baru
         color_map = {
-            "Merah": "#dc2626",
-            "Oranye": "#ea580c",
-            "Kuning": "#d97706",
-            "Hijau": "#16a34a",
-            "Biru": "#2563eb",
-            "Ungu": "#6d28d9",
-            "Abu-abu": "#374151",
+            "Overdue": "#dc2626",       # Merah
+            "Due ≤3 Hari": "#ea580c",   # Oranye
+            "Due ≤7 Hari": "#d97706",   # Kuning
+            "Selesai": "#16a34a",      # Hijau
+            "Cuti": "#2563eb",         # Biru
+            "Flex Time": "#6d28d9",     # Ungu
+            "Mobil Kantor": "#374151",  # Abu-abu
         }
         for nama, desc in legend_items:
             legend_html += f"<div title='{desc}' style='background:{color_map.get(nama,'#999')};color:#fff;padding:4px 10px;border-radius:14px;font-size:12px;font-weight:600'>{nama}</div>"
