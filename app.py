@@ -841,7 +841,7 @@ def show_login_page():
         with st.form("login_form"):
             username = st.text_input("Username").lower()
             password = st.text_input("Password", type="password")
-            login_button = st.form_submit_button("Login")
+            login_button = st.form_submit_button("Login", key="login_btn")
 
             if login_button:
                 if not username or not password:
@@ -878,7 +878,7 @@ def show_login_page():
             new_username = st.text_input("Username Baru").lower()
             new_password = st.text_input("Password Baru", type="password")
             confirm_password = st.text_input("Konfirmasi Password", type="password")
-            register_button = st.form_submit_button("Register")
+            register_button = st.form_submit_button("Register", key="register_btn")
 
             if register_button:
                 if not new_username or not new_password or not confirm_password:
@@ -904,18 +904,6 @@ def show_login_page():
                     except Exception:
                         pass
 
-def show_main_app():
-    if st.sidebar.button("Logout"):
-        email_subject = "Notifikasi: User Logout"
-        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
-        try:
-            notify_event("auth", "logout", email_subject, email_body)
-        except Exception:
-            pass
-        
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-        st.rerun()
 
 def get_current_user():
     return st.session_state.get("user")
