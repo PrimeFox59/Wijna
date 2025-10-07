@@ -62,6 +62,7 @@ def format_datetime_wib(dtstr):
         return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
     except Exception:
         return dtstr
+
 class _AuditCursor:
     def __init__(self, outer_conn, inner_cursor):
         self._outer_conn = outer_conn
@@ -323,10 +324,14 @@ def ensure_db():
         count_users = cur.fetchone()[0]
         if count_users == 0:
             try:
-                pw = hash_password("admin")
+                pw = hash_password("zzz")
                 now = datetime.utcnow().isoformat()
                 cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
-                            ("admin", "Superuser", "superuser", pw, "active", now))
+                            ("admin", "Prime", "superuser", pw, "active", now))
+                cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
+                            ("admin2", "Finance", "Finance", pw, "active", now))
+                cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
+                            ("admin3", "director", "director", pw, "active", now))
                 conn.commit()
             except Exception:
                 pass
