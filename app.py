@@ -7,6 +7,140 @@ import base64
 import pandas as pd
 import uuid
 import json
+
+# NOTE: Skema tabel akan dibuat di fungsi ensure_db() / inisialisasi terpusat.
+# Blok CREATE TABLE yang sebelumnya ada di bagian atas telah dipindahkan agar tidak
+# menyebabkan NameError (variabel cur belum didefinisikan) dan agar lebih terstruktur.
+
+DB_PATH = "office_ops.db"
+SALT = "office_ops_salt_v1"
+
+# --- Password hashing utility ---
+def hash_password(password: str) -> str:
+    import hashlib
+    salted = (password + SALT).encode('utf-8')
+    return hashlib.sha256(salted).hexdigest()
+
+icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
+# --- Global CSS for modern look ---
+st.markdown(
+    """
+    <style>
+    .main .block-container {padding-top: 2rem;}
+    .stButton>button, .stDownloadButton>button {
+        background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+        color: white; border: none; border-radius: 6px; font-weight: 600;
+        box-shadow: 0 2px 8px rgba(80,140,255,0.08);
+        margin-bottom: 6px;
+    }
+    .stButton>button:hover, .stDownloadButton>button:hover {
+        background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
+        color: #fff;
+    }
+    .stDataFrame, .stTable {background: #f8fbff; border-radius: 8px;}
+    .stExpanderHeader {font-weight: 700; color: #2a5d9f;}
+    .stTextInput>div>input, .stTextArea>div>textarea {
+        border-radius: 6px; border: 1px solid #b3d1ff;
+    }
+    .stFileUploader>div>div {background: #eaf4ff; border-radius: 6px;}
+    .stMetric {background: #eaf4ff; border-radius: 8px;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# Pastikan pemanggilan st.markdown(table_html, unsafe_allow_html=True) dilakukan di bagian yang tepat pada kode Daftar Inventaris
+
+# -------------------------
+# Utilities
+# -------------------------
+# --- Database connection utility --- 
+def format_datetime_wib(dtstr):
+    try:
+        dt_utc = datetime.fromisoformat(dtstr)
+        dt_wib = dt_utc + timedelta(hours=7)
+        return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
+    except Exception:
+        return dtstr
+class _AuditCursor:
+    def __init__(self, outer_conn, inner_cursor):
+        self._outer_conn = outer_conn
+        self._c = inner_cursor
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+    def execute(self, sql, params=()):
+        result = self._c.execute(sql, params)
+        try:
+            self._maybe_log(sql, params)
+        except Exception:
+            pass
+        return result
+    def executemany(self, sql, seq_of_params):
+        result = self._c.executemany(sql, seq_of_params)
+        try:
+            for p in seq_of_params:
+                self._maybe_log(sql, p)
+        except Exception:
+            pass
+        return result
+    def _maybe_log(self, sql, params):
+        # Guard or non-DML: skip
+        if st.session_state.get("__audit_disabled"):
+            return
+        sql_l = (sql or "").strip().lower()
+        op = None
+        table = None
+        target_id = None
+        if sql_l.startswith("insert into"):
+            op = "create"
+            try:
+                # parse table and col list
+                after_into = sql_l.split("insert into",1)[1].strip()
+                table = after_into.split("(",1)[0].strip().split()[0]
+                if "(" in after_into:
+                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
+                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
+                    if "id" in cols:
+                        idx = cols.index("id")
+                        if isinstance(params, (list, tuple)) and len(params) > idx:
+                            target_id = params[idx]
+            except Exception:
+                pass
+        elif sql_l.startswith("update"):
+            op = "update"
+            try:
+                table = sql_l.split()[1]
+                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
+                    # assume last param is id
+                    if isinstance(params, (list, tuple)) and len(params) >= 1:
+                        target_id = params[-1]
+            except Exception:
+                pass
+        elif sql_l.startswith("delete from"):
+            op = "delete"
+            try:
+                table = sql_l.split()[2]
+                # assume last param is id
+                if isinstance(params, (list, tuple)) and len(params) >= 1:
+                    target_id = params[-1]
+            except Exception:
+                pass
+        # Only log DML and skip logging file_log table itself
+        if op and table and table != "file_log":
+            try:
+                audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
+            except Exception:
+                pass
+
+class _AuditConnection:
+    def __init__(self, inner_conn: sqlite3.Connection):
+        self._conn = inner_conn
+        self.row_factory = inner_conn.row_factory
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+    def cursor(self, *args, **kwargs):
+        return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
+
 def sop_module():
     user = require_login()
     st.header("📚 Kebijakan & SOP")
@@ -153,373 +287,6 @@ def sop_module():
                                 pass
                             st.success("SOP approved.")
                             st.rerun()
-    # Force create default superuser if not exists (guaranteed on first run)
-    cur.execute("SELECT COUNT(*) as c FROM users")
-    c = cur.fetchone()["c"] if cur.description else 0
-    if c == 0:
-        pw = hash_password("superpassword")
-        now = datetime.utcnow().isoformat()
-        cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    ("superuser@local", "Superuser", "superuser", pw, "active", now))
-        conn.commit()
-    # Surat Masuk
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS surat_masuk (
-        id TEXT PRIMARY KEY,
-        indeks TEXT,
-        nomor TEXT,
-        pengirim TEXT,
-        tanggal TEXT,
-        perihal TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        status TEXT,
-        follow_up TEXT
-    )
-    """)
-    # Surat Keluar
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS surat_keluar (
-        id TEXT PRIMARY KEY,
-        indeks TEXT,
-        nomor TEXT,
-        tanggal TEXT,
-        ditujukan TEXT,
-        perihal TEXT,
-        lampiran_blob BLOB,
-        lampiran_name TEXT,
-        pengirim TEXT,
-        draft_blob BLOB,
-        draft_name TEXT,
-        status TEXT,
-        follow_up TEXT,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0,
-        final_blob BLOB,
-        final_name TEXT
-    )
-    """)
-    # MoU
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS mou (
-        id TEXT PRIMARY KEY,
-        nomor TEXT,
-        nama TEXT,
-        pihak TEXT,
-        jenis TEXT,
-        tgl_mulai TEXT,
-        tgl_selesai TEXT,
-        divisi TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        board_note TEXT,
-        board_approved INTEGER DEFAULT 0,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0,
-        final_blob BLOB,
-        final_name TEXT
-    )
-    """)
-    # Cash Advance
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS cash_advance (
-        id TEXT PRIMARY KEY,
-        divisi TEXT,
-        items_json TEXT,
-        totals REAL,
-        tanggal TEXT,
-        finance_note TEXT,
-        finance_approved INTEGER DEFAULT 0,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0
-    )
-    """)
-    # PMR
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pmr (
-        id TEXT PRIMARY KEY,
-        nama TEXT,
-        file1_blob BLOB,
-        file1_name TEXT,
-        file2_blob BLOB,
-        file2_name TEXT,
-        bulan TEXT,
-        finance_note TEXT,
-        finance_approved INTEGER DEFAULT 0,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0,
-        tanggal_submit TEXT
-    )
-    """)
-    # Cuti
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS cuti (
-        id TEXT PRIMARY KEY,
-        nama TEXT,
-        tgl_mulai TEXT,
-        tgl_selesai TEXT,
-        durasi INTEGER,
-        kuota_tahunan INTEGER,
-        cuti_terpakai INTEGER,
-        sisa_kuota INTEGER,
-        status TEXT,
-        finance_note TEXT,
-        finance_approved INTEGER DEFAULT 0,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0
-    )
-    """)
-    # Flex
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS flex (
-        id TEXT PRIMARY KEY,
-        nama TEXT,
-        tanggal TEXT,
-        jam_mulai TEXT,
-        jam_selesai TEXT,
-        finance_note TEXT,
-        finance_approved INTEGER DEFAULT 0,
-        director_note TEXT,
-        director_approved INTEGER DEFAULT 0
-    )
-    """)
-    # Delegasi
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS delegasi (
-        id TEXT PRIMARY KEY,
-        judul TEXT,
-        deskripsi TEXT,
-        pic TEXT,
-        tgl_mulai TEXT,
-        tgl_selesai TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        status TEXT,
-        tanggal_update TEXT
-    )
-    """)
-    # Mobil
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS mobil (
-        id TEXT PRIMARY KEY,
-        nama_pengguna TEXT,
-        divisi TEXT,
-        tgl_mulai TEXT,
-        tgl_selesai TEXT,
-        tujuan TEXT,
-        kendaraan TEXT,
-        driver TEXT,
-        status TEXT,
-        finance_note TEXT
-    )
-    """)
-    # Calendar
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS calendar (
-        id TEXT PRIMARY KEY,
-        jenis TEXT,
-        judul TEXT,
-        nama_divisi TEXT,
-        tgl_mulai TEXT,
-        tgl_selesai TEXT,
-        deskripsi TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        is_holiday INTEGER DEFAULT 0,
-        sumber TEXT,
-        ditetapkan_oleh TEXT,
-        tanggal_penetapan TEXT
-    )
-    """)
-    # Public Holidays
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS public_holidays (
-        tahun INTEGER,
-        tanggal TEXT,
-        nama TEXT,
-        keterangan TEXT,
-        ditetapkan_oleh TEXT,
-        tanggal_penetapan TEXT
-    )
-    """)
-    # SOP
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sop (
-        id TEXT PRIMARY KEY,
-        judul TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        tanggal_upload TEXT
-    )
-    """)
-    # Notulen
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS notulen (
-        id TEXT PRIMARY KEY,
-        judul TEXT,
-        file_blob BLOB,
-        file_name TEXT,
-        tanggal_upload TEXT
-    )
-    """)
-    # File Log
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS file_log (
-        id TEXT PRIMARY KEY,
-        modul TEXT,
-        file_name TEXT,
-        versi INTEGER,
-        deleted_by TEXT,
-        tanggal_hapus TEXT,
-        alasan TEXT
-    )
-    """)
-    # Migration: ensure optional columns exist for richer audit
-    try:
-        cur.execute("PRAGMA table_info(file_log)")
-        fl_cols = [row[1] for row in cur.fetchall()]
-        # add uploaded_by
-        if "uploaded_by" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
-        # add tanggal_upload
-        if "tanggal_upload" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
-        # add action
-        if "action" not in fl_cols:
-            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
-
-DB_PATH = "office_ops.db"
-SALT = "office_ops_salt_v1"
-
-# --- Password hashing utility ---
-def hash_password(password: str) -> str:
-    import hashlib
-    salted = (password + SALT).encode('utf-8')
-    return hashlib.sha256(salted).hexdigest()
-
-icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
-st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
-# --- Global CSS for modern look ---
-st.markdown(
-    """
-    <style>
-    .main .block-container {padding-top: 2rem;}
-    .stButton>button, .stDownloadButton>button {
-        background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
-        color: white; border: none; border-radius: 6px; font-weight: 600;
-        box-shadow: 0 2px 8px rgba(80,140,255,0.08);
-        margin-bottom: 6px;
-    }
-    .stButton>button:hover, .stDownloadButton>button:hover {
-        background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
-        color: #fff;
-    }
-    .stDataFrame, .stTable {background: #f8fbff; border-radius: 8px;}
-    .stExpanderHeader {font-weight: 700; color: #2a5d9f;}
-    .stTextInput>div>input, .stTextArea>div>textarea {
-        border-radius: 6px; border: 1px solid #b3d1ff;
-    }
-    .stFileUploader>div>div {background: #eaf4ff; border-radius: 6px;}
-    .stMetric {background: #eaf4ff; border-radius: 8px;}
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-# Pastikan pemanggilan st.markdown(table_html, unsafe_allow_html=True) dilakukan di bagian yang tepat pada kode Daftar Inventaris
-
-# -------------------------
-# Utilities
-# -------------------------
-# --- Database connection utility --- 
-def format_datetime_wib(dtstr):
-    try:
-        dt_utc = datetime.fromisoformat(dtstr)
-        dt_wib = dt_utc + timedelta(hours=7)
-        return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
-    except Exception:
-        return dtstr
-class _AuditCursor:
-    def __init__(self, outer_conn, inner_cursor):
-        self._outer_conn = outer_conn
-        self._c = inner_cursor
-    def __getattr__(self, name):
-        return getattr(self._c, name)
-    def execute(self, sql, params=()):
-        result = self._c.execute(sql, params)
-        try:
-            self._maybe_log(sql, params)
-        except Exception:
-            pass
-        return result
-    def executemany(self, sql, seq_of_params):
-        result = self._c.executemany(sql, seq_of_params)
-        try:
-            for p in seq_of_params:
-                self._maybe_log(sql, p)
-        except Exception:
-            pass
-        return result
-    def _maybe_log(self, sql, params):
-        # Guard or non-DML: skip
-        if st.session_state.get("__audit_disabled"):
-            return
-        sql_l = (sql or "").strip().lower()
-        op = None
-        table = None
-        target_id = None
-        if sql_l.startswith("insert into"):
-            op = "create"
-            try:
-                # parse table and col list
-                after_into = sql_l.split("insert into",1)[1].strip()
-                table = after_into.split("(",1)[0].strip().split()[0]
-                if "(" in after_into:
-                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
-                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
-                    if "id" in cols:
-                        idx = cols.index("id")
-                        if isinstance(params, (list, tuple)) and len(params) > idx:
-                            target_id = params[idx]
-            except Exception:
-                pass
-        elif sql_l.startswith("update"):
-            op = "update"
-            try:
-                table = sql_l.split()[1]
-                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
-                    # assume last param is id
-                    if isinstance(params, (list, tuple)) and len(params) >= 1:
-                        target_id = params[-1]
-            except Exception:
-                pass
-        elif sql_l.startswith("delete from"):
-            op = "delete"
-            try:
-                table = sql_l.split()[2]
-                # assume last param is id
-                if isinstance(params, (list, tuple)) and len(params) >= 1:
-                    target_id = params[-1]
-            except Exception:
-                pass
-        # Only log DML and skip logging file_log table itself
-        if op and table and table != "file_log":
-            try:
-                audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
-            except Exception:
-                pass
-
-class _AuditConnection:
-    def __init__(self, inner_conn: sqlite3.Connection):
-        self._conn = inner_conn
-        self.row_factory = inner_conn.row_factory
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-    def cursor(self, *args, **kwargs):
-        return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
 
 def get_db() -> sqlite3.Connection:
     db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
@@ -551,6 +318,18 @@ def ensure_db():
             )
             """
         )
+        # Seed default superuser if table empty
+        cur.execute("SELECT COUNT(*) FROM users")
+        count_users = cur.fetchone()[0]
+        if count_users == 0:
+            try:
+                pw = hash_password("admin")
+                now = datetime.utcnow().isoformat()
+                cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
+                            ("admin", "Superuser", "superuser", pw, "active", now))
+                conn.commit()
+            except Exception:
+                pass
         # Calendar tables
         cur.execute(
             """
@@ -625,6 +404,169 @@ def ensure_db():
             )
             """
         )
+        # Additional domain tables (moved from top-level into bootstrap)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS surat_masuk (
+            id TEXT PRIMARY KEY,
+            indeks TEXT,
+            nomor TEXT,
+            pengirim TEXT,
+            tanggal TEXT,
+            perihal TEXT,
+            file_blob BLOB,
+            file_name TEXT,
+            status TEXT,
+            follow_up TEXT,
+            rekap INTEGER DEFAULT 0,
+            director_approved INTEGER DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS surat_keluar (
+            id TEXT PRIMARY KEY,
+            indeks TEXT,
+            nomor TEXT,
+            tanggal TEXT,
+            ditujukan TEXT,
+            perihal TEXT,
+            lampiran_blob BLOB,
+            lampiran_name TEXT,
+            pengirim TEXT,
+            draft_blob BLOB,
+            draft_name TEXT,
+            status TEXT,
+            follow_up TEXT,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0,
+            final_blob BLOB,
+            final_name TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS mou (
+            id TEXT PRIMARY KEY,
+            nomor TEXT,
+            nama TEXT,
+            pihak TEXT,
+            jenis TEXT,
+            tgl_mulai TEXT,
+            tgl_selesai TEXT,
+            divisi TEXT,
+            file_blob BLOB,
+            file_name TEXT,
+            board_note TEXT,
+            board_approved INTEGER DEFAULT 0,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0,
+            final_blob BLOB,
+            final_name TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cash_advance (
+            id TEXT PRIMARY KEY,
+            divisi TEXT,
+            items_json TEXT,
+            totals REAL,
+            tanggal TEXT,
+            finance_note TEXT,
+            finance_approved INTEGER DEFAULT 0,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pmr (
+            id TEXT PRIMARY KEY,
+            nama TEXT,
+            file1_blob BLOB,
+            file1_name TEXT,
+            file2_blob BLOB,
+            file2_name TEXT,
+            bulan TEXT,
+            finance_note TEXT,
+            finance_approved INTEGER DEFAULT 0,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0,
+            tanggal_submit TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cuti (
+            id TEXT PRIMARY KEY,
+            nama TEXT,
+            tgl_mulai TEXT,
+            tgl_selesai TEXT,
+            durasi INTEGER,
+            kuota_tahunan INTEGER,
+            cuti_terpakai INTEGER,
+            sisa_kuota INTEGER,
+            status TEXT,
+            finance_note TEXT,
+            finance_approved INTEGER DEFAULT 0,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS flex (
+            id TEXT PRIMARY KEY,
+            nama TEXT,
+            tanggal TEXT,
+            jam_mulai TEXT,
+            jam_selesai TEXT,
+            alasan TEXT,
+            catatan_finance TEXT,
+            approval_finance INTEGER DEFAULT 0,
+            catatan_director TEXT,
+            approval_director INTEGER DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS delegasi (
+            id TEXT PRIMARY KEY,
+            judul TEXT,
+            deskripsi TEXT,
+            pic TEXT,
+            tgl_mulai TEXT,
+            tgl_selesai TEXT,
+            file_blob BLOB,
+            file_name TEXT,
+            status TEXT,
+            tanggal_update TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS mobil (
+            id TEXT PRIMARY KEY,
+            nama_pengguna TEXT,
+            divisi TEXT,
+            tgl_mulai TEXT,
+            tgl_selesai TEXT,
+            tujuan TEXT,
+            kendaraan TEXT,
+            driver TEXT,
+            status TEXT,
+            finance_note TEXT
+        )
+        """)
+        # Inventory table (missing previously)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            location TEXT,
+            status TEXT,
+            pic TEXT,
+            updated_at TEXT,
+            finance_note TEXT,
+            finance_approved INTEGER DEFAULT 0,
+            director_note TEXT,
+            director_approved INTEGER DEFAULT 0,
+            file_blob BLOB,
+            file_name TEXT
+        )
+        """)
         cur.execute("PRAGMA table_info(file_log)")
         fl_cols = {row[1] for row in cur.fetchall()}
         if "uploaded_by" not in fl_cols:
@@ -1004,7 +946,31 @@ def inventory_module():
     conn = get_db()
     cur = conn.cursor()
     this_month = date.today().strftime("%Y-%m")
-    df_month = pd.read_sql_query(f"SELECT * FROM inventory WHERE substr(updated_at,1,7)=?", conn, params=(this_month,))
+    # Safeguard: if table missing (first migration), create it and continue
+    try:
+        df_month = pd.read_sql_query("SELECT * FROM inventory WHERE substr(updated_at,1,7)=?", conn, params=(this_month,))
+    except Exception:
+        try:
+            cur.execute("SELECT 1 FROM inventory LIMIT 1")
+            df_month = pd.DataFrame()
+        except Exception:
+            # create table on the fly (should already exist via ensure_db, but fallback)
+            cur.execute("""CREATE TABLE IF NOT EXISTS inventory (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                location TEXT,
+                status TEXT,
+                pic TEXT,
+                updated_at TEXT,
+                finance_note TEXT,
+                finance_approved INTEGER DEFAULT 0,
+                director_note TEXT,
+                director_approved INTEGER DEFAULT 0,
+                file_blob BLOB,
+                file_name TEXT
+            )""")
+            conn.commit()
+            df_month = pd.DataFrame()
     # --- UI with Tabs (always show tabs, even if df_month is empty) ---
     tab_labels = []
     tab_contents = []
