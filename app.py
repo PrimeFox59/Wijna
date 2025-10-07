@@ -1,7 +1,3 @@
-def main_app():
-    # TODO: Pindahkan logika utama aplikasi ke sini jika perlu.
-    pass
-
 import streamlit as st
 import pandas as pd
 import gspread
