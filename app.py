@@ -581,6 +581,17 @@ def ensure_db():
             file_name TEXT
         )
         """)
+        # Rekap bulanan cash advance (aggregated summary), one row per bulan (YYYY-MM)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rekap_monthly_cashadvance (
+            bulan TEXT PRIMARY KEY,
+            total_pengajuan INTEGER DEFAULT 0,
+            total_nominal REAL DEFAULT 0,
+            total_cair INTEGER DEFAULT 0,
+            total_nominal_cair REAL DEFAULT 0,
+            updated_at TEXT
+        )
+        """)
         cur.execute("PRAGMA table_info(file_log)")
         fl_cols = {row[1] for row in cur.fetchall()}
         if "uploaded_by" not in fl_cols:
@@ -600,6 +611,49 @@ def log_file_delete(modul, file_name, deleted_by, alasan=None):
     cur.execute("INSERT INTO file_log (id, modul, file_name, versi, deleted_by, tanggal_hapus, alasan) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (log_id, modul, file_name, 1, deleted_by, now, alasan or ""))
     conn.commit()
+def generate_cashadvance_monthly_rekap():
+    """Aggregate data from cash_advance into rekap_monthly_cashadvance for the current month.
+    - bulan format: YYYY-MM
+    - total_pengajuan: count rows bulan tsb
+    - total_nominal: sum totals
+    - total_cair: count approved (finance_approved=1 AND director_approved=1)
+    - total_nominal_cair: sum totals for approved
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        bulan = date.today().strftime("%Y-%m")
+        # Filter baris sesuai bulan pada kolom tanggal (assuming stored as ISO date)
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(totals),0) FROM cash_advance WHERE substr(tanggal,1,7)=?", (bulan,))
+        row_all = cur.fetchone()
+        total_pengajuan = row_all[0] if row_all else 0
+        total_nominal = row_all[1] if row_all else 0.0
+        cur.execute("""
+            SELECT COUNT(*), COALESCE(SUM(totals),0) FROM cash_advance
+            WHERE substr(tanggal,1,7)=? AND finance_approved=1 AND director_approved=1
+        """, (bulan,))
+        row_cair = cur.fetchone()
+        total_cair = row_cair[0] if row_cair else 0
+        total_nominal_cair = row_cair[1] if row_cair else 0.0
+        now = datetime.utcnow().isoformat()
+        # Upsert (SQLite 3.24+ supports ON CONFLICT DO UPDATE)
+        cur.execute("""
+            INSERT INTO rekap_monthly_cashadvance (bulan,total_pengajuan,total_nominal,total_cair,total_nominal_cair,updated_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(bulan) DO UPDATE SET
+              total_pengajuan=excluded.total_pengajuan,
+              total_nominal=excluded.total_nominal,
+              total_cair=excluded.total_cair,
+              total_nominal_cair=excluded.total_nominal_cair,
+              updated_at=excluded.updated_at
+        """, (bulan, total_pengajuan, total_nominal, total_cair, total_nominal_cair, now))
+        conn.commit()
+        try:
+            audit_log("cash_advance", "rekap_generate", target=bulan, details=f"pengajuan={total_pengajuan}; cair={total_cair}")
+        except Exception:
+            pass
+    except Exception:
+        pass
     
 def audit_log(modul: str, action: str, target=None, details=None, actor=None):
     """Write an audit log entry to file_log.
@@ -3164,18 +3218,24 @@ def dashboard():
         st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-title">📊 Rekap Bulanan (Ringkasan)</div>', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-desc">Rekap otomatis tersedia di tabel <b>rekap_monthly_*</b> (trigger scheduler belum diimplementasikan).</div>', unsafe_allow_html=True)
+        col_gen, col_info = st.columns([1,3])
+        with col_gen:
+            if st.button("⚙️ Generate / Refresh Rekap Bulan Ini", key="gen_rekap_ca"):
+                generate_cashadvance_monthly_rekap()
+                st.experimental_rerun()
         try:
-            df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance LIMIT 10", conn)
-            for col in df_ca_rekap.columns:
-                if 'tanggal' in col or 'tgl' in col or 'updated' in col:
-                    df_ca_rekap[col] = df_ca_rekap[col].apply(format_datetime_wib)
-            if df_ca_rekap.empty:
-                st.info("Belum ada data rekap cash advance bulan ini.")
-            else:
-                st.write("Cash Advance Rekap (sample)")
+            df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", conn)
+            if not df_ca_rekap.empty:
+                # Formatting numeric columns
+                for numcol in ["total_nominal","total_nominal_cair"]:
+                    if numcol in df_ca_rekap.columns:
+                        df_ca_rekap[numcol] = df_ca_rekap[numcol].apply(lambda v: f"Rp {v:,.0f}".replace(",","."))
+                st.write("Rekap Cash Advance (12 bulan terakhir / terbaru di atas)")
                 st.dataframe(df_ca_rekap, use_container_width=True, hide_index=True)
+            else:
+                st.info("Belum ada rekap. Klik tombol Generate untuk membuat data bulan ini.")
         except Exception:
-            st.warning("Tabel rekap_monthly_cashadvance belum tersedia. Rekap bulanan akan muncul setelah modul scheduler/rekap dijalankan.")
+            st.warning("Tabel rekap_monthly_cashadvance belum tersedia (otomatis dibuat ketika generate pertama kali). Klik Generate untuk mulai.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
