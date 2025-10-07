@@ -1,21 +1,16 @@
+
 import streamlit as st
 import pandas as pd
 import gspread
 from passlib.context import CryptContext
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from googleapiclient.errors import HttpError
+# Lazy imports: modules heavy / rarely needed are imported inside functions now.
 import io
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 import json
 import os
 import uuid
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import time
-from datetime import timezone
 try:
     # Python 3.9+: zoneinfo
     from zoneinfo import ZoneInfo  # type: ignore
@@ -43,6 +38,13 @@ CALENDAR_SHEET_NAME = "calendar"
 PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
 NOTULEN_SHEET_NAME = "notulen"
 SOP_SHEET_NAME = "sop"
+WIB_OFFSET = 7  # UTC+7
+try:
+    from zoneinfo import ZoneInfo
+    WIB_TZ = ZoneInfo("Asia/Jakarta")
+except Exception:
+    WIB_TZ = None
+SETTINGS_SHEET_NAME = "settings"  # placeholder sheet name for settings/config if not existing
 SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 # ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
 # pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
@@ -89,107 +91,50 @@ def can_create(module_key: str, user: dict | None) -> bool:
 # Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
 # Catatan: superuser selalu otomatis ditambahkan oleh helper.
 # Tambahkan / ubah sesuai kebutuhan bisnis Anda.
-NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
-    ("inventory", "create"): ["finance"],
-    ("inventory", "finance_review"): ["director"],
-    ("inventory", "director_approved"): ["finance"],  # misal informasikan balik ke finance
-    ("inventory", "director_reject"): ["finance"],
-    ("surat_masuk", "draft"): ["director"],
-    ("surat_masuk", "director_approved"): ["finance"],
-    ("surat_keluar", "draft"): ["director"],
-    ("surat_keluar", "final_upload"): ["finance"],
-    ("cuti", "submit"): ["finance"],
-    ("cuti", "finance_review"): ["director"],
-    ("cuti", "director_approved"): ["finance"],
-    ("cuti", "director_reject"): ["finance"],
-    # Auth events
-    ("auth", "login"): ["superuser"],
-    ("auth", "logout"): ["superuser"],
-    ("users", "register"): ["superuser"],
-    # Cash Advance events
-    ("cash_advance", "create"): ["finance"],
-    ("cash_advance", "finance_review"): ["director"],
-    ("cash_advance", "director_approval"): ["finance"],
-    # PMR events
-    ("pmr", "upload"): ["finance"],
-    ("pmr", "finance_review"): ["director"],
-    ("pmr", "director_approval"): ["finance"],
-    # Delegasi events
-    ("delegasi", "create"): ["director"],
-    ("delegasi", "update"): ["director"],
-    # Flex Time events
-    ("flex", "create"): ["finance"],
-    ("flex", "finance_review"): ["director"],
-    ("flex", "director_approval"): ["finance"],
-    # Mobil events
-    ("mobil", "create"): ["finance"],
-    ("mobil", "update"): ["finance", "director"],
-    ("mobil", "delete"): ["finance"],
-    # Calendar events
-    ("calendar", "add_holiday"): ["director"],
-    # Notulen events
-    ("notulen", "upload"): ["director"],
-    ("notulen", "director_approval"): ["staff", "finance"],  # optional broadcast; uploader akan tetap dapat email jika masuk role
-    # SOP events
-    ("sop", "upload"): ["director"],
-    ("sop", "director_approval"): ["staff", "finance"],
-    # MoU due soon automatic alert
-    ("mou", "due_soon"): ["director", "finance"],
-}
+from notifications import NOTIF_ROLE_MAP  # type: ignore
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_config_notif_map() -> dict[tuple[str, str], list[str]]:
-    """Load dynamic notification role mapping from config sheet.
-    Sheet schema: module | action | roles | active | updated_at | updated_by
-    - roles: comma-separated roles, e.g. "finance,director"
-    - active: 1/0 or TRUE/FALSE; only active==1 considered
-    Returns dict with (module, action) => [roles]
-    """
-    mapping: dict[tuple[str, str], list[str]] = {}
-    try:
-        ws = _get_ws(CONFIG_SHEET_NAME)
-        records = ws.get_all_records()
-        for rec in records:
-            try:
-                mod = str(rec.get("module", "")).strip().lower()
-                act = str(rec.get("action", "")).strip().lower()
-                roles_raw = str(rec.get("roles", "")).strip()
-                active_val = str(rec.get("active", "1")).strip().lower()
-                if not mod or not act or not roles_raw:
-                    continue
-                if active_val not in ("1", "true", "yes", "y"):  # treat others as inactive
-                    continue
-                roles_list = [r.strip().lower() for r in roles_raw.split(',') if r.strip()]
-                if not roles_list:
-                    continue
-                mapping[(mod, act)] = roles_list
-            except Exception:
-                continue
-    except Exception:
-        return {}
-    return mapping
+from notifications import notify_event  # type: ignore
 
-def notify_event(module: str, action: str, subject: str, body: str, roles: list[str] | None = None):
-    """Kirim notifikasi email berbasis module & action.
-    - roles: override manual; bila None akan lookup NOTIF_ROLE_MAP.
-    - superuser + ADMIN_EMAIL_RECIPIENT ditambahkan otomatis oleh _notify_roles.
-    - Diam (silent) jika tidak ada peran terpetakan.
-    """
+# === Generic batch row update utility (top-level, for all modules) ===
+def _batch_update_row_generic(ws, row_idx: int, updates: dict, sheet_name: str, map_cache_key: str | None = None):
+    headers = ws.row_values(1)
+    payload = []
+    for k, v in updates.items():
+        if k not in headers:
+            continue
+        a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
+        payload.append({'range': a1, 'values': [[v]]})
+    if not payload:
+        return
     try:
-        if roles is not None:
-            target_roles = roles
-        else:
-            # First try dynamic config sheet
-            dyn_map = load_config_notif_map()
-            target_roles = dyn_map.get((module.lower(), action.lower()))
-            if not target_roles:
-                # fallback to static default
-                target_roles = NOTIF_ROLE_MAP.get((module, action), [])
-        if not target_roles or not isinstance(target_roles, list):
-            return
-        _notify_roles(list(set(target_roles)), subject, body)
+        with_retries(ws.batch_update, payload)
     except Exception:
-        pass
+        # fallback per cell
+        for item in payload:
+            rng = item['range']; vals = item['values']
+            for attempt in range(3):
+                try:
+                    ws.update(rng, vals)
+                    break
+                except gspread.exceptions.APIError as e:
+                    if '429' in str(e) and attempt < 2:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    raise
+    bump_sheet_cache(sheet_name)
+    if map_cache_key:
+        st.session_state.pop(map_cache_key, None)
+
+def _throttle(key: str, window_seconds: int) -> bool:
+    """Return True if allowed (outside window) else False. Uses st.session_state."""
+    now = time.time()
+    bucket = st.session_state.setdefault('_throttle', {})  # type: ignore
+    last = bucket.get(key, 0)
+    if now - last < window_seconds:
+        return False
+    bucket[key] = now
+    st.session_state['_throttle'] = bucket
+    return True
 
 def _load_settings_row() -> dict:
     """Read special settings row from config sheet where module='__settings__'. Returns dict."""
@@ -210,15 +155,146 @@ def is_superuser_auto_enabled() -> bool:
     val = str(row.get("superuser_auto", "1")) if row else "1"
     return val.strip().lower() in ("1", "true", "yes", "y")
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
-# --- Timezone Helpers (WIB GMT+07:00) ---
-WIB_OFFSET = 7  # hours
-WIB_TZ = None
-if ZoneInfo:
-    try:
-        WIB_TZ = ZoneInfo("Asia/Jakarta")
-    except Exception:
-        WIB_TZ = None
+# === Versi Cache Per Sheet (untuk invalidasi selektif) ===
+if '_sheet_cache_version' not in st.session_state:
+    st.session_state['_sheet_cache_version'] = {}
 
+def _get_sheet_version(name: str) -> int:
+    return int(st.session_state['_sheet_cache_version'].get(name, 0))
+
+def bump_sheet_cache(name: str):
+    st.session_state['_sheet_cache_version'][name] = _get_sheet_version(name) + 1
+
+@st.cache_data(ttl=180, show_spinner=False, max_entries=128)
+def load_sheet_records(sheet_name: str, version: int, expected_headers: list | None = None):
+    """Load seluruh baris sheet dengan cache berbasis (sheet_name, version).
+    version diincrement via bump_sheet_cache() saat ada write, sehingga invalidasi spesifik.
+    expected_headers: jika diberikan akan diusahakan mapping kolom tetap stabil."""
+    ws = get_spreadsheet().worksheet(sheet_name)
+    try:
+        if expected_headers is not None:
+            return ws.get_all_records(expected_headers=expected_headers)
+        return ws.get_all_records()
+    except Exception:
+        return []
+
+@st.cache_data(show_spinner=False, ttl=600, max_entries=32)
+def load_static_sheet_records(sheet_name: str, version: int, expected_headers: list | None = None):
+    try:
+        ws = _get_ws(sheet_name)
+        if not ws:
+            return []
+        records = ws.get_all_records(expected_headers=expected_headers)
+        # normalize header keys
+        norm = []
+        for r in records:
+            norm.append({k.strip(): (v if not isinstance(v,str) else v.strip()) for k,v in r.items()})
+        return norm
+    except Exception:
+        return []
+
+# === Aggregated Dashboard Loader ===
+@st.cache_data(show_spinner=False, ttl=90, max_entries=8)
+def load_dashboard_minimal(versions: dict[str,int]):
+    """Load minimal multi-sheet snapshot for dashboard in one cached call.
+    versions: dict mapping sheet_name -> version int (so cache invalidates when any changes).
+    Returns dict of DataFrames (or empty DataFrame if load fails).
+    """
+    result = {}
+    targets = [
+        CUTI_SHEET_NAME,
+        FLEX_SHEET_NAME,
+        DELEGASI_SHEET_NAME,
+        MOBIL_SHEET_NAME,
+        CALENDAR_SHEET_NAME,
+        INVENTORY_SHEET_NAME,
+    ]
+    for sheet in targets:
+        v = versions.get(sheet, 0)
+        try:
+            rows = load_sheet_records(sheet, v)
+            result[sheet] = pd.DataFrame(rows)
+        except Exception:
+            result[sheet] = pd.DataFrame()
+    return result
+
+def _build_id_row_map(ws, id_column: str = 'id') -> dict[str,int]:
+    """Build an in-memory map id -> row index (1-based) to reduce repeated ws.find calls.
+    Not cached across sessions deliberately (depends on latest sheet state)."""
+    try:
+        headers = ws.row_values(1)
+        if id_column not in headers:
+            return {}
+        col_idx = headers.index(id_column) + 1
+        # Get all values in that column (excluding header) via get_all_values
+        all_vals = ws.col_values(col_idx)
+        mapping = {}
+        # all_vals[0] is header
+        for offset, val in enumerate(all_vals[1:], start=2):
+            if val:
+                mapping[str(val).strip()] = offset
+        return mapping
+    except Exception:
+        return {}
+
+# === Central Retry Utilities ===
+def with_retries(fn, *args, retries: int = 3, backoff: float = 1.0, quota_only: bool = True, **kwargs):
+    # Metrics init
+    if '_metrics' not in st.session_state:
+        st.session_state._metrics = {
+            'retry_calls': 0,
+            'retry_attempts': 0,
+            'retry_failures': 0,
+            'retry_success': 0,
+        }
+    st.session_state._metrics['retry_calls'] += 1
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            if attempt > 0:
+                st.session_state._metrics['retry_attempts'] += 1
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:  # type: ignore
+            last_exc = e
+            msg = str(e)
+            if quota_only and not any(c in msg for c in ["429", "Quota", "quota", "503", "500"]):
+                raise
+            time.sleep(backoff * (attempt + 1))
+            continue
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff * (attempt + 1))
+            continue
+    if last_exc:
+        st.session_state._metrics['retry_failures'] += 1
+        raise last_exc
+    st.session_state._metrics['retry_success'] += 1
+
+def safe_append_row(ws, values: list, sheet_name: str):
+    with_retries(ws.append_row, values)
+    bump_sheet_cache(sheet_name)
+
+def safe_batch_update(ws, data_ranges: list[dict], sheet_name: str):
+    try:
+        with_retries(ws.batch_update, data_ranges)
+    except Exception:
+        # Fallback: individual updates
+        for dr in data_ranges:
+            rng = dr.get('range'); vals = dr.get('values')
+            if not rng: continue
+            with_retries(ws.update, rng, vals)
+        bump_sheet_cache(sheet_name)
+        if data_ranges:
+            st.session_state['_last_batch_update'] = data_ranges
+def safe_update(ws, a1_range: str, values, sheet_name: str):
+    with_retries(ws.update, a1_range, values)
+    bump_sheet_cache(sheet_name)
+    st.session_state['_last_update'] = {'range': a1_range, 'values': values}
+
+def safe_delete_rows(ws, index: int, sheet_name: str, number: int = 1):
+    for i in range(number):
+        with_retries(ws.delete_rows, index)
+    bump_sheet_cache(sheet_name)
 # All application timestamps are standardized to WIB (UTC+07:00) via now_wib_dt()/now_wib_iso().
 # IMPORTANT:
 #  - Always call now_wib_iso() for storing a timestamp (avoid direct datetime.utcnow()).
@@ -345,10 +421,21 @@ def get_gsheets_client():
 
 @st.cache_resource
 def get_gdrive_service():
-    """Membuat service untuk Google Drive API menggunakan credentials."""
+    """Membuat service untuk Google Drive API menggunakan credentials.
+    Dipindah ke lazy import agar modul googleapiclient hanya diload saat benar-benar dibutuhkan."""
+    # Lazy import
+    from googleapiclient.discovery import build  # type: ignore
     creds = get_credentials()
-    service = build('drive', 'v3', credentials=creds)
-    return service
+    return build('drive', 'v3', credentials=creds)
+
+def build_media_upload(file_like, mimetype: str | None):
+        """Helper pembungkus MediaIoBaseUpload dengan lazy import.
+        Parameter:
+            - file_like: objek bytes/stream siap dibaca.
+            - mimetype: string mime atau None -> fallback generic.
+        """
+        from googleapiclient.http import MediaIoBaseUpload  # type: ignore
+        return MediaIoBaseUpload(file_like, mimetype=mimetype or 'application/octet-stream', resumable=True)
 
 
 @st.cache_resource
@@ -382,11 +469,8 @@ def _cached_get_all_records(sheet_name: str, expected_headers: list | None = Non
 
 
 def _invalidate_data_cache():
-    """Invalidasi cache data sheet (dipanggil setelah operasi tulis)."""
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
+    """Deprecated: no-op (kept for backward compatibility)."""
+    return
 
 
 # --- 3. FUNGSI HELPER & UTILITAS ---
@@ -399,8 +483,14 @@ def verify_password(plain_password: str, hashed_password: str):
     return pwd_context.verify(plain_password, hashed_password)
 
 def send_notification_email(recipient_email, subject, body):
-    """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
+    """Mengirim email notifikasi menggunakan kredensial dari st.secrets.
+    Lazy import modul terkait email agar startup lebih cepat jika email tidak dipakai."""
     try:
+        # Lazy imports
+        import smtplib  # type: ignore
+        from email.mime.multipart import MIMEMultipart  # type: ignore
+        from email.mime.text import MIMEText  # type: ignore
+
         creds = st.secrets.get("email_credentials", {})
         sender_email = (creds.get("username") or "").strip()
         sender_password = (creds.get("app_password") or "").strip()
@@ -414,14 +504,11 @@ def send_notification_email(recipient_email, subject, body):
         message["Subject"] = subject
         message.attach(MIMEText(body or "", "plain"))
 
-        # Coba TLS 587 kemudian fallback ke SSL 465 jika gagal
         for attempt in range(2):
             try:
                 if attempt == 0:
                     server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
-                    server.ehlo()
-                    server.starttls()
-                    server.login(sender_email, sender_password)
+                    server.ehlo(); server.starttls(); server.login(sender_email, sender_password)
                 else:
                     server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
                     server.login(sender_email, sender_password)
@@ -432,80 +519,55 @@ def send_notification_email(recipient_email, subject, body):
             except Exception as inner_e:
                 if attempt == 1:
                     raise inner_e
-                # tunggu sebentar lalu coba SSL
-                try:
-                    time.sleep(1.0)
-                except Exception:
-                    pass
+                time.sleep(1.0)
         return False
     except Exception as e:
         st.toast(f"Gagal mengirim email: {e}")
         return False
 
 def send_notification_bulk(recipients: list[str], subject: str, body: str) -> tuple[int, int]:
-    """Kirim email ke banyak penerima dalam satu sesi SMTP untuk performa lebih baik.
-    Return: (jumlah_terkirim, total_penerima)
-    Catatan: Fungsi ini tidak menampilkan toast per penerima untuk menghindari lag.
-    """
+    """Bulk email dengan lazy import. Menghindari load modul email saat tidak diperlukan."""
     try:
-        # Normalisasi dan dedupe
+        import smtplib  # type: ignore
+        from email.mime.multipart import MIMEMultipart  # type: ignore
+        from email.mime.text import MIMEText  # type: ignore
         recipients = sorted({(e or "").strip() for e in recipients if (e or "").strip()})
         total = len(recipients)
         if total == 0:
             return 0, 0
-
         creds = st.secrets.get("email_credentials", {})
         sender_email = (creds.get("username") or "").strip()
         sender_password = (creds.get("app_password") or "").strip()
         if not sender_email or not sender_password:
             return 0, total
-
         def build_msg(to_addr: str):
-            msg = MIMEMultipart()
-            msg["From"] = sender_email
-            msg["To"] = to_addr or "Undisclosed recipients"
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body or "", "plain"))
-            return msg
-
+            m = MIMEMultipart(); m["From"] = sender_email; m["To"] = to_addr or "Undisclosed"; m["Subject"] = subject; m.attach(MIMEText(body or "", "plain")); return m
         sent = 0
-        # 1) Coba TLS 587 dahulu
         try:
             server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
             try:
-                server.ehlo()
-                server.starttls()
-                server.login(sender_email, sender_password)
+                server.ehlo(); server.starttls(); server.login(sender_email, sender_password)
                 for rcpt in recipients:
                     try:
-                        server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
-                        sent += 1
+                        server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string()); sent += 1
                     except Exception:
-                        # lanjut ke penerima berikutnya
                         pass
             finally:
-                try:
-                    server.quit()
-                except Exception:
-                    pass
+                try: server.quit()
+                except Exception: pass
             return sent, total
         except Exception:
-            # 2) Fallback SSL 465
             try:
                 server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
                 try:
                     server.login(sender_email, sender_password)
                     for rcpt in recipients:
                         try:
-                            server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
-                            sent += 1
-                        except Exception:
-                            pass
+                            server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string()); sent += 1
+                        except Exception: pass
                 finally:
-                    try:
-                        server.quit()
-                    except Exception:
-                        pass
+                    try: server.quit()
+                    except Exception: pass
                 return sent, total
             except Exception:
                 return 0, total
@@ -536,14 +598,14 @@ def initialize_users_sheet():
             st.info(f"Sheet '{USERS_SHEET_NAME}' tidak ditemukan. Membuat sheet baru...")
             worksheet = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows="100", cols="2")
             headers = ["username", "password_hash"]
-            worksheet.append_row(headers)
+            safe_append_row(worksheet, headers, USERS_SHEET_NAME)
             st.success(f"Sheet '{USERS_SHEET_NAME}' berhasil dibuat.")
             df = pd.DataFrame(columns=headers)
 
         if df.empty or 'admin' not in df['username'].values:
             st.info("User default 'admin' tidak ditemukan. Membuat user...")
             hashed_admin_pass = hash_password('admin')
-            worksheet.append_row(['admin', hashed_admin_pass])
+            safe_append_row(worksheet, ['admin', hashed_admin_pass], USERS_SHEET_NAME)
             st.success("User default 'admin' dengan password 'admin' berhasil ditambahkan.")
     except Exception as e:
         st.error(f"Gagal inisialisasi Google Sheet: {e}")
@@ -611,7 +673,7 @@ def ensure_core_sheets():
             # Append a default superuser only if sheet is empty
             for i in range(3):
                 try:
-                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", now_wib_iso(), 1])
+                    safe_append_row(users_ws, ["admin@local", hash_password("admin"), "Admin", "superuser", now_wib_iso(), 1], USERS_SHEET_NAME)
                     break
                 except gspread.exceptions.APIError as e:
                     if "429" in str(e):
@@ -797,7 +859,8 @@ def show_login_page():
                         email_subject = "Notifikasi: User Login"
                         email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
                         try:
-                            notify_event("auth", "login", email_subject, email_body)
+                            if _throttle(f"login_event:{username}", 30):
+                                notify_event("auth", "login", email_subject, email_body)
                         except Exception:
                             pass
                         
@@ -830,7 +893,7 @@ def show_login_page():
                     st.error("Username sudah terdaftar. Silakan pilih yang lain.")
                 else:
                     hashed_pass = hash_password(new_password)
-                    worksheet.append_row([new_username, hashed_pass])
+                    safe_append_row(worksheet, [new_username, hashed_pass], USERS_SHEET_NAME)
                     st.success("Registrasi berhasil! Silakan login.")
 
                     # Kirim notifikasi ke seluruh SUPERUSER saat REGISTRASI
@@ -867,10 +930,11 @@ def show_main_app():
         if st.button(f"Upload '{uploaded_file.name}'"):
             with st.spinner("Mengupload file..."):
                 try:
+                    # Lazy import MediaIoBaseUpload hanya saat upload dilakukan
                     drive_service = get_gdrive_service()
                     file_metadata = {'name': uploaded_file.name, 'parents': [GDRIVE_FOLDER_ID]}
                     file_buffer = io.BytesIO(uploaded_file.getvalue())
-                    media = MediaIoBaseUpload(file_buffer, mimetype=uploaded_file.type, resumable=True)
+                    media = build_media_upload(file_buffer, uploaded_file.type)
                     
                     file = drive_service.files().create(
                         body=file_metadata,
@@ -889,8 +953,9 @@ def show_main_app():
     st.header("📋 Daftar File di Drive")
     if st.button("Refresh Daftar File"):
         # force cache clear
+        # Refresh list drive cache only (function _list_drive_files has its own cache by folder_id+TTL)
         try:
-            st.cache_data.clear()
+            _list_drive_files.clear()  # type: ignore[attr-defined]
         except Exception:
             pass
         st.rerun()
@@ -978,6 +1043,7 @@ def logout():
         # Audit logout event
         try:
             audit_log("auth", "logout", target=user.get("email", ""))
+            flush_audit_buffer()
         except Exception:
             pass
     st.session_state.user = None
@@ -985,117 +1051,7 @@ def logout():
     st.session_state.username = ""
 
 
-def _load_users_df():
-    spreadsheet = get_spreadsheet()
-    ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-    users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
-    try:
-        records = _cached_get_all_records(USERS_SHEET_NAME, users_headers)
-    except Exception:
-        records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    return ws, df
-
-
-def login_user(email: str, password: str):
-    try:
-        ws, df = _load_users_df()
-        email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
-        if email_col is None:
-            return False, "Sheet users tidak memiliki kolom email/username."
-        row = df[df[email_col].astype(str).str.lower() == email.lower()]
-        if row.empty:
-            return False, "Email/Username tidak ditemukan."
-        hashed = row.iloc[0].get("password_hash")
-        if not hashed:
-            return False, "Akun tidak memiliki password. Hubungi admin."
-        if not verify_password(password, hashed):
-            return False, "Password salah."
-        # Build user object
-        user_obj = {
-            "email": row.iloc[0].get("email", row.iloc[0].get("username")),
-            "full_name": row.iloc[0].get("full_name", ""),
-            "role": str(row.iloc[0].get("role", "user")).lower() or "user",
-            "active": int(row.iloc[0].get("active", 1)) if str(row.iloc[0].get("active", 1)).isdigit() else 1,
-        }
-        if not user_obj["active"]:
-            return False, "Akun dinonaktifkan."
-        set_current_user(user_obj)
-        st.session_state.logged_in = True
-        st.session_state.username = user_obj["email"]
-        try:
-            notify_event("auth", "login", "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
-        except Exception:
-            pass
-        # Audit login event
-        try:
-            audit_log("auth", "login", target=user_obj.get("email", ""))
-        except Exception:
-            pass
-        return True, "Login berhasil."
-    except Exception as e:
-        return False, f"Gagal login: {e}"
-
-
-def register_user(email: str, full_name: str, password: str):
-    try:
-        spreadsheet = get_spreadsheet()
-        ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
-        try:
-            df = pd.DataFrame(_cached_get_all_records(USERS_SHEET_NAME, users_headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        email_lower = email.lower()
-        # Check existing
-        email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
-        if email_col and (df[email_col].astype(str).str.lower() == email_lower).any():
-            return False, "Email/Username sudah terdaftar."
-        hashed = hash_password(password)
-        now = now_wib_iso()
-        # Adapt to sheet schema
-        headers = ws.row_values(1)
-        row_values = []
-        for h in headers:
-            if h == "email":
-                row_values.append(email)
-            elif h == "username":
-                row_values.append(email)
-            elif h == "password_hash":
-                row_values.append(hashed)
-            elif h == "full_name":
-                row_values.append(full_name)
-            elif h == "role":
-                row_values.append("user")
-            elif h == "created_at":
-                row_values.append(now)
-            elif h == "active":
-                row_values.append(1)
-            else:
-                row_values.append("")
-        # Retry and cache invalidation
-        for i in range(3):
-            try:
-                ws.append_row(row_values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-        try:
-            notify_event("users", "register", "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
-        except Exception:
-            pass
-        # Audit register
-        try:
-            audit_log("users", "register", target=email)
-        except Exception:
-            pass
-        return True, "Registrasi berhasil."
-    except Exception as e:
-        return False, f"Gagal registrasi: {e}"
+from auth import login_user, register_user  # type: ignore
 
 
 def auth_sidebar():
@@ -1125,31 +1081,20 @@ def auth_sidebar():
 
 
 def _get_emails_by_role(role: str) -> list[str]:
-    """Kembalikan list email untuk user dengan role tertentu dan active=1 (jika ada)."""
     try:
-        _, df = _load_users_df()
-        if df is None or df.empty:
-            return []
+        ws = get_spreadsheet().worksheet(USERS_SHEET_NAME)
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty: return []
         role_mask = df.get('role', pd.Series(dtype=str)).astype(str).str.lower() == str(role).lower()
-        # Interpret kolom active lebih fleksibel: terima 1/"1"/true/yes/y/aktif/active
         if 'active' in df.columns:
             active_col = df['active'].astype(str).str.strip().str.lower()
-            truthy_values = {"1", "true", "yes", "y", "aktif", "active"}
-            # Jika kolom numeric (0/1) tetap akan cocok dgn "1"
-            active_mask = active_col.isin(truthy_values)
-            role_mask = role_mask & active_mask
+            truth_vals = {"1","true","yes","y","aktif","active"}
+            role_mask &= active_col.isin(truth_vals)
         email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
-        if not email_col:
-            return []
-        emails = (
-            df.loc[role_mask, email_col]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .unique()
-            .tolist()
+        if not email_col: return []
+        return (
+            df.loc[role_mask, email_col].dropna().astype(str).str.strip().unique().tolist()
         )
-        return emails
     except Exception:
         return []
 
@@ -1242,75 +1187,160 @@ def _safe_get_ws(name: str, retries: int = 3, delay: float = 1.0):
 
 
 def audit_log(module: str, action: str, target: str = "", details: str = ""):
+    """Buffer an audit entry (timestamp, actor, module, action, target, details).
+    Flush will occur automatically at size threshold or explicitly via flush_audit_buffer()."""
+    if '_audit_buffer' not in st.session_state:
+        st.session_state['_audit_buffer'] = []
+    actor = (get_current_user() or {}).get('email', '-')
+    st.session_state['_audit_buffer'].append([now_wib_iso(), actor, module, action, target, details])
+    if len(st.session_state['_audit_buffer']) >= 15:
+        try: flush_audit_buffer()
+        except Exception: pass
+
+def flush_audit_buffer():
+    buf = st.session_state.get('_audit_buffer')
+    if not buf:
+        return
+    if '_metrics' not in st.session_state:
+        st.session_state._metrics = {}
+    st.session_state._metrics['audit_flushes'] = st.session_state._metrics.get('audit_flushes', 0) + 1
     try:
         ws = _get_ws(AUDIT_SHEET_NAME)
-        actor = (get_current_user() or {}).get("email", "guest")
-        data = [now_wib_iso(), actor, module, action, target, details]
-        for i in range(3):
+        if not ws:
+            return
+        for entry in buf:
             try:
-                ws.append_row(data)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
+                safe_append_row(ws, entry, AUDIT_SHEET_NAME)
+            except Exception:
+                continue
+        st.session_state['_audit_buffer'] = []
     except Exception:
-        # Non-blocking audit logging failure; swallow errors
-        pass
-
-
-# --- Helpers: Users sheet operations ---
-def _find_user_row(ws, email_or_username: str) -> int | None:
-    """Find row index (1-based) by matching email or username columns (case-insensitive). Returns None if not found."""
-    headers = ws.row_values(1)
-    email_col_idx = (headers.index('email') + 1) if 'email' in headers else None
-    user_col_idx = (headers.index('username') + 1) if 'username' in headers else None
-    # Prefer email search
-    try_cols = [email_col_idx, user_col_idx]
-    for col_idx in try_cols:
-        if not col_idx:
-            continue
-        try:
-            cell = ws.find(email_or_username, in_column=col_idx, case_sensitive=False)
-            if cell:
-                return cell.row
-        except Exception:
-            continue
-    return None
+        return
 
 
 def _users_update_row(ws, row_idx: int, updates: dict):
-    """Update specified columns for a given row with retries; clear cache after."""
+    """Batch update multiple columns in a single request where possible.
+    Falls back to individual updates on repeated 429s."""
     headers = ws.row_values(1)
+    ranges_payload = []
     for k, v in updates.items():
         if k not in headers:
             continue
         a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-        for i in range(3):
-            try:
-                ws.update(a1, [[v]])
-                break
-            except gspread.exceptions.APIError as e:
-                if '429' in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-    _invalidate_data_cache()
+        ranges_payload.append({'range': a1, 'values': [[v]]})
+    if not ranges_payload:
+        return
+    for attempt in range(3):
+        try:
+            ws.batch_update(ranges_payload)
+            bump_sheet_cache(USERS_SHEET_NAME)
+            break
+        except gspread.exceptions.APIError as e:
+            if '429' in str(e) and attempt < 2:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            # Fallback: try one-by-one
+            for item in ranges_payload:
+                for i in range(2):
+                    try:
+                        ws.update(item['range'], item['values'])
+                        break
+                    except gspread.exceptions.APIError as ie:
+                        if '429' in str(ie) and i == 0:
+                            time.sleep(0.8)
+                            continue
+                        raise
+            bump_sheet_cache(USERS_SHEET_NAME)
+            break
 
 
 def _users_delete_row(ws, row_idx: int):
     for i in range(3):
         try:
-            ws.delete_rows(row_idx)
-            _invalidate_data_cache()
+            safe_delete_rows(ws, row_idx, USERS_SHEET_NAME)
+            bump_sheet_cache(USERS_SHEET_NAME)
+            st.session_state.pop('_users_row_map', None)
             break
         except gspread.exceptions.APIError as e:
             if '429' in str(e):
                 time.sleep(1.2 * (i + 1))
                 continue
             raise
+
+def _find_user_row(ws, identifier: str | None):
+    """Find the row index for a user by email/username using a cached id map.
+    Falls back to ws.find on miss. Returns None if not found."""
+    if not identifier:
+        return None
+    try:
+        # Build map once per session to minimize API calls
+        cache_key = '_users_row_map'
+        row_map = st.session_state.get(cache_key)
+        if row_map is None:
+            # Build mapping based on primary identifier column
+            headers = ws.row_values(1)
+            if 'email' in headers:
+                id_col = 'email'
+            elif 'username' in headers:
+                id_col = 'username'
+            else:
+                id_col = headers[0] if headers else None
+            row_map = {}
+            if id_col:
+                values = ws.col_values(headers.index(id_col) + 1)
+                for idx, val in enumerate(values, start=1):
+                    if idx == 1:  # header
+                        continue
+                    if val:
+                        row_map[str(val).strip().lower()] = idx
+            st.session_state[cache_key] = row_map
+        return row_map.get(str(identifier).strip().lower())
+    except Exception:
+        try:
+            found = ws.find(str(identifier))
+            return found.row if found else None
+        except Exception:
+            return None
+
+def _sheet_row_map(ws, id_col: str, cache_key: str):
+    """Generic cached id -> row index map for a worksheet.
+    cache_key should be unique per sheet/column (e.g. f"_map_{sheet}_{col}")."""
+    try:
+        row_map = st.session_state.get(cache_key)
+        if row_map is None:
+            headers = ws.row_values(1)
+            if id_col not in headers:
+                return {}
+            col_idx = headers.index(id_col) + 1
+            values = ws.col_values(col_idx)
+            row_map = {}
+            for idx, val in enumerate(values, start=1):
+                if idx == 1:
+                    continue
+                if val:
+                    row_map[str(val).strip()] = idx
+            st.session_state[cache_key] = row_map
+            # metrics count builds
+            if '_metrics' not in st.session_state:
+                st.session_state._metrics = {}
+            st.session_state._metrics['row_map_builds'] = st.session_state._metrics.get('row_map_builds', 0) + 1
+        return row_map
+    except Exception:
+        return {}
+
+def _sheet_row_lookup(ws, identifier: str, id_col: str, cache_key: str):
+    if not identifier:
+        return None
+    m = _sheet_row_map(ws, id_col, cache_key)
+    row_idx = m.get(str(identifier).strip())
+    if row_idx:
+        return row_idx
+    # fallback
+    try:
+        found = ws.find(str(identifier))
+        return found.row if found else None
+    except Exception:
+        return None
 
 
 def dashboard():
@@ -1486,10 +1516,9 @@ def dashboard():
             data = []
             today_local = date.today()
             try:
-                # Delegasi
-                try:
-                    ws = _get_ws(DELEGASI_SHEET_NAME); delegasi = pd.DataFrame(ws.get_all_records())
-                except Exception: delegasi = pd.DataFrame()
+                versions = {s: _get_sheet_version(s) for s in [DELEGASI_SHEET_NAME, MOU_SHEET_NAME, CUTI_SHEET_NAME, FLEX_SHEET_NAME, MOBIL_SHEET_NAME]}
+                dash = load_dashboard_minimal(versions)
+                delegasi = dash.get(DELEGASI_SHEET_NAME, pd.DataFrame())
                 if not delegasi.empty:
                     for _, r in delegasi.iterrows():
                         judul = r.get('judul') or '(Tanpa Judul)'
@@ -1507,10 +1536,7 @@ def dashboard():
                             if warna:
                                 data.append({'label': f"Delegasi: {judul}", 'warna': warna, 'modul':'Delegasi'})
                         except Exception: pass
-                # MoU
-                try:
-                    ws = _get_ws(MOU_SHEET_NAME); mou_df = pd.DataFrame(ws.get_all_records())
-                except Exception: mou_df = pd.DataFrame()
+                mou_df = dash.get(MOU_SHEET_NAME, pd.DataFrame())
                 if not mou_df.empty:
                     for _, r in mou_df.iterrows():
                         tgl_selesai = r.get('tgl_selesai') or ''
@@ -1524,10 +1550,7 @@ def dashboard():
                             if warna:
                                 data.append({'label': f"MoU: {judul}", 'warna': warna, 'modul':'MoU'})
                         except Exception: pass
-                # Cuti (aktif hari ini)
-                try:
-                    ws = _get_ws(CUTI_SHEET_NAME); cuti_df = pd.DataFrame(ws.get_all_records())
-                except Exception: cuti_df = pd.DataFrame()
+                cuti_df = dash.get(CUTI_SHEET_NAME, pd.DataFrame())
                 if not cuti_df.empty:
                     for _, r in cuti_df.iterrows():
                         try:
@@ -1537,10 +1560,7 @@ def dashboard():
                                 if d1 <= today_local <= d2:
                                     data.append({'label': f"Cuti: {r.get('nama','')}", 'warna':'Cuti', 'modul':'Cuti'})
                         except Exception: continue
-                # Flex Time (hari ini)
-                try:
-                    ws = _get_ws(FLEX_SHEET_NAME); flex_df = pd.DataFrame(ws.get_all_records())
-                except Exception: flex_df = pd.DataFrame()
+                flex_df = dash.get(FLEX_SHEET_NAME, pd.DataFrame())
                 if not flex_df.empty:
                     for _, r in flex_df.iterrows():
                         try:
@@ -1548,10 +1568,7 @@ def dashboard():
                             if tgl and datetime.fromisoformat(str(tgl)).date()==today_local:
                                 data.append({'label': f"Flex: {r.get('nama','')} ({r.get('jam_mulai','')}-{r.get('jam_selesai','')})", 'warna':'Flex Time','modul':'Flex Time'})
                         except Exception: continue
-                # Mobil Kantor (rentang aktif)
-                try:
-                    ws = _get_ws(MOBIL_SHEET_NAME); mob_df = pd.DataFrame(ws.get_all_records())
-                except Exception: mob_df = pd.DataFrame()
+                mob_df = dash.get(MOBIL_SHEET_NAME, pd.DataFrame())
                 if not mob_df.empty:
                     for _, r in mob_df.iterrows():
                         try:
@@ -1718,7 +1735,7 @@ def dashboard():
                                     row_values = [payload.get(h, '') for h in headers]
                                     for i in range(3):
                                         try:
-                                            ws.append_row(row_values)
+                                            safe_append_row(ws, row_values, CONFIG_SHEET_NAME)
                                             break
                                         except gspread.exceptions.APIError as e:
                                             if '429' in str(e):
@@ -1730,7 +1747,7 @@ def dashboard():
                             audit_log('config','bulk_apply', target='bulk_notif', details=f"cat={len(selected_categories)} created={total_created} updated={total_updated}")
                         except Exception:
                             pass
-                        load_config_notif_map.clear()  # type: ignore[attr-defined]
+                        # dynamic notification cache clear (disabled after modular refactor)
                         st.success(f"Selesai. Created: {total_created} | Updated: {total_updated}")
                 except Exception as e:
                     st.error(f"Gagal bulk generate: {e}")
@@ -1863,18 +1880,15 @@ def dashboard():
                                     continue
                                 info = match[0]
                                 ws = _get_ws(info['sheet'])
-                                # find id cell
-                                try:
-                                    cell = ws.find(obj_id)
-                                except Exception:
-                                    cell = None
-                                if not cell:
-                                    continue
+                                # map lookup for row index
                                 headers_ws = ws.row_values(1)
+                                row_idx = _sheet_row_lookup(ws, obj_id, 'id', f"_map_{info['sheet']}_id")
+                                if not row_idx:
+                                    continue
                                 if info['approval_col'] not in headers_ws:
                                     continue
                                 col_idx = headers_ws.index(info['approval_col']) + 1
-                                a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                                a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
                                 for attempt in range(3):
                                     try:
                                         ws.update(a1, [[1]])
@@ -1892,7 +1906,8 @@ def dashboard():
                                         raise
                             except Exception:
                                 continue
-                        _invalidate_data_cache()
+                        bump_sheet_cache(INVENTORY_SHEET_NAME)
+                        st.session_state.pop('_map_inventory_id', None)
                         st.success(f"Berhasil approve {approved_count} item.")
                         st.experimental_rerun()
             else:
@@ -1952,8 +1967,9 @@ def inventory_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, INVENTORY_SHEET_NAME)
+                bump_sheet_cache(INVENTORY_SHEET_NAME)
+                st.session_state.pop('_map_inventory_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -1964,26 +1980,11 @@ def inventory_module():
     def _inv_update_by_id(iid: str, updates: dict):
         ws = _inv_ws()
         headers = ws.row_values(1)
-        id_cell = ws.find(iid)
-        if not id_cell:
+        row_idx = _sheet_row_lookup(ws, iid, 'id', '_map_inventory_id')
+        if not row_idx:
             raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            col_idx = headers.index(k) + 1
-            a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-            # Retry updates
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, INVENTORY_SHEET_NAME, '_map_inventory_id')
+
 
     def format_datetime_wib(ts: str) -> str:
         try:
@@ -2003,7 +2004,7 @@ def inventory_module():
                 'name': file.name,
                 'parents': [GDRIVE_FOLDER_ID]
             }
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or 'application/octet-stream', resumable=True)
+            media = build_media_upload(io.BytesIO(file.getvalue()), file.type)
             resp = service.files().create(
                 body=file_metadata,
                 media_body=media,
@@ -2393,8 +2394,9 @@ def surat_masuk_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, SURAT_MASUK_SHEET_NAME)
+                bump_sheet_cache(SURAT_MASUK_SHEET_NAME)
+                st.session_state.pop('_map_surat_masuk_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -2404,25 +2406,10 @@ def surat_masuk_module():
 
     def _sm_update_by_id(sid: str, updates: dict):
         ws = _sm_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(sid)
-        if not id_cell:
+        row_idx = _sheet_row_lookup(ws, sid, 'id', '_map_surat_masuk_id')
+        if not row_idx:
             raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, SURAT_MASUK_SHEET_NAME, '_map_surat_masuk_id')
 
     # Drive helpers
     def _upload_surat_to_drive(file) -> tuple[str, str, str]:
@@ -2431,7 +2418,7 @@ def surat_masuk_module():
         try:
             service = get_gdrive_service()
             file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
+            media = build_media_upload(io.BytesIO(file.getvalue()), file.type)
             resp = service.files().create(
                 body=file_metadata,
                 media_body=media,
@@ -2703,8 +2690,9 @@ def surat_keluar_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, SURAT_KELUAR_SHEET_NAME)
+                bump_sheet_cache(SURAT_KELUAR_SHEET_NAME)
+                st.session_state.pop('_map_surat_keluar_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -2714,25 +2702,10 @@ def surat_keluar_module():
 
     def _sk_update_by_id(sid: str, updates: dict):
         ws = _sk_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(sid)
-        if not id_cell:
+        row_idx = _sheet_row_lookup(ws, sid, 'id', '_map_surat_keluar_id')
+        if not row_idx:
             raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, SURAT_KELUAR_SHEET_NAME, '_map_surat_keluar_id')
 
     # Drive helpers
     def _upload_to_drive(file) -> tuple[str, str, str]:
@@ -2741,7 +2714,7 @@ def surat_keluar_module():
         try:
             service = get_gdrive_service()
             file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
+            media = build_media_upload(io.BytesIO(file.getvalue()), file.type)
             resp = service.files().create(
                 body=file_metadata,
                 media_body=media,
@@ -3044,22 +3017,22 @@ def mou_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
+                safe_append_row(ws, values, MOU_SHEET_NAME)
                 break
             except gspread.exceptions.APIError as e:
                 if '429' in str(e):
                     time.sleep(1 + i)
                     continue
                 raise
-        st.cache_data.clear()
+    bump_sheet_cache(MOU_SHEET_NAME)
 
     def _mou_update_by_id(mid: str, updates: dict):
         ws = _mou_ws()
         headers = ws.row_values(1)
-        id_cell = ws.find(mid)
-        if not id_cell:
+        id_map = _build_id_row_map(ws, 'id')
+        row_idx = id_map.get(mid)
+        if not row_idx:
             raise ValueError("ID MoU tidak ditemukan")
-        row_idx = id_cell.row
         for k, v in updates.items():
             if k not in headers:
                 continue
@@ -3073,14 +3046,14 @@ def mou_module():
                         time.sleep(1 + i)
                         continue
                     raise
-        st.cache_data.clear()
+    bump_sheet_cache(MOU_SHEET_NAME)
 
     def _upload_file(file) -> tuple[str, str, str]:
         if not file:
             return "", "", ""
         try:
             service = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            media = build_media_upload(file, file.type)
             folder_id = GDRIVE_FOLDER_ID
             file_metadata = {"name": file.name, "parents": [folder_id]}
             created = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink, name").execute()
@@ -3311,8 +3284,9 @@ def cash_advance_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, CASH_ADVANCE_SHEET_NAME)
+                bump_sheet_cache(CASH_ADVANCE_SHEET_NAME)
+                st.session_state.pop('_map_cash_advance_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -3322,28 +3296,11 @@ def cash_advance_module():
 
     def _ca_update_by_id(cid: str, updates: dict):
         ws = _ca_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(cid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, cid, 'id', '_map_cash_advance_id')
+        if not row_idx:
+            st.error("ID tidak ditemukan")
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, CASH_ADVANCE_SHEET_NAME, '_map_cash_advance_id')
         return True
 
     def _upload_tor(file) -> tuple[str, str, str] | tuple[None, None, None]:
@@ -3351,7 +3308,7 @@ def cash_advance_module():
             return None, None, None
         try:
             drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            media = build_media_upload(file, file.type)
             meta = {
                 'name': file.name,
                 'parents': [GDRIVE_FOLDER_ID]
@@ -3669,8 +3626,9 @@ def pmr_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, PMR_SHEET_NAME)
+                bump_sheet_cache(PMR_SHEET_NAME)
+                st.session_state.pop('_map_pmr_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -3680,28 +3638,10 @@ def pmr_module():
 
     def _pmr_update_by_id(pid: str, updates: dict):
         ws = _pmr_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(pid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, pid, 'id', '_map_pmr_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, PMR_SHEET_NAME, '_map_pmr_id')
         return True
 
     def _upload_file(file):
@@ -3709,7 +3649,7 @@ def pmr_module():
             return None, None, None
         try:
             drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            media = build_media_upload(file, file.type)
             meta = {'name': file.name, 'parents': [GDRIVE_FOLDER_ID]}
             created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
             return created.get('id'), file.name, created.get('webViewLink')
@@ -3942,8 +3882,9 @@ def flex_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, FLEX_SHEET_NAME)
+                bump_sheet_cache(FLEX_SHEET_NAME)
+                st.session_state.pop('_map_flex_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -3953,28 +3894,10 @@ def flex_module():
 
     def _flex_update_by_id(fid: str, updates: dict):
         ws = _flex_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(fid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, fid, 'id', '_map_flex_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, FLEX_SHEET_NAME, '_map_flex_id')
         return True
 
     # Helpers for overlap detection (only among approved director=1)
@@ -4199,8 +4122,9 @@ def delegasi_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, DELEGASI_SHEET_NAME)
+                bump_sheet_cache(DELEGASI_SHEET_NAME)
+                st.session_state.pop('_map_delegasi_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -4210,28 +4134,10 @@ def delegasi_module():
 
     def _del_update_by_id(did: str, updates: dict):
         ws = _del_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(did)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, did, 'id', '_map_delegasi_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, DELEGASI_SHEET_NAME, '_map_delegasi_id')
         return True
 
     def _upload_file(file):
@@ -4239,7 +4145,7 @@ def delegasi_module():
             return None, None, None
         try:
             drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
+            media = build_media_upload(file, file.type)
             meta = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
             created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
             return created.get('id'), file.name, created.get('webViewLink')
@@ -4494,8 +4400,9 @@ def kalender_pemakaian_mobil_kantor():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, MOBIL_SHEET_NAME)
+                bump_sheet_cache(MOBIL_SHEET_NAME)
+                st.session_state.pop('_map_mobil_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -4505,43 +4412,22 @@ def kalender_pemakaian_mobil_kantor():
 
     def _mobil_update_by_id(mid: str, updates: dict):
         ws = _mobil_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(mid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, mid, 'id', '_map_mobil_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, MOBIL_SHEET_NAME, '_map_mobil_id')
         return True
 
     def _mobil_delete(mid: str):
         ws = _mobil_ws()
-        try:
-            cell = ws.find(mid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, mid, 'id', '_map_mobil_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
         for i in range(3):
             try:
-                ws.delete_rows(row_idx)
-                _invalidate_data_cache()
+                safe_delete_rows(ws, row_idx, MOBIL_SHEET_NAME)
+                bump_sheet_cache(MOBIL_SHEET_NAME)
+                st.session_state.pop('_map_mobil_id', None)
                 return True
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -4799,8 +4685,9 @@ def calendar_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
-                _invalidate_data_cache()
+                safe_append_row(ws, values, CALENDAR_SHEET_NAME)
+                bump_sheet_cache(SOP_SHEET_NAME)
+                st.session_state.pop('_map_sop_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -4820,7 +4707,7 @@ def calendar_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
+                safe_append_row(ws, values, SOP_SHEET_NAME)
                 _invalidate_data_cache()
                 break
             except gspread.exceptions.APIError as e:
@@ -5088,7 +4975,7 @@ def sop_module():
         ws = _sop_ws()
         headers = _sop_headers()
         try:
-            records = _cached_get_all_records(SOP_SHEET_NAME, headers)
+            records = load_static_sheet_records(SOP_SHEET_NAME, _get_sheet_version(SOP_SHEET_NAME), headers)
         except Exception:
             records = ws.get_all_records()
         df = pd.DataFrame(records)
@@ -5104,7 +4991,7 @@ def sop_module():
         values = [row.get(h, "") for h in headers]
         for i in range(3):
             try:
-                ws.append_row(values)
+                safe_append_row(ws, values, NOTULEN_SHEET_NAME)
                 _invalidate_data_cache()
                 break
             except gspread.exceptions.APIError as e:
@@ -5115,28 +5002,10 @@ def sop_module():
 
     def _sop_update_by_id(sid: str, updates: dict):
         ws = _sop_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(sid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, sid, 'id', '_map_sop_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, SOP_SHEET_NAME, '_map_sop_id')
         return True
 
     def _upload_sop_file(file) -> tuple[str, str, str]:
@@ -5145,7 +5014,7 @@ def sop_module():
         try:
             service = get_gdrive_service()
             fname = file.name
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
+            media = build_media_upload(file, file.type)
             metadata = {"name": fname, "parents": [GDRIVE_FOLDER_ID]}
             created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name").execute()
             fid = created.get('id','')
@@ -5344,7 +5213,7 @@ def notulen_module():
         ws = _not_ws()
         headers = _not_headers()
         try:
-            records = _cached_get_all_records(NOTULEN_SHEET_NAME, headers)
+            records = load_static_sheet_records(NOTULEN_SHEET_NAME, _get_sheet_version(NOTULEN_SHEET_NAME), headers)
         except Exception:
             records = ws.get_all_records()
         df = pd.DataFrame(records)
@@ -5362,7 +5231,8 @@ def notulen_module():
         for i in range(3):
             try:
                 ws.append_row(values)
-                _invalidate_data_cache()
+                bump_sheet_cache(NOTULEN_SHEET_NAME)
+                st.session_state.pop('_map_notulen_id', None)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -5372,28 +5242,10 @@ def notulen_module():
 
     def _not_update_by_id(nid: str, updates: dict):
         ws = _not_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(nid)
-        except Exception:
+        row_idx = _sheet_row_lookup(ws, nid, 'id', '_map_notulen_id')
+        if not row_idx:
             return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
+        _batch_update_row_generic(ws, row_idx, updates, NOTULEN_SHEET_NAME, '_map_notulen_id')
         return True
 
     def _upload_notulen_file(file) -> tuple[str, str, str]:
@@ -5407,9 +5259,9 @@ def notulen_module():
                 try:
                     service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
                     parents = [GDRIVE_FOLDER_ID]
-                except HttpError:
+                except Exception:
                     st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan/akses ditolak. File akan diupload ke root Drive service account.")
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
+            media = build_media_upload(file, file.type)
             metadata = {"name": fname}
             if parents:
                 metadata["parents"] = parents
@@ -5688,7 +5540,8 @@ def notulen_module():
 def user_setting_module():
     user = require_login()
     st.header("⚙️ User Setting")
-    ws, df = _load_users_df()
+    ws = get_spreadsheet().worksheet(USERS_SHEET_NAME)
+    df = pd.DataFrame(ws.get_all_records())
     email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
     if not email_col:
         st.error("Sheet users tidak memiliki kolom email/username.")
@@ -5889,10 +5742,11 @@ def superuser_panel():
     # Utility: refresh dynamic cache
     def _clear_config_cache():
         try:
-            load_config_notif_map.clear()  # type: ignore[attr-defined]
+            # dynamic notification mapping cache clear (disabled)
+            pass
         except Exception:
             try:
-                st.cache_data.clear()
+                bump_sheet_cache(CONFIG_SHEET_NAME)
             except Exception:
                 pass
 
@@ -6049,7 +5903,7 @@ def superuser_panel():
                         values = [row_payload.get(h, "") for h in headers]
                         for i in range(3):
                             try:
-                                ws.append_row(values)
+                                safe_append_row(ws, values, CONFIG_SHEET_NAME)
                                 break
                             except gspread.exceptions.APIError as e:
                                 if '429' in str(e):
@@ -6092,7 +5946,7 @@ def superuser_panel():
                     if del_row:
                         for i in range(3):
                             try:
-                                ws.delete_rows(del_row)
+                                safe_delete_rows(ws, del_row, CONFIG_SHEET_NAME)
                                 break
                             except gspread.exceptions.APIError as e:
                                 if '429' in str(e):
@@ -6170,7 +6024,7 @@ def superuser_panel():
                     row_vals = [settings_payload.get(h, '') for h in headers]
                     for i in range(3):
                         try:
-                            ws.append_row(row_vals)
+                            safe_append_row(ws, row_vals, SETTINGS_SHEET_NAME)
                             break
                         except gspread.exceptions.APIError as e:
                             if '429' in str(e):
@@ -6197,7 +6051,7 @@ def superuser_panel():
             test_subject = st.text_input("Subject", value="[TEST] Notifikasi Dummy")
             test_body = st.text_area("Body", value="Ini hanya email percobaan.")
             # Pilih mapping yang ada
-            active_map = load_config_notif_map()
+            active_map = {}
             map_labels = [f"{m}:{a}" for (m, a) in sorted(active_map.keys())]
             use_mapping = st.selectbox("Gunakan Mapping (opsional)", ["(Manual Roles)"] + map_labels)
             manual_roles = []
@@ -6217,7 +6071,7 @@ def superuser_panel():
                             else:
                                 notify_event(m_sel, a_sel, test_subject, test_body, roles=None)  # dynamic lookup
                                 # Cek secara manual siapa saja penerima (diagnostik)
-                                dyn_roles = load_config_notif_map().get((m_sel, a_sel), []) or []
+                                dyn_roles = []
                                 preview_roles = set(dyn_roles)
                                 if is_superuser_auto_enabled():
                                     preview_roles.add("superuser")
@@ -6303,7 +6157,7 @@ def _cuti_append(row_dict: dict):
     values = [row_dict.get(h, "") for h in headers]
     for i in range(3):
         try:
-            ws.append_row(values)
+            safe_append_row(ws, values, CUTI_SHEET_NAME)
             _invalidate_data_cache()
             break
         except gspread.exceptions.APIError as e:
@@ -6533,80 +6387,42 @@ def cuti_module():
 
 
 def main():
-    ensure_core_sheets()
-    # --- Sidebar Logo ---
+    """Entry point utama untuk mengurangi beban startup.
+    Hanya memanggil bagian berat setelah login terverifikasi."""
+    # Jangan panggil ensure_core_sheets sebelum user login untuk menghemat quota & waktu.
+    user_logged_in = bool(st.session_state.get('logged_in') or st.session_state.get('user'))
+    if not user_logged_in:
+        # Tampilkan hanya halaman login ringan.
+        try: show_login_page()
+        except Exception as e: st.error(f"Gagal memuat halaman login: {e}")
+        return
+    # Setelah login, baru jalankan inisialisasi sheet inti sekali.
+    if not st.session_state.get('_core_sheets_ok'):
+        try:
+            ensure_core_sheets()
+        except Exception as e:
+            st.warning(f"Inisialisasi sheet tertunda: {e}")
+    # Lanjut ke aplikasi utama (misal dashboard / file management)
+    try:
+        show_main_app()
+    except Exception as e:
+        st.error(f"Terjadi kesalahan di aplikasi utama: {e}")
+
+# Jalankan main() sebagai titik masuk tunggal.
+if __name__ == '__main__':
+    main()
     user = get_current_user()
+    # Bagian login kustom di bawah (dulu corrupt) sekarang dibiarkan dikelola oleh show_login_page().
     if not user:
-        # --- Full page login/register, no sidebar ---
-        st.markdown("""
-            <style>
-            fname = file.name
-            parents = []
-            if GDRIVE_FOLDER_ID:
-                try:
-                    service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
-                    parents = [GDRIVE_FOLDER_ID]
-                except HttpError:
-                    st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan atau belum dibagikan ke service account. File akan diupload ke root Drive service account.")
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
-            metadata = {"name": fname}
-            if parents:
-                metadata["parents"] = parents
-            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name", supportsAllDrives=True).execute()
-                background: #fff;
-                border-radius: 12px;
-                box-shadow: 0 2px 16px rgba(80,140,255,0.10);
-                padding: 2.5rem 2.5rem 2rem 2.5rem;
-            }
-            .center-login h2 {text-align:center; color:#2563eb; margin-bottom:1.5rem;}
-            .center-login .stTextInput>div>input, .center-login .stTextInput>div>textarea {
-                border-radius: 6px; border: 1px solid #b3d1ff;
-            }
-            .center-login .stButton>button {
-                width: 100%; margin-top: 1rem; font-weight: 600;
-            }
-            .center-login .stTabs {
-                margin-bottom: 1.5rem;
-            }
-            </style>
-        """, unsafe_allow_html=True)
-        # Centered header using 3 columns; place content in the middle column
-        col1, col2, col3 = st.columns(3)
-        with col2:
-            st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=500)
-        tabs = st.tabs(["Login", "Register"])
-        with tabs[0]:
-            email = st.text_input("Email", key="login_email", placeholder="Masukkan email Anda")
-            pwd = st.text_input("Password", type="password", key="login_pw", placeholder="Masukkan password Anda")
-            if st.button("Login", key="login_btn"):
-                if not email or not pwd:
-                    st.warning("Email dan password wajib diisi.")
-                else:
-                    ok, msg = login_user(email.strip().lower(), pwd)
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-        with tabs[1]:
-            r_email = st.text_input("Email (register)", key="r_email2")
-            r_name = st.text_input("Nama lengkap", key="r_name2")
-            r_pw = st.text_input("Password", type="password", key="r_pw2")
-            if st.button("Register", key="register_btn"):
-                if not (r_email and r_name and r_pw):
-                    st.error("Lengkapi semua field.")
-                else:
-                    ok, msg = register_user(r_email.strip().lower(), r_name.strip(), r_pw)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-        st.markdown('</div>', unsafe_allow_html=True)
         st.stop()
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     # Gunakan helper agar tidak memicu StreamlitInvalidWidthError (hindari width=None eksplisit)
+    try:
+        flush_audit_buffer()
+    except Exception:
+        pass
     safe_image(logo_path)
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Management System</h2>", unsafe_allow_html=True)
     auth_sidebar()
