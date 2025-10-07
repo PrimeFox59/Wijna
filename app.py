@@ -2976,6 +2976,9 @@ def dashboard():
     st.title("🏠 Dashboard WIJNA")
     conn = get_db()
     cur = conn.cursor()
+    # Raw connection (hindari warning pandas karena wrapper _AuditConnection)
+    raw_conn = conn._conn if hasattr(conn, '_conn') else conn
+
 
     # --------------------------------------------------
     # UTIL: CSS & helper
@@ -3025,7 +3028,10 @@ def dashboard():
     mou_due7 = cur.fetchone()["c"]
     # Delegasi aktif (tidak selesai)
     try:
-        delegasi_aktif = pd.read_sql_query("SELECT COUNT(*) c FROM delegasi WHERE lower(status) NOT IN ('selesai','done')", conn).iloc[0]['c']
+        delegasi_aktif = pd.read_sql_query(
+            "SELECT COUNT(*) c FROM delegasi WHERE lower(status) NOT IN ('selesai','done')",
+            raw_conn
+        ).iloc[0]['c']
     except Exception:
         delegasi_aktif = 0
     colA, colB, colC, colD = st.columns(4)
@@ -3056,7 +3062,7 @@ def dashboard():
         rows = []
         for modul, q in pending_specs:
             try:
-                dtemp = pd.read_sql_query(q, conn)
+                dtemp = pd.read_sql_query(q, raw_conn)
                 if not dtemp.empty:
                     for _, r in dtemp.iterrows():
                         rows.append({"Modul": modul, "Info": r.get("info"), "Status": r.get("status")})
@@ -3064,7 +3070,7 @@ def dashboard():
                 continue
         if rows:
             dfp = pd.DataFrame(rows)
-            st.dataframe(dfp, use_container_width=True, hide_index=True)
+            st.dataframe(dfp, width='stretch', hide_index=True)
         else:
             st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -3073,11 +3079,11 @@ def dashboard():
         st.markdown("<div class='wijna-section-title'>📄 Surat & MoU</div>", unsafe_allow_html=True)
         st.markdown("<div class='wijna-section-desc'>Surat belum dibahas & MoU ≤30 hari jatuh tempo.</div>", unsafe_allow_html=True)
         try:
-            df_surat_pending = pd.read_sql_query("SELECT nomor, perihal, tanggal FROM surat_masuk WHERE status='Belum Dibahas' ORDER BY tanggal DESC LIMIT 6", conn)
+            df_surat_pending = pd.read_sql_query("SELECT nomor, perihal, tanggal FROM surat_masuk WHERE status='Belum Dibahas' ORDER BY tanggal DESC LIMIT 6", raw_conn)
         except Exception:
             df_surat_pending = pd.DataFrame()
         try:
-            df_mou_due = pd.read_sql_query("SELECT nomor, nama, tgl_selesai FROM mou WHERE date(tgl_selesai) BETWEEN date('now') AND date('now','+30 day') ORDER BY tgl_selesai ASC LIMIT 6", conn)
+            df_mou_due = pd.read_sql_query("SELECT nomor, nama, tgl_selesai FROM mou WHERE date(tgl_selesai) BETWEEN date('now') AND date('now','+30 day') ORDER BY tgl_selesai ASC LIMIT 6", raw_conn)
         except Exception:
             df_mou_due = pd.DataFrame()
         left, right = st.columns(2)
@@ -3086,13 +3092,13 @@ def dashboard():
             if df_surat_pending.empty:
                 st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
             else:
-                st.dataframe(df_surat_pending, use_container_width=True, hide_index=True)
+                st.dataframe(df_surat_pending, width='stretch', hide_index=True)
         with right:
             st.caption("MoU Due")
             if df_mou_due.empty:
                 st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
             else:
-                st.dataframe(df_mou_due, use_container_width=True, hide_index=True)
+                st.dataframe(df_mou_due, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
     with c3:
         st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
@@ -3101,7 +3107,7 @@ def dashboard():
         rekap_rows = []
         def safe_read(query, params=None):
             try:
-                return pd.read_sql_query(query, conn, params=params)
+                return pd.read_sql_query(query, raw_conn, params=params)
             except Exception:
                 return pd.DataFrame()
         df_ca = safe_read("SELECT totals, finance_approved, director_approved, tanggal FROM cash_advance WHERE substr(tanggal,1,7)=?", (this_month,))
@@ -3128,7 +3134,10 @@ def dashboard():
             dr = pd.DataFrame(rekap_rows)
             if 'Nominal' in dr.columns:
                 dr['Nominal'] = dr['Nominal'].apply(lambda v: (f"Rp {v:,.0f}".replace(",",".")) if isinstance(v,(int,float)) else v)
-            st.dataframe(dr, use_container_width=True, hide_index=True)
+            # Normalisasi kolom 'Selesai' agar tidak campur int/string (hindari ArrowTypeError)
+            if 'Selesai' in dr.columns:
+                dr['Selesai'] = dr['Selesai'].apply(lambda v: '-' if (isinstance(v,str) and v.strip()== '-') else str(v))
+            st.dataframe(dr, width='stretch', hide_index=True)
         else:
             st.markdown("<div class='empty-hint'>Tidak ada data bulan ini.</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -3143,35 +3152,35 @@ def dashboard():
         st.markdown("<div class='wijna-section-title'>🌴 Cuti & ⏰ Flex</div>", unsafe_allow_html=True)
         st.markdown("<div class='wijna-section-desc'>Ringkas total cuti per nama & flex disetujui terbaru.</div>", unsafe_allow_html=True)
         try:
-            df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) total_pengajuan, SUM(durasi) total_durasi FROM cuti GROUP BY nama ORDER BY total_durasi DESC", conn)
+            df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) total_pengajuan, SUM(durasi) total_durasi FROM cuti GROUP BY nama ORDER BY total_durasi DESC", raw_conn)
         except Exception:
             df_cuti = pd.DataFrame(columns=["nama","total_pengajuan","total_durasi"])
         if df_cuti.empty:
             st.markdown("<div class='empty-hint'>Belum ada data cuti.</div>", unsafe_allow_html=True)
         else:
-            st.dataframe(df_cuti, use_container_width=True, hide_index=True)
+            st.dataframe(df_cuti, width='stretch', hide_index=True)
         try:
-            df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 8", conn)
+            df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 8", raw_conn)
         except Exception:
             df_flex_ok = pd.DataFrame()
         st.caption("Flex Disetujui (8 terbaru)")
         if df_flex_ok.empty:
             st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
         else:
-            st.dataframe(df_flex_ok, use_container_width=True, hide_index=True)
+            st.dataframe(df_flex_ok, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
     with c5:
         st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
         st.markdown("<div class='wijna-section-title'>🗂️ Delegasi Aktif</div>", unsafe_allow_html=True)
         st.markdown("<div class='wijna-section-desc'>10 tugas mendekati/berjalan (urut tgl selesai).</div>", unsafe_allow_html=True)
         try:
-            df_del = pd.read_sql_query("SELECT judul, pic, tgl_mulai, tgl_selesai, status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", conn)
+            df_del = pd.read_sql_query("SELECT judul, pic, tgl_mulai, tgl_selesai, status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", raw_conn)
         except Exception:
             df_del = pd.DataFrame()
         if df_del.empty:
             st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
         else:
-            st.dataframe(df_del, use_container_width=True, hide_index=True)
+            st.dataframe(df_del, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     c6, c7 = st.columns([1.1, 1])
@@ -3181,7 +3190,7 @@ def dashboard():
         st.markdown("<div class='wijna-section-desc'>Event lintas modul (cuti, flex, delegasi, rapat, mobil, libur).</div>", unsafe_allow_html=True)
         today = date.today(); end_30 = today + timedelta(days=30)
         def safe_df(q):
-            try: return pd.read_sql_query(q, conn)
+            try: return pd.read_sql_query(q, raw_conn)
             except Exception: return pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
         df_cuti = safe_df("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1")
         df_flex = safe_df("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1")
@@ -3215,7 +3224,7 @@ def dashboard():
         st.markdown("<div class='wijna-section-title'>🧾 Rekap Cash Advance (Histori)</div>", unsafe_allow_html=True)
         st.markdown("<div class='wijna-section-desc'>Sumber tabel rekap_monthly_cashadvance (maks 12 terakhir).</div>", unsafe_allow_html=True)
         try:
-            df_hist = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", conn)
+            df_hist = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", raw_conn)
         except Exception:
             df_hist = pd.DataFrame()
         if df_hist.empty:
@@ -3224,7 +3233,7 @@ def dashboard():
             for col in ["total_nominal","total_nominal_cair"]:
                 if col in df_hist.columns:
                     df_hist[col] = df_hist[col].apply(lambda v: f"Rp {v:,.0f}".replace(",","."))
-            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            st.dataframe(df_hist, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     # footer hint (optional)
