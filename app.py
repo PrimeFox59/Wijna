@@ -3462,6 +3462,12 @@ def main():
         st.markdown('</div>', unsafe_allow_html=True)
         st.stop()
 
+    # --- Sidebar Firestore/SQLite status ---
+    if 'USE_FIREBASE' in globals() and USE_FIREBASE and FIRESTORE_CLIENT is not None:
+        st.sidebar.success("🟢 Tersambung ke Firestore (Cloud Database)")
+    else:
+        st.sidebar.warning("🟡 Tidak tersambung ke Firestore, menggunakan SQLite lokal.")
+
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     st.sidebar.image(logo_path, use_container_width=True)
