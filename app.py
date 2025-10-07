@@ -2396,7 +2396,15 @@ def calendar_module():
     with tab2:
         # --- AUTO INTEGRASI EVENT ---
         df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
-        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        # Flex table uses approval_director (not director_approved). Fallback if column missing.
+        try:
+            df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1", conn)
+        except Exception:
+            # fallback without filter
+            try:
+                df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex", conn)
+            except Exception:
+                df_flex = pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
         df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
         df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
         df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai, kendaraan FROM mobil WHERE status='Disetujui'", conn)
@@ -3055,7 +3063,13 @@ def dashboard():
         today = date.today()
         end_30 = today + timedelta(days=30)
         df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
-        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        try:
+            df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1", conn)
+        except Exception:
+            try:
+                df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex", conn)
+            except Exception:
+                df_flex = pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
         df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
         df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
         df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'", conn)
