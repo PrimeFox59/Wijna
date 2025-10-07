@@ -1,2067 +1,1198 @@
 import streamlit as st
-import pandas as pd
-import gspread
-from passlib.context import CryptContext
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from googleapiclient.errors import HttpError
-import io
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import json
 import os
-import uuid
+import sqlite3
+from sqlite3 import Connection
 from datetime import datetime, date, timedelta
-import time
-from datetime import timezone
-try:
-    # Python 3.9+: zoneinfo
-    from zoneinfo import ZoneInfo  # type: ignore
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # Fallback; we will manually offset
-import threading
+import base64
+import pandas as pd
+import uuid
+import json
+def sop_module():
+    user = require_login()
+    st.header("📚 Kebijakan & SOP")
+    conn = get_db()
+    cur = conn.cursor()
 
-# --- 1. KONFIGURASI APLIKASI ---
-# PENTING: Pastikan ID ini berasal dari folder di dalam SHARED DRIVE
-GDRIVE_FOLDER_ID = "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1" 
-USERS_SHEET_NAME = "users"
-CUTI_SHEET_NAME = "cuti"
-AUDIT_SHEET_NAME = "audit_log"
-INVENTORY_SHEET_NAME = "inventory"
-SURAT_MASUK_SHEET_NAME = "surat_masuk"
-SURAT_KELUAR_SHEET_NAME = "surat_keluar"
-CONFIG_SHEET_NAME = "config"
-MOU_SHEET_NAME = "mou"
-CASH_ADVANCE_SHEET_NAME = "cash_advance"
-PMR_SHEET_NAME = "pmr"
-DELEGASI_SHEET_NAME = "delegasi"
-FLEX_SHEET_NAME = "flex"
-MOBIL_SHEET_NAME = "mobil"
-CALENDAR_SHEET_NAME = "calendar"
-PUBLIC_HOLIDAYS_SHEET_NAME = "public_holidays"
-NOTULEN_SHEET_NAME = "notulen"
-SOP_SHEET_NAME = "sop"
-SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
-# ADMIN_EMAIL_RECIPIENT sekarang dikosongkan; seluruh notifikasi dikendalikan oleh
-# pemetaan per modul & aksi melalui NOTIF_ROLE_MAP di bawah. Jika ingin fallback
-# khusus (misal selalu kirim ke tim IT), isi dengan alamat distribution list.
-ADMIN_EMAIL_RECIPIENT = ""
-ALLOWED_ROLES = ["user", "staff", "finance", "director", "superuser", "board"]
+    # Introspeksi kolom untuk fleksibilitas skema
+    cur.execute("PRAGMA table_info(sop)")
+    sop_cols = [row[1] for row in cur.fetchall()]
+    sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
 
-# Centralized create permissions matrix per module (draft/input capability)
-# Keys use internal module identifiers; adjust as business rules evolve.
-CREATE_ACCESS: dict[str, set[str]] = {
-    # (Menu: "📦 Inventory")
-    "inventory": {"staff", "finance", "director", "superuser"},
-    # (Menu: "📥 Surat Masuk")
-    "surat_masuk": {"staff", "finance", "director", "superuser"},
-    # (Menu: "📤 Surat Keluar")
-    "surat_keluar": {"staff", "finance", "director", "superuser"},
-    # (Menu: "🤝 MoU")
-    "mou": {"staff", "finance", "director", "superuser"},
-    # (Menu: "💸 Cash Advance")
-    "cash_advance": {"staff", "finance", "director", "superuser"},
-    # (Menu: "📑 PMR")
-    "PMR": {"staff", "finance", "director", "superuser"},
-    # (Menu: "🌴 Cuti")
-    "cuti": {"staff", "finance", "director", "superuser"},
-    # (Menu: "⏰ Flex Time")
-    "Flex Time": {"staff", "finance", "director", "superuser"},
-    # (Menu: "📝 Delegasi")
-    "Delegasi": {"staff", "finance", "director", "superuser"},
-    # (Menu: "🚗 Mobil Kantor") – sebelumnya key terpisah calendar_mobil
-    "Mobil Kantor": {"finance", "director", "superuser"},
-    # (Menu: "📅 Kalender Bersama") – sebelumnya calendar_libur (hanya director & superuser yang dapat buat event/libur)
-    "Kalender Bersama": {"director", "superuser"},
-    # (Menu: "📚 SOP")
-    "SOP": {"director", "superuser"},
-    # (Menu: "🗒️ Notulen") – finance tidak input notulen
-    "Notulen": {"staff", "director", "superuser"},
-}
+    tab_upload, tab_daftar, tab_approve = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director"])
 
-def can_create(module_key: str, user: dict | None) -> bool:
-    role = (user or {}).get("role", "").lower()
-    allow = CREATE_ACCESS.get(module_key, set())
-    return role in allow
-
-# Pemetaan default notifikasi: (module, action) -> daftar role penerima utama.
-# Catatan: superuser selalu otomatis ditambahkan oleh helper.
-# Tambahkan / ubah sesuai kebutuhan bisnis Anda.
-NOTIF_ROLE_MAP: dict[tuple[str, str], list[str]] = {
-    ("inventory", "create"): ["finance"],
-    ("inventory", "finance_review"): ["director"],
-    ("inventory", "director_approved"): ["finance"],  # misal informasikan balik ke finance
-    ("inventory", "director_reject"): ["finance"],
-    ("surat_masuk", "draft"): ["director"],
-    ("surat_masuk", "director_approved"): ["finance"],
-    ("surat_keluar", "draft"): ["director"],
-    ("surat_keluar", "final_upload"): ["finance"],
-    ("cuti", "submit"): ["finance"],
-    ("cuti", "finance_review"): ["director"],
-    ("cuti", "director_approved"): ["finance"],
-    ("cuti", "director_reject"): ["finance"],
-    # Auth events
-    ("auth", "login"): ["superuser"],
-    ("auth", "logout"): ["superuser"],
-    ("users", "register"): ["superuser"],
-    # Cash Advance events
-    ("cash_advance", "create"): ["finance"],
-    ("cash_advance", "finance_review"): ["director"],
-    ("cash_advance", "director_approval"): ["finance"],
-    # PMR events
-    ("pmr", "upload"): ["finance"],
-    ("pmr", "finance_review"): ["director"],
-    ("pmr", "director_approval"): ["finance"],
-    # Delegasi events
-    ("delegasi", "create"): ["director"],
-    ("delegasi", "update"): ["director"],
-    # Flex Time events
-    ("flex", "create"): ["finance"],
-    ("flex", "finance_review"): ["director"],
-    ("flex", "director_approval"): ["finance"],
-    # Mobil events
-    ("mobil", "create"): ["finance"],
-    ("mobil", "update"): ["finance", "director"],
-    ("mobil", "delete"): ["finance"],
-    # Calendar events
-    ("calendar", "add_holiday"): ["director"],
-    # Notulen events
-    ("notulen", "upload"): ["director"],
-    ("notulen", "director_approval"): ["staff", "finance"],  # optional broadcast; uploader akan tetap dapat email jika masuk role
-    # SOP events
-    ("sop", "upload"): ["director"],
-    ("sop", "director_approval"): ["staff", "finance"],
-    # MoU due soon automatic alert
-    ("mou", "due_soon"): ["director", "finance"],
-}
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_config_notif_map() -> dict[tuple[str, str], list[str]]:
-    """Load dynamic notification role mapping from config sheet.
-    Sheet schema: module | action | roles | active | updated_at | updated_by
-    - roles: comma-separated roles, e.g. "finance,director"
-    - active: 1/0 or TRUE/FALSE; only active==1 considered
-    Returns dict with (module, action) => [roles]
-    """
-    mapping: dict[tuple[str, str], list[str]] = {}
-    try:
-        ws = _get_ws(CONFIG_SHEET_NAME)
-        records = ws.get_all_records()
-        for rec in records:
-            try:
-                mod = str(rec.get("module", "")).strip().lower()
-                act = str(rec.get("action", "")).strip().lower()
-                roles_raw = str(rec.get("roles", "")).strip()
-                active_val = str(rec.get("active", "1")).strip().lower()
-                if not mod or not act or not roles_raw:
-                    continue
-                if active_val not in ("1", "true", "yes", "y"):  # treat others as inactive
-                    continue
-                roles_list = [r.strip().lower() for r in roles_raw.split(',') if r.strip()]
-                if not roles_list:
-                    continue
-                mapping[(mod, act)] = roles_list
-            except Exception:
-                continue
-    except Exception:
-        return {}
-    return mapping
-
-def notify_event(module: str, action: str, subject: str, body: str, roles: list[str] | None = None):
-    """Kirim notifikasi email berbasis module & action.
-    - roles: override manual; bila None akan lookup NOTIF_ROLE_MAP.
-    - superuser + ADMIN_EMAIL_RECIPIENT ditambahkan otomatis oleh _notify_roles.
-    - Diam (silent) jika tidak ada peran terpetakan.
-    """
-    try:
-        if roles is not None:
-            target_roles = roles
-        else:
-            # First try dynamic config sheet
-            dyn_map = load_config_notif_map()
-            target_roles = dyn_map.get((module.lower(), action.lower()))
-            if not target_roles:
-                # fallback to static default
-                target_roles = NOTIF_ROLE_MAP.get((module, action), [])
-        if not target_roles or not isinstance(target_roles, list):
-            return
-        _notify_roles(list(set(target_roles)), subject, body)
-    except Exception:
-        pass
-
-def _load_settings_row() -> dict:
-    """Read special settings row from config sheet where module='__settings__'. Returns dict."""
-    try:
-        ws = _get_ws(CONFIG_SHEET_NAME)
-        records = ws.get_all_records()
-        for rec in records:
-            if str(rec.get("module", "")).strip().lower() == "__settings__":
-                return rec
-    except Exception:
-        return {}
-    return {}
-
-@st.cache_data(ttl=60, show_spinner=False)
-def is_superuser_auto_enabled() -> bool:
-    """Check settings to decide whether superuser auto inclusion is active. Default True if not set."""
-    row = _load_settings_row()
-    val = str(row.get("superuser_auto", "1")) if row else "1"
-    return val.strip().lower() in ("1", "true", "yes", "y")
-ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
-# --- Timezone Helpers (WIB GMT+07:00) ---
-WIB_OFFSET = 7  # hours
-WIB_TZ = None
-if ZoneInfo:
-    try:
-        WIB_TZ = ZoneInfo("Asia/Jakarta")
-    except Exception:
-        WIB_TZ = None
-
-# All application timestamps are standardized to WIB (UTC+07:00) via now_wib_dt()/now_wib_iso().
-# IMPORTANT:
-#  - Always call now_wib_iso() for storing a timestamp (avoid direct datetime.utcnow()).
-#  - Historical rows may still contain naive UTC timestamps from before migration; treat
-#    them as legacy if you need to normalize. New writes are WIB localized.
-#  - Microseconds are stripped for consistency and easier filtering/comparison in Sheets.
-#  - If a timestamp stored has no timezone info, we assume it's already WIB.
-
-def now_wib_dt() -> datetime:
-    """Return current datetime in WIB (UTC+7) tz-aware if possible."""
-    if WIB_TZ:
-        return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(WIB_TZ)
-    # Manual offset fallback
-    return datetime.utcnow() + timedelta(hours=WIB_OFFSET)
-
-def now_wib_iso() -> str:
-    dt = now_wib_dt()
-    # Standardize ISO without microseconds for consistency
-    return dt.replace(microsecond=0).isoformat()
-
-def parse_wib(ts: str) -> datetime | None:
-    """Parse ISO timestamp string into a datetime in WIB.
-
-    Behavior:
-      - If ts has TZ info, convert to WIB (Asia/Jakarta if available else fixed offset).
-      - If ts is naive, assume it is already WIB (post-migration convention).
-      - Returns None if parsing fails.
-    """
-    if not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts)
-    except Exception:
-        return None
-    if dt.tzinfo is None:
-        # Assume already WIB
-        if WIB_TZ:
-            return dt.replace(tzinfo=WIB_TZ)
-        return dt  # naive but treated as WIB
-    # Convert to WIB
-    if WIB_TZ:
-        return dt.astimezone(WIB_TZ)
-    # Fallback fixed offset
-    return dt.astimezone(timezone(timedelta(hours=WIB_OFFSET)))
-# Use centered layout on login screen; switch to wide after user logs in.
-_layout_mode = "wide" if st.session_state.get("user") else "centered"
-st.set_page_config(page_title="WIJNA Management System", page_icon=ICON_PATH, layout=_layout_mode)
-
-# --- Compatibility Helpers (Deprecation safe) ---
-def safe_dataframe(df, *, index=True, height=None, key=None, use_container: bool = True, **kwargs):
-    """Wrapper untuk transisi dari use_container_width -> width='stretch'.
-    Param:
-      - use_container: jika True (default) akan pakai width='stretch'.
-      - kwargs lain diteruskan ke st.dataframe.
-    """
-    try:
-        # Bangun argumen dinamis agar tidak mengirim height=None (menyebabkan StreamlitInvalidHeightError di versi baru)
-        df_args = {}
-        if height is not None:
-            df_args['height'] = height
-        if use_container:
-            # Versi baru menerima width='stretch'; jika tidak didukung akan ditangkap oleh except TypeError
-            return st.dataframe(df, width='stretch', hide_index=not index, key=key, **df_args, **kwargs)
-        else:
-            return st.dataframe(df, hide_index=not index, key=key, **df_args, **kwargs)
-    except TypeError:
-        # Versi Streamlit lama belum dukung width argumen baru
-        if height is not None:
-            return st.dataframe(df, height=height, hide_index=not index, key=key, **kwargs)
-        return st.dataframe(df, hide_index=not index, key=key, **kwargs)
-
-def safe_image(image, *, caption=None, clamp=False, channels="RGB", output_format="auto", use_container: bool = True, **kwargs):
-    """Wrapper image untuk hindari width=None invalid di versi baru.
-    - Jika use_container True, kita biarkan Streamlit autosize tanpa mengirim width=None eksplisit.
-    - Jika ada argumen width=None, diabaikan.
-    """
-    if 'width' in kwargs and kwargs['width'] is None:
-        kwargs.pop('width')
-    try:
-        return st.sidebar.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
-    except Exception:
-        try:
-            return st.image(image, caption=caption, clamp=clamp, channels=channels, output_format=output_format, **kwargs)
-        except Exception:
-            pass
-
-# Ensure the browser tab title is exactly as desired on some Streamlit versions that append '• Streamlit'.
-def _enforce_page_title():
-    try:
-        import streamlit.components.v1 as components
-        components.html(
-            "<script>window.parent.document.title = 'WIJNA Management System';</script>",
-            height=0,
-        )
-    except Exception:
-        # Non-blocking; fall back to set_page_config title
-        pass
-
-_enforce_page_title()
-
-
-# --- 2. FUNGSI KONEKSI & AUTENTIKASI ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-@st.cache_resource
-def get_credentials():
-    """Membuat object credentials dari secrets."""
-    creds_dict = st.secrets["connections"]["gsheets"]
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=[
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-    )
-    return creds
-
-@st.cache_resource
-def get_gsheets_client():
-    """Membuat client untuk gspread menggunakan credentials."""
-    creds = get_credentials()
-    client = gspread.authorize(creds)
-    return client
-
-@st.cache_resource
-def get_gdrive_service():
-    """Membuat service untuk Google Drive API menggunakan credentials."""
-    creds = get_credentials()
-    service = build('drive', 'v3', credentials=creds)
-    return service
-
-
-@st.cache_resource
-def get_spreadsheet():
-    """Cache object Spreadsheet untuk menghindari open_by_url berulang."""
-    client = get_gsheets_client()
-    return client.open_by_url(SPREADSHEET_URL)
-
-
-@st.cache_data(ttl=300, show_spinner=False, max_entries=64)
-def _cached_get_all_records(sheet_name: str, expected_headers: list | None = None):
-    """Ambil seluruh records dari sebuah sheet dengan cache dan retry ringan.
-    - ttl 60s untuk mengurangi beban read
-    - expected_headers bila disediakan akan memaksa mapping kolom
-    """
-    ws = get_spreadsheet().worksheet(sheet_name)
-    # Retry ringan untuk 429/5xx
-    for i in range(3):
-        try:
-            if expected_headers is not None:
-                return ws.get_all_records(expected_headers=expected_headers)
-            return ws.get_all_records()
-        except gspread.exceptions.APIError as e:
-            msg = str(e)
-            if any(code in msg for code in ["429", "500", "503"]):
-                time.sleep(1.5 * (i + 1))
-                continue
-            raise
-    # Fallback terakhir tanpa mapping
-    return ws.get_all_records()
-
-
-def _invalidate_data_cache():
-    """Invalidasi cache data sheet (dipanggil setelah operasi tulis)."""
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-
-
-# --- 3. FUNGSI HELPER & UTILITAS ---
-def hash_password(password: str):
-    """Mengubah password plain text menjadi hash."""
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str):
-    """Memverifikasi password dengan hash yang tersimpan."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-def send_notification_email(recipient_email, subject, body):
-    """Mengirim email notifikasi menggunakan kredensial dari st.secrets."""
-    try:
-        creds = st.secrets.get("email_credentials", {})
-        sender_email = (creds.get("username") or "").strip()
-        sender_password = (creds.get("app_password") or "").strip()
-        if not sender_email or not sender_password:
-            st.toast("Konfigurasi email tidak lengkap (username/app_password).")
-            return False
-
-        message = MIMEMultipart()
-        message["From"] = sender_email
-        message["To"] = recipient_email
-        message["Subject"] = subject
-        message.attach(MIMEText(body or "", "plain"))
-
-        # Coba TLS 587 kemudian fallback ke SSL 465 jika gagal
-        for attempt in range(2):
-            try:
-                if attempt == 0:
-                    server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
-                    server.ehlo()
-                    server.starttls()
-                    server.login(sender_email, sender_password)
+    # --- Tab 1: Upload SOP ---
+    with tab_upload:
+        st.subheader("Upload SOP / Kebijakan")
+        with st.form("sop_add", clear_on_submit=True):
+            judul = st.text_input("Judul Kebijakan / SOP")
+            tgl = st.date_input("Tanggal Terbit" if sop_date_col == "tanggal_terbit" else "Tanggal", value=date.today())
+            f = st.file_uploader("Upload File SOP (PDF/DOC)")
+            submit = st.form_submit_button("💾 Simpan")
+            if submit:
+                if not judul or not f:
+                    st.warning("Judul dan file wajib diisi.")
                 else:
-                    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
-                    server.login(sender_email, sender_password)
-                server.send_message(message)
-                server.quit()
-                st.toast(f"📧 Notifikasi email terkirim ke {recipient_email}")
-                return True
-            except Exception as inner_e:
-                if attempt == 1:
-                    raise inner_e
-                # tunggu sebentar lalu coba SSL
-                try:
-                    time.sleep(1.0)
-                except Exception:
-                    pass
-        return False
-    except Exception as e:
-        st.toast(f"Gagal mengirim email: {e}")
-        return False
+                    sid = gen_id("sop")
+                    blob, fname, _ = upload_file_and_store(f)
+                    cols = ["id", "judul", "file_blob", "file_name"]
+                    vals = [sid, judul, blob, fname]
+                    if sop_date_col == "tanggal_terbit":
+                        cols.append("tanggal_terbit"); vals.append(tgl.isoformat())
+                    elif sop_date_col == "tanggal_upload":
+                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                    if "director_approved" in sop_cols:
+                        cols.append("director_approved"); vals.append(0)
+                    for opt in ("memo", "board_note"):
+                        if opt in sop_cols:
+                            cols.append(opt); vals.append("")
+                    placeholders = ", ".join(["?" for _ in cols])
+                    cur.execute(f"INSERT INTO sop ({', '.join(cols)}) VALUES ({placeholders})", vals)
+                    conn.commit()
+                    try:
+                        audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
+                    except Exception:
+                        pass
+                    st.success("SOP berhasil diupload. Menunggu approval Director.")
 
-def send_notification_bulk(recipients: list[str], subject: str, body: str) -> tuple[int, int]:
-    """Kirim email ke banyak penerima dalam satu sesi SMTP untuk performa lebih baik.
-    Return: (jumlah_terkirim, total_penerima)
-    Catatan: Fungsi ini tidak menampilkan toast per penerima untuk menghindari lag.
+    # --- Tab 2: Daftar & Rekap ---
+    with tab_daftar:
+        st.subheader("Daftar SOP")
+        # Build SELECT dinamis
+        cur.execute("PRAGMA table_info(sop)")
+        sop_cols = [row[1] for row in cur.fetchall()]
+        sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
+        select_cols = ["id", "judul"]
+        if sop_date_col: select_cols.append(sop_date_col)
+        if "director_approved" in sop_cols: select_cols.append("director_approved")
+        if "file_name" in sop_cols: select_cols.append("file_name")
+        df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM sop ORDER BY " + (sop_date_col or "id") + " DESC", conn)
+
+        # Filter UI
+        col1, col2, col3 = st.columns([2,2,2])
+        with col1:
+            q = st.text_input("Cari Judul", "")
+        with col2:
+            status_opt = ["Semua", "Approved", "Belum"] if "director_approved" in df.columns else ["Semua"]
+            status_sel = st.selectbox("Status", status_opt)
+        with col3:
+            if sop_date_col and not df.empty:
+                min_d = pd.to_datetime(df[sop_date_col]).min().date()
+                max_d = pd.to_datetime(df[sop_date_col]).max().date()
+                dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
+            else:
+                dr = None
+
+        dff = df.copy()
+        if q:
+            dff = dff[dff["judul"].astype(str).str.contains(q, case=False, na=False)]
+        if status_sel != "Semua" and "director_approved" in dff.columns:
+            dff = dff[dff["director_approved"] == (1 if status_sel == "Approved" else 0)]
+        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and sop_date_col and sop_date_col in dff.columns:
+            s, e = dr
+            dff = dff[(pd.to_datetime(dff[sop_date_col]) >= pd.to_datetime(s)) & (pd.to_datetime(dff[sop_date_col]) <= pd.to_datetime(e))]
+
+        # Tampilan tabel ramah pengguna
+        if not dff.empty:
+            show = dff.copy()
+            if "director_approved" in show.columns:
+                show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
+            cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
+            st.dataframe(show[cols_show], use_container_width=True)
+            # Download CSV
+            st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode("utf-8"), file_name="daftar_sop.csv")
+            # Download file per item (opsional pilih)
+            if "id" in show.columns and "file_name" in show.columns:
+                opsi = {f"{r['judul']} — {r.get(sop_date_col, '')} ({r['file_name'] or '-'})": r['id'] for _, r in show.iterrows()}
+                if opsi:
+                    pilih = st.selectbox("Unduh file SOP", [""] + list(opsi.keys()))
+                    if pilih:
+                        sid = opsi[pilih]
+                        row = pd.read_sql_query("SELECT file_blob, file_name FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
+                        if row["file_blob"] is not None and row["file_name"]:
+                            st.download_button("⬇️ Download File", data=row["file_blob"], file_name=row["file_name"], mime="application/octet-stream")
+        else:
+            st.info("Belum ada SOP.")
+
+        # Rekap Bulanan SOP
+        st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
+        this_month = date.today().strftime("%Y-%m")
+        if not dff.empty and sop_date_col and sop_date_col in dff.columns:
+            df_month = dff[dff[sop_date_col].astype(str).str[:7] == this_month]
+        else:
+            df_month = pd.DataFrame()
+        st.write(f"Total SOP/Kebijakan bulan ini: {len(df_month)}")
+
+    # --- Tab 3: Approval Director ---
+    with tab_approve:
+        if user["role"] not in ["director", "superuser"]:
+            st.info("Hanya Director/Superuser yang dapat meng-approve.")
+        elif "director_approved" not in sop_cols:
+            st.info("Kolom director_approved belum tersedia pada tabel SOP. Approval tidak bisa dilakukan.")
+        else:
+            df_pend = pd.read_sql_query(
+                f"SELECT id, judul" + (f", {sop_date_col}" if sop_date_col else "") + ", file_name FROM sop WHERE director_approved=0 ORDER BY " + (sop_date_col or "id") + " DESC",
+                conn
+            )
+            if df_pend.empty:
+                st.success("Tidak ada item menunggu approval.")
+            else:
+                for _, row in df_pend.iterrows():
+                    title = f"{row['judul']}" + (f" | {row[sop_date_col]}" if sop_date_col and row.get(sop_date_col) else "")
+                    with st.expander(title):
+                        st.write(f"File: {row.get('file_name') or '-'}")
+                        note = st.text_area("Catatan Director (opsional)", key=f"sop_note_{row['id']}")
+                        if st.button("✅ Approve", key=f"sop_approve_{row['id']}"):
+                            if "memo" in sop_cols:
+                                cur.execute("UPDATE sop SET director_approved=1, memo=? WHERE id=?", (note, row['id']))
+                            else:
+                                cur.execute("UPDATE sop SET director_approved=1 WHERE id=?", (row['id'],))
+                            conn.commit()
+                            try:
+                                audit_log("sop", "director_approval", target=row['id'], details=f"note={note}")
+                            except Exception:
+                                pass
+                            st.success("SOP approved.")
+                            st.rerun()
+    # Force create default superuser if not exists (guaranteed on first run)
+    cur.execute("SELECT COUNT(*) as c FROM users")
+    c = cur.fetchone()["c"] if cur.description else 0
+    if c == 0:
+        pw = hash_password("superpassword")
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("superuser@local", "Superuser", "superuser", pw, "active", now))
+        conn.commit()
+    # Surat Masuk
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS surat_masuk (
+        id TEXT PRIMARY KEY,
+        indeks TEXT,
+        nomor TEXT,
+        pengirim TEXT,
+        tanggal TEXT,
+        perihal TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        status TEXT,
+        follow_up TEXT
+    )
+    """)
+    # Surat Keluar
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS surat_keluar (
+        id TEXT PRIMARY KEY,
+        indeks TEXT,
+        nomor TEXT,
+        tanggal TEXT,
+        ditujukan TEXT,
+        perihal TEXT,
+        lampiran_blob BLOB,
+        lampiran_name TEXT,
+        pengirim TEXT,
+        draft_blob BLOB,
+        draft_name TEXT,
+        status TEXT,
+        follow_up TEXT,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        final_blob BLOB,
+        final_name TEXT
+    )
+    """)
+    # MoU
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mou (
+        id TEXT PRIMARY KEY,
+        nomor TEXT,
+        nama TEXT,
+        pihak TEXT,
+        jenis TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        divisi TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        board_note TEXT,
+        board_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        final_blob BLOB,
+        final_name TEXT
+    )
+    """)
+    # Cash Advance
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_advance (
+        id TEXT PRIMARY KEY,
+        divisi TEXT,
+        items_json TEXT,
+        totals REAL,
+        tanggal TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # PMR
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pmr (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        file1_blob BLOB,
+        file1_name TEXT,
+        file2_blob BLOB,
+        file2_name TEXT,
+        bulan TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0,
+        tanggal_submit TEXT
+    )
+    """)
+    # Cuti
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cuti (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        durasi INTEGER,
+        kuota_tahunan INTEGER,
+        cuti_terpakai INTEGER,
+        sisa_kuota INTEGER,
+        status TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # Flex
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS flex (
+        id TEXT PRIMARY KEY,
+        nama TEXT,
+        tanggal TEXT,
+        jam_mulai TEXT,
+        jam_selesai TEXT,
+        finance_note TEXT,
+        finance_approved INTEGER DEFAULT 0,
+        director_note TEXT,
+        director_approved INTEGER DEFAULT 0
+    )
+    """)
+    # Delegasi
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegasi (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        deskripsi TEXT,
+        pic TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        status TEXT,
+        tanggal_update TEXT
+    )
+    """)
+    # Mobil
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mobil (
+        id TEXT PRIMARY KEY,
+        nama_pengguna TEXT,
+        divisi TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        tujuan TEXT,
+        kendaraan TEXT,
+        driver TEXT,
+        status TEXT,
+        finance_note TEXT
+    )
+    """)
+    # Calendar
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS calendar (
+        id TEXT PRIMARY KEY,
+        jenis TEXT,
+        judul TEXT,
+        nama_divisi TEXT,
+        tgl_mulai TEXT,
+        tgl_selesai TEXT,
+        deskripsi TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        is_holiday INTEGER DEFAULT 0,
+        sumber TEXT,
+        ditetapkan_oleh TEXT,
+        tanggal_penetapan TEXT
+    )
+    """)
+    # Public Holidays
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS public_holidays (
+        tahun INTEGER,
+        tanggal TEXT,
+        nama TEXT,
+        keterangan TEXT,
+        ditetapkan_oleh TEXT,
+        tanggal_penetapan TEXT
+    )
+    """)
+    # SOP
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sop (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        tanggal_upload TEXT
+    )
+    """)
+    # Notulen
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS notulen (
+        id TEXT PRIMARY KEY,
+        judul TEXT,
+        file_blob BLOB,
+        file_name TEXT,
+        tanggal_upload TEXT
+    )
+    """)
+    # File Log
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS file_log (
+        id TEXT PRIMARY KEY,
+        modul TEXT,
+        file_name TEXT,
+        versi INTEGER,
+        deleted_by TEXT,
+        tanggal_hapus TEXT,
+        alasan TEXT
+    )
+    """)
+    # Migration: ensure optional columns exist for richer audit
+    try:
+        cur.execute("PRAGMA table_info(file_log)")
+        fl_cols = [row[1] for row in cur.fetchall()]
+        # add uploaded_by
+        if "uploaded_by" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
+        # add tanggal_upload
+        if "tanggal_upload" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
+        # add action
+        if "action" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+DB_PATH = "office_ops.db"
+SALT = "office_ops_salt_v1"
+
+# -------------------------
+# Firebase / Firestore Toggle & Initialization
+# -------------------------
+# To activate Firestore backend set environment variable USE_FIREBASE=1 (recommended)
+# or change the default below to True. When enabled, selected data operations
+# (initially: users, file_log, sop, notulen) will use Firestore collections instead of SQLite tables.
+# Gradually extend MIGRATED_COLLECTIONS to cover remaining modules.
+import os as _os
+USE_FIREBASE: bool = _os.environ.get("USE_FIREBASE", "0") == "1"
+FIREBASE_CONFIG_PATH = _os.path.join(_os.path.dirname(__file__), "firebase_config.json")
+
+FIRESTORE_CLIENT = None
+try:
+    if USE_FIREBASE:
+        import firebase_admin  # type: ignore
+        from firebase_admin import credentials, firestore  # type: ignore
+        if not firebase_admin._apps:  # initialize only once
+            if not _os.path.exists(FIREBASE_CONFIG_PATH):
+                raise FileNotFoundError(f"firebase_config.json tidak ditemukan di {FIREBASE_CONFIG_PATH}")
+            _cred = credentials.Certificate(FIREBASE_CONFIG_PATH)
+            firebase_admin.initialize_app(_cred)
+        FIRESTORE_CLIENT = firestore.client()
+        # Mapping of logical table names -> Firestore collection names
+        MIGRATED_COLLECTIONS = {
+            "users": "users",
+            "file_log": "file_log",
+            "sop": "sop",
+              "notulen": "notulen",
+              "inventory": "inventory",
+              "surat_masuk": "surat_masuk",
+              "surat_keluar": "surat_keluar",
+              "mou": "mou"
+        }
+    else:
+        MIGRATED_COLLECTIONS = {}
+except Exception as _fb_init_exc:
+    # Fallback to SQLite if initialization fails
+    USE_FIREBASE = False
+    MIGRATED_COLLECTIONS = {}
+    st.sidebar.warning(f"Firebase init gagal: {_fb_init_exc}. Menggunakan SQLite.")
+
+def firestore_collection(name: str):
+    if not FIRESTORE_CLIENT:
+        raise RuntimeError("Firestore client belum diinisialisasi")
+    return FIRESTORE_CLIENT.collection(name)
+
+def fs_get_document(collection: str, doc_id: str):
+    doc_ref = firestore_collection(collection).document(doc_id).get()
+    return doc_ref.to_dict() if doc_ref.exists else None
+
+def fs_set_document(collection: str, doc_id: str, data: dict, merge: bool = True):
+    firestore_collection(collection).document(doc_id).set(data, merge=merge)
+
+def fs_query(collection: str, filters: list[tuple] | None = None):
+    col_ref = firestore_collection(collection)
+    q = col_ref
+    if filters:
+        # filters: list of (field, op, value)
+        for field, op, value in filters:
+            q = q.where(field, op, value)
+    return [d.to_dict() | {"id": d.id} for d in q.stream()]
+
+def fs_upsert(collection: str, data: dict, id_field: str = "id"):
+    doc_id = data.get(id_field)
+    if not doc_id:
+        raise ValueError("Data harus memiliki field 'id' untuk upsert Firestore")
+    fs_set_document(collection, doc_id, data, merge=True)
+    return doc_id
+
+def fs_add(collection: str, data: dict):
+    ref = firestore_collection(collection).document()
+    data["id"] = ref.id
+    ref.set(data)
+    return data["id"]
+
+def fs_delete(collection: str, doc_id: str):
+    firestore_collection(collection).document(doc_id).delete()
+
+def using_firestore(table_name: str) -> bool:
+    return USE_FIREBASE and table_name in MIGRATED_COLLECTIONS
+
+# ---- Generic Firestore helpers for list/create/update with ordering & basic filters ----
+def fs_list(collection: str, filters: list | None = None, order_by: list | None = None, limit: int | None = None):
+    col = firestore_collection(collection)
+    q = col
+    if filters:
+        for f in filters:
+            if len(f) == 3:
+                field, op, val = f
+                q = q.where(field, op, val)
+    if order_by:
+        for ob in order_by:
+            if isinstance(ob, (list, tuple)) and len(ob) >= 1:
+                field = ob[0]
+                direction = ob[1] if len(ob) > 1 else firestore.Query.DESCENDING  # type: ignore
+                q = q.order_by(field, direction=direction)  # type: ignore
+            else:
+                q = q.order_by(ob)  # type: ignore
+    if limit:
+        q = q.limit(limit)
+    return [d.to_dict() | {"id": d.id} for d in q.stream()]
+
+def fs_create(collection: str, data: dict, custom_id: str | None = None):
+    if custom_id:
+        firestore_collection(collection).document(custom_id).set(data, merge=False)
+        return custom_id
+    ref = firestore_collection(collection).document()
+    data["id"] = ref.id
+    ref.set(data, merge=False)
+    return data["id"]
+
+def fs_update(collection: str, doc_id: str, data: dict):
+    firestore_collection(collection).document(doc_id).set(data, merge=True)
+
+def fs_filter_month(items: list[dict], date_field: str, year_month: str):
+    out = []
+    for it in items:
+        v = it.get(date_field)
+        if isinstance(v, str) and v[:7] == year_month:
+            out.append(it)
+    return out
+
+# --- Password hashing utility ---
+def hash_password(password: str) -> str:
+    import hashlib
+    salted = (password + SALT).encode('utf-8')
+    return hashlib.sha256(salted).hexdigest()
+
+icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+st.set_page_config(page_title="WIJNA Manajemen System", page_icon=icon_path, layout="wide")
+# --- Global CSS for modern look ---
+st.markdown(
     """
+    <style>
+    .main .block-container {padding-top: 2rem;}
+    .stButton>button, .stDownloadButton>button {
+        background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+        color: white; border: none; border-radius: 6px; font-weight: 600;
+        box-shadow: 0 2px 8px rgba(80,140,255,0.08);
+        margin-bottom: 6px;
+    }
+    .stButton>button:hover, .stDownloadButton>button:hover {
+        background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
+        color: #fff;
+    }
+    .stDataFrame, .stTable {background: #f8fbff; border-radius: 8px;}
+    .stExpanderHeader {font-weight: 700; color: #2a5d9f;}
+    .stTextInput>div>input, .stTextArea>div>textarea {
+        border-radius: 6px; border: 1px solid #b3d1ff;
+    }
+    .stFileUploader>div>div {background: #eaf4ff; border-radius: 6px;}
+    .stMetric {background: #eaf4ff; border-radius: 8px;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# Pastikan pemanggilan st.markdown(table_html, unsafe_allow_html=True) dilakukan di bagian yang tepat pada kode Daftar Inventaris
+
+# -------------------------
+# Utilities
+# -------------------------
+# --- Database connection utility --- 
+def format_datetime_wib(dtstr):
     try:
-        # Normalisasi dan dedupe
-        recipients = sorted({(e or "").strip() for e in recipients if (e or "").strip()})
-        total = len(recipients)
-        if total == 0:
-            return 0, 0
-
-        creds = st.secrets.get("email_credentials", {})
-        sender_email = (creds.get("username") or "").strip()
-        sender_password = (creds.get("app_password") or "").strip()
-        if not sender_email or not sender_password:
-            return 0, total
-
-        def build_msg(to_addr: str):
-            msg = MIMEMultipart()
-            msg["From"] = sender_email
-            msg["To"] = to_addr or "Undisclosed recipients"
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body or "", "plain"))
-            return msg
-
-        sent = 0
-        # 1) Coba TLS 587 dahulu
-        try:
-            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
-            try:
-                server.ehlo()
-                server.starttls()
-                server.login(sender_email, sender_password)
-                for rcpt in recipients:
-                    try:
-                        server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
-                        sent += 1
-                    except Exception:
-                        # lanjut ke penerima berikutnya
-                        pass
-            finally:
-                try:
-                    server.quit()
-                except Exception:
-                    pass
-            return sent, total
-        except Exception:
-            # 2) Fallback SSL 465
-            try:
-                server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
-                try:
-                    server.login(sender_email, sender_password)
-                    for rcpt in recipients:
-                        try:
-                            server.sendmail(sender_email, [rcpt], build_msg(rcpt).as_string())
-                            sent += 1
-                        except Exception:
-                            pass
-                finally:
-                    try:
-                        server.quit()
-                    except Exception:
-                        pass
-                return sent, total
-            except Exception:
-                return 0, total
+        dt_utc = datetime.fromisoformat(dtstr)
+        dt_wib = dt_utc + timedelta(hours=7)
+        return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
     except Exception:
-        return 0, 0
-
-def _send_async(func, *args, **kwargs):
-    """Jalankan fungsi di background thread agar UI tidak menunggu I/O jaringan."""
-    try:
-        t = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
-        t.start()
-    except Exception:
+        return dtstr
+class _AuditCursor:
+    def __init__(self, outer_conn, inner_cursor):
+        self._outer_conn = outer_conn
+        self._c = inner_cursor
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+    def execute(self, sql, params=()):
+        result = self._c.execute(sql, params)
         try:
-            func(*args, **kwargs)
+            self._maybe_log(sql, params)
         except Exception:
             pass
-
-def initialize_users_sheet():
-    """Memastikan sheet 'users' ada dan berisi user default 'admin'."""
-    try:
-        client = get_gsheets_client()
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
-        
+        return result
+    def executemany(self, sql, seq_of_params):
+        result = self._c.executemany(sql, seq_of_params)
         try:
-            worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
-            df = pd.DataFrame(worksheet.get_all_records())
-        except gspread.WorksheetNotFound:
-            st.info(f"Sheet '{USERS_SHEET_NAME}' tidak ditemukan. Membuat sheet baru...")
-            worksheet = spreadsheet.add_worksheet(title=USERS_SHEET_NAME, rows="100", cols="2")
-            headers = ["username", "password_hash"]
-            worksheet.append_row(headers)
-            st.success(f"Sheet '{USERS_SHEET_NAME}' berhasil dibuat.")
-            df = pd.DataFrame(columns=headers)
+            for p in seq_of_params:
+                self._maybe_log(sql, p)
+        except Exception:
+            pass
+        return result
+    def _maybe_log(self, sql, params):
+        # Guard or non-DML: skip
+        if st.session_state.get("__audit_disabled"):
+            return
+        sql_l = (sql or "").strip().lower()
+        op = None
+        table = None
+        target_id = None
+        if sql_l.startswith("insert into"):
+            op = "create"
+            try:
+                # parse table and col list
+                after_into = sql_l.split("insert into",1)[1].strip()
+                table = after_into.split("(",1)[0].strip().split()[0]
+                if "(" in after_into:
+                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
+                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
+                    if "id" in cols:
+                        idx = cols.index("id")
+                        if isinstance(params, (list, tuple)) and len(params) > idx:
+                            target_id = params[idx]
+            except Exception:
+                pass
+        elif sql_l.startswith("update"):
+            op = "update"
+            try:
+                table = sql_l.split()[1]
+                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
+                    # assume last param is id
+                    if isinstance(params, (list, tuple)) and len(params) >= 1:
+                        target_id = params[-1]
+            except Exception:
+                pass
+        elif sql_l.startswith("delete from"):
+            op = "delete"
+            try:
+                table = sql_l.split()[2]
+                # assume last param is id
+                if isinstance(params, (list, tuple)) and len(params) >= 1:
+                    target_id = params[-1]
+            except Exception:
+                pass
+        # Only log DML and skip logging file_log table itself
+        if op and table and table != "file_log":
+            try:
+                audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
+            except Exception:
+                pass
 
-        if df.empty or 'admin' not in df['username'].values:
-            st.info("User default 'admin' tidak ditemukan. Membuat user...")
-            hashed_admin_pass = hash_password('admin')
-            worksheet.append_row(['admin', hashed_admin_pass])
-            st.success("User default 'admin' dengan password 'admin' berhasil ditambahkan.")
-    except Exception as e:
-        st.error(f"Gagal inisialisasi Google Sheet: {e}")
+class _AuditConnection:
+    def __init__(self, inner_conn: sqlite3.Connection):
+        self._conn = inner_conn
+        self.row_factory = inner_conn.row_factory
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+    def cursor(self, *args, **kwargs):
+        return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
 
-
-def ensure_sheet_with_headers(spreadsheet, title: str, headers: list[str]):
-    """Ensure a worksheet exists and its header row is valid and unique.
-    - If worksheet doesn't exist: create it and set exact headers.
-    - If header row is empty or contains duplicates/whitespace variants: replace with canonical headers.
-    - If some required headers are missing: append them to the end (keeping existing columns).
+def get_db() -> sqlite3.Connection:
+    db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    # If audit is disabled (e.g., during migrations or within audit_log), return raw connection
+    if st.session_state.get("__audit_disabled"):
+        return conn
+    return _AuditConnection(conn)
+def ensure_db():
+    """Ensure minimum required tables/columns exist so modules load safely (SQLite mode).
+    In Firestore mode we only verify connectivity and return early.
     """
-    try:
-        ws = spreadsheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(max(10, len(headers) + 2)))
-        ws.update("A1", [headers])
-        return ws
-
-    # Ensure headers present and unique
-    try:
-        current = ws.row_values(1)
-        if not current:
-            ws.update("A1", [headers])
-            return ws
-
-        # Normalize for duplicate detection
-        curr_norm = [str(h).strip() for h in current]
-        has_duplicates = len(curr_norm) != len(set(curr_norm))
-
-        if has_duplicates:
-            # If duplicates exist (e.g., ['active', 'active']), reset to canonical headers
-            ws.update("A1", [headers])
-            return ws
-
-        # Append any missing required headers (avoid case/whitespace issues)
-        present = set(curr_norm)
-        missing = [h for h in headers if h.strip() not in present]
-        if missing:
-            new_headers = curr_norm + missing
-            ws.update("A1", [new_headers])
-        return ws
-    except Exception:
-        # If header fetch fails for any reason, set headers
-        ws.update("A1", [headers])
-        return ws
-
-
-def ensure_core_sheets():
-    """Initialize required worksheets once; minimize reads to avoid quotas."""
-    if st.session_state.get("_core_sheets_ok"):
+    if USE_FIREBASE:
+        try:
+            # simple ping by listing a known collection (users)
+            firestore_collection(MIGRATED_COLLECTIONS.get("users", "users"))
+        except Exception as e:
+            st.sidebar.error(f"Firebase tidak siap: {e}")
         return
     try:
-        spreadsheet = get_spreadsheet()
-
-        # Users sheet: create or validate headers only (no full read)
-        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
-        users_ws = ensure_sheet_with_headers(spreadsheet, USERS_SHEET_NAME, users_headers)
-
-        # Lightweight check for at least one data row; only read a tiny range
-        try:
-            data_row2 = users_ws.row_values(2)
-        except Exception:
-            data_row2 = []
-        if not data_row2:
-            # Append a default superuser only if sheet is empty
-            for i in range(3):
-                try:
-                    users_ws.append_row(["admin@local", hash_password("admin"), "Admin", "superuser", now_wib_iso(), 1])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.2 * (i + 1))
-                        continue
-                    raise
-
-        # Cuti sheet
-        cuti_headers = [
-            "id", "nama", "tgl_mulai", "tgl_selesai", "durasi",
-            "kuota_tahunan", "cuti_terpakai", "sisa_kuota", "status",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "alasan", "created_at"
-        ]
-        ensure_sheet_with_headers(spreadsheet, CUTI_SHEET_NAME, cuti_headers)
-
-        # Audit log sheet
-        audit_headers = ["timestamp", "actor", "module", "action", "target", "details"]
-        ensure_sheet_with_headers(spreadsheet, AUDIT_SHEET_NAME, audit_headers)
-
-        # Inventory sheet
-        inv_headers = [
-            "id", "name", "location", "status", "pic", "updated_at",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "file_id", "file_name", "file_link", "loan_info"
-        ]
-        ensure_sheet_with_headers(spreadsheet, INVENTORY_SHEET_NAME, inv_headers)
-
-        # Surat Masuk sheet
-        sm_headers = [
-            "id", "nomor", "tanggal", "pengirim", "perihal",
-            "file_id", "file_name", "file_link",
-            "status", "follow_up",
-            "director_approved", "rekap",
-            "created_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, sm_headers)
-
-        # Surat Keluar sheet
-        sk_headers = [
-            "id", "nomor", "tanggal", "ditujukan", "perihal", "pengirim",
-            "status", "follow_up", "director_note", "director_approved",
-            "draft_file_id", "draft_name", "draft_link",
-            "final_file_id", "final_name", "final_link",
-            "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, sk_headers)
-
-        # Config sheet for dynamic notification mappings
-        config_headers = ["module", "action", "roles", "active", "updated_at", "updated_by"]
-        ensure_sheet_with_headers(spreadsheet, CONFIG_SHEET_NAME, config_headers)
-
-        # MoU sheet
-        mou_headers = [
-            "id", "nomor", "nama", "pihak", "jenis",
-            "tgl_mulai", "tgl_selesai",
-            "draft_file_id", "draft_file_name", "draft_file_link",
-            "board_note", "board_approved",
-            "final_file_id", "final_file_name", "final_file_link",
-            "due_notified",  # flag otomatis notifikasi jatuh tempo (<=7 hari)
-            "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
-
-        # Cash Advance sheet
-        ca_headers = [
-            "id", "divisi", "items_json", "totals", "tanggal",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, CASH_ADVANCE_SHEET_NAME, ca_headers)
-
-        # PMR sheet
-        pmr_headers = [
-            "id", "nama", "bulan", "file1_id", "file1_name", "file2_id", "file2_name",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "tanggal_submit", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, PMR_SHEET_NAME, pmr_headers)
-
-        # Delegasi sheet
-        delegasi_headers = [
-            "id", "judul", "deskripsi", "pic", "tgl_mulai", "tgl_selesai",
-            "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, DELEGASI_SHEET_NAME, delegasi_headers)
-
-        # Flex sheet
-        flex_headers = [
-            "id", "nama", "tanggal", "jam_mulai", "jam_selesai", "alasan",
-            "catatan_finance", "approval_finance", "catatan_director", "approval_director",
-            "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, FLEX_SHEET_NAME, flex_headers)
-
-        # Mobil Kantor sheet
-        mobil_headers = [
-            "id", "nama_pengguna", "divisi", "tgl_mulai", "tgl_selesai", "tujuan",
-            "kendaraan", "driver", "status", "finance_note",
-            "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, MOBIL_SHEET_NAME, mobil_headers)
-
-        # Calendar (generic events) sheet
-        calendar_headers = [
-            "id", "jenis", "judul", "nama_divisi", "tgl_mulai", "tgl_selesai",
-            "deskripsi", "file_id", "file_name", "file_link",
-            "is_holiday", "sumber", "ditetapkan_oleh", "tanggal_penetapan", "created_at", "updated_at", "submitted_by"
-        ]
-        ensure_sheet_with_headers(spreadsheet, CALENDAR_SHEET_NAME, calendar_headers)
-
-        # Public holidays (normalized) sheet
-        public_holidays_headers = [
-            "tahun", "tanggal", "nama", "keterangan", "ditetapkan_oleh", "tanggal_penetapan"
-        ]
-        ensure_sheet_with_headers(spreadsheet, PUBLIC_HOLIDAYS_SHEET_NAME, public_holidays_headers)
-
-        # Notulen sheet (meeting minutes) - flexible columns to align with reference
-        notulen_headers = [
-            "id", "judul", "kategori", "divisi", "tanggal_rapat", "tanggal_upload", "file_id", "file_name", "file_link",
-            "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
-        ]
-        ensure_sheet_with_headers(spreadsheet, NOTULEN_SHEET_NAME, notulen_headers)
-
-        # SOP sheet (policies & procedures)
-        sop_headers = [
-            "id", "judul", "tanggal_terbit", "tanggal_upload", "file_id", "file_name", "file_link",
-            "memo", "board_note", "director_approved", "uploaded_by", "created_at", "updated_at"
-        ]
-        ensure_sheet_with_headers(spreadsheet, SOP_SHEET_NAME, sop_headers)
-
-        st.session_state["_core_sheets_ok"] = True
-    except Exception as e:
-        st.error(f"Gagal memastikan sheet inti tersedia: {e}")
-
-
-# --- 4. MANAJEMEN SESSION STATE ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'username' not in st.session_state:
-    st.session_state.username = ""
-if 'user' not in st.session_state:
-    st.session_state.user = None
-
-
-# --- 5. TAMPILAN HALAMAN (UI) ---
-def show_login_page():
-    """Menampilkan halaman login dan registrasi."""
-    st.header("🔐 Secure App Login")
+        conn = get_db(); cur = conn.cursor()
+        # Users
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+                email TEXT UNIQUE NOT NULL,
+                full_name TEXT,
+                role TEXT,
+                password_hash TEXT,
+                status TEXT,
+                created_at TEXT,
+                last_login TEXT
+            )
+            """
+        )
+        # Minimal tables required by remaining SQLite modules
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS surat_masuk (
+                id TEXT PRIMARY KEY,
+                nomor TEXT,
+                tanggal TEXT,
+                pengirim TEXT,
+                perihal TEXT,
+                file_blob BLOB,
+                file_name TEXT,
+                status TEXT,
+                follow_up TEXT,
+                director_approved INTEGER DEFAULT 0,
+                rekap INTEGER DEFAULT 0
+            )"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS file_log (
+                id TEXT PRIMARY KEY,
+                modul TEXT,
+                file_name TEXT,
+                versi INTEGER,
+                deleted_by TEXT,
+                tanggal_hapus TEXT,
+                alasan TEXT
+            )"""
+        )
+        # optional audit extension columns
+        cur.execute("PRAGMA table_info(file_log)")
+        fl_cols = {row[1] for row in cur.fetchall()}
+        if "uploaded_by" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN uploaded_by TEXT")
+        if "tanggal_upload" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
+        if "action" not in fl_cols:
+            cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
+        conn.commit()
+    except Exception:
+        pass
+def log_file_delete(modul, file_name, deleted_by, alasan=None):
+    conn = get_db()
+    cur = conn.cursor()
+    log_id = gen_id("log")
+    now = datetime.utcnow().isoformat()
+    cur.execute("INSERT INTO file_log (id, modul, file_name, versi, deleted_by, tanggal_hapus, alasan) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (log_id, modul, file_name, 1, deleted_by, now, alasan or ""))
+    conn.commit()
     
-    with st.sidebar:
-        st.subheader("Pilih Aksi")
-        action = st.radio(" ", ["Login", "Register"])
-
+def audit_log(modul: str, action: str, target=None, details=None, actor=None):
+    """Write an audit log entry to file_log.
+    - modul: name of module (e.g., 'auth', 'cuti', 'delegasi')
+    - action: verb (e.g., 'login', 'logout', 'create', 'update', 'delete', 'approve', 'review')
+    - target: entity id/name being acted on
+    - details: optional human-readable info
+    - actor: email/name of actor; defaults to current user's email if available
+    """
     try:
-        client = get_gsheets_client()
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
-        worksheet = spreadsheet.worksheet(USERS_SHEET_NAME)
-    except Exception as e:
-        st.error(f"Tidak dapat terhubung ke Google Sheet. Pastikan file dibagikan dan URL benar. Error: {e}")
-        st.stop()
-
-    if action == "Login":
-        st.subheader("Login")
-        with st.form("login_form"):
-            username = st.text_input("Username").lower()
-            password = st.text_input("Password", type="password")
-            login_button = st.form_submit_button("Login")
-
-            if login_button:
-                if not username or not password:
-                    st.warning("Username dan Password tidak boleh kosong.")
-                    return
-
-                users_df = pd.DataFrame(worksheet.get_all_records())
-                user_data = users_df[users_df["username"] == username]
-
-                if not user_data.empty:
-                    stored_hash = user_data.iloc[0]["password_hash"]
-                    if verify_password(password, stored_hash):
-                        
-                        # Kirim notifikasi ke seluruh SUPERUSER saat LOGIN
-                        email_subject = "Notifikasi: User Login"
-                        email_body = f"User '{username}' telah berhasil LOGIN ke aplikasi Anda."
-                        try:
-                            notify_event("auth", "login", email_subject, email_body)
-                        except Exception:
-                            pass
-                        
-                        st.session_state.logged_in = True
-                        st.session_state.username = username
-                        st.rerun()
-                    else:
-                        st.error("Username atau Password salah.")
-                else:
-                    st.error("Username atau Password salah.")
-
-    elif action == "Register":
-        st.subheader("Buat Akun Baru")
-        with st.form("register_form"):
-            new_username = st.text_input("Username Baru").lower()
-            new_password = st.text_input("Password Baru", type="password")
-            confirm_password = st.text_input("Konfirmasi Password", type="password")
-            register_button = st.form_submit_button("Register")
-
-            if register_button:
-                if not new_username or not new_password or not confirm_password:
-                    st.warning("Semua field harus diisi.")
-                    return
-                if new_password != confirm_password:
-                    st.error("Password tidak cocok.")
-                    return
-                
-                users_df = pd.DataFrame(worksheet.get_all_records())
-                if new_username in users_df["username"].values:
-                    st.error("Username sudah terdaftar. Silakan pilih yang lain.")
-                else:
-                    hashed_pass = hash_password(new_password)
-                    worksheet.append_row([new_username, hashed_pass])
-                    st.success("Registrasi berhasil! Silakan login.")
-
-                    # Kirim notifikasi ke seluruh SUPERUSER saat REGISTRASI
-                    email_subject = "Notifikasi: User Baru Telah Mendaftar"
-                    email_body = f"User baru dengan username '{new_username}' telah berhasil mendaftar di aplikasi Anda."
-                    try:
-                        notify_event("users", "register", email_subject, email_body)
-                    except Exception:
-                        pass
-
-def show_main_app():
-    """Menampilkan aplikasi utama setelah user berhasil login."""
-    st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
-    if st.sidebar.button("Logout"):
-        
-        # Kirim notifikasi ke seluruh SUPERUSER saat LOGOUT
-        email_subject = "Notifikasi: User Logout"
-        email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
+        # prevent recursive logging
+        st.session_state["__audit_disabled"] = True
+        db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
+        conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+        cur = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        # Resolve actor from session if not provided
+        if not actor:
+            u = st.session_state.get("user")
+            actor = (u.get("email") or u.get("full_name")) if u else "-"
+        # Check available columns
+        cur.execute("PRAGMA table_info(file_log)")
+        cols = {row[1] for row in cur.fetchall()}
+        # Build insert dynamically
+        data = {
+            "id": gen_id("log"),
+            "modul": modul,
+            "file_name": target or "",
+            "versi": 1,
+            "uploaded_by": actor,
+            "tanggal_upload": now,
+            "alasan": (details or ""),
+            "action": action,
+        }
+        insert_cols = [c for c in ["id","modul","file_name","versi",
+                                    "uploaded_by" if "uploaded_by" in cols else None,
+                                    "tanggal_upload" if "tanggal_upload" in cols else None,
+                                    "alasan",
+                                    "action" if "action" in cols else None] if c]
+        placeholders = ", ".join(["?" for _ in insert_cols])
+        cur.execute(f"INSERT INTO file_log ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                    [data[c] for c in insert_cols])
+        conn.commit()
+    except Exception:
+        pass
+    finally:
         try:
-            notify_event("auth", "logout", email_subject, email_body)
+            del st.session_state["__audit_disabled"]
         except Exception:
             pass
-        
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-        st.rerun()
 
-    st.title("📂 File Management with Google Drive")
 
-    st.header("⬆️ Upload File Baru")
-    uploaded_file = st.file_uploader("Pilih file untuk diupload ke Google Drive", type=None)
-    
-    if uploaded_file is not None:
-        if st.button(f"Upload '{uploaded_file.name}'"):
-            with st.spinner("Mengupload file..."):
-                try:
-                    drive_service = get_gdrive_service()
-                    file_metadata = {'name': uploaded_file.name, 'parents': [GDRIVE_FOLDER_ID]}
-                    file_buffer = io.BytesIO(uploaded_file.getvalue())
-                    media = MediaIoBaseUpload(file_buffer, mimetype=uploaded_file.type, resumable=True)
-                    
-                    file = drive_service.files().create(
-                        body=file_metadata,
-                        media_body=media,
-                        fields='id',
-                        supportsAllDrives=True
-                    ).execute()
-                    st.success(f"✅ File '{uploaded_file.name}' berhasil diupload!")
-                    try:
-                        audit_log("drive", "upload", target=file.get('id', ''), details=f"name={uploaded_file.name}; type={uploaded_file.type}")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    st.error(f"Gagal mengupload file: {e}")
+def to_blob(file_bytes: bytes) -> bytes:
+    # store base64 bytes (text) to BLOB, so we keep as bytes
+    return base64.b64encode(file_bytes)
 
-    st.header("📋 Daftar File di Drive")
-    if st.button("Refresh Daftar File"):
-        # force cache clear
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        st.rerun()
-        
+def from_blob(blob: bytes) -> bytes:
+    if blob is None:
+        return None
     try:
-        @st.cache_data(ttl=60, show_spinner=False)
-        def _list_drive_files(folder_id: str):
-            service = get_gdrive_service()
-            query = f"'{folder_id}' in parents and trashed=false"
-            for i in range(3):
-                try:
-                    results = service.files().list(
-                        q=query,
-                        pageSize=100,
-                        fields="nextPageToken, files(id, name)",
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True
-                    ).execute()
-                    return results.get('files', [])
-                except Exception as e:
-                    if any(code in str(e) for code in ["429", "500", "503"]):
-                        time.sleep(1.2 * (i + 1))
-                        continue
-                    raise
-            return []
-        with st.spinner("Memuat daftar file dari Google Drive..."):
-            items = _list_drive_files(GDRIVE_FOLDER_ID)
+        return base64.b64decode(blob)
+    except Exception:
+        return blob
 
-        if not items:
-            st.info("📂 Folder ini masih kosong atau ID salah/belum di-share.")
-        else:
-            st.write(f"Ditemukan {len(items)} file:")
-            for item in items:
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.write(f"📄 **{item['name']}**")
-                with col2:
-                    def download_file_from_drive(file_id):
-                        service = get_gdrive_service()
-                        for i in range(3):
-                            try:
-                                request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                                fh = io.BytesIO()
-                                fh.write(request.execute())
-                                fh.seek(0)
-                                return fh.getvalue()
-                            except Exception as e:
-                                if any(code in str(e) for code in ["429", "500", "503"]):
-                                    time.sleep(1.0 * (i + 1))
-                                    continue
-                                raise
-                        return b""
+def gen_id(prefix="id"):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
-                    file_data = download_file_from_drive(item['id'])
-                    st.download_button(
-                        label="Download",
-                        data=file_data,
-                        file_name=item['name'],
-                        key=f"dl_{item['id']}"
-                    )
-    except Exception as e:
-        st.error(f"Gagal memuat daftar file: {e}")
+# -------------------------
+# Auth & Session
+# -------------------------
+def register_user(email, full_name, password):
+    pw = hash_password(password)
+    now = datetime.utcnow().isoformat()
+    # Firestore path
+    if using_firestore("users"):
+        existing = fs_query("users", [("email", "==", email.lower())])
+        if existing:
+            return False, "Email sudah terdaftar (Firestore)."
+        user_id = gen_id("usr")
+        data = {
+            "id": user_id,
+            "email": email.lower(),
+            "full_name": full_name,
+            "role": "staff",  # align with existing default then pending status separate
+            "password_hash": pw,
+            "status": "pending",
+            "created_at": now,
+            "last_login": None,
+        }
+        fs_set_document("users", user_id, data)
+        audit_log("auth", "register", target=user_id, details="Register (Firestore)")
+        return True, "Registered (Firestore) — menunggu approval superuser."
+    # SQLite fallback
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (email, full_name, "staff", pw, "pending", now))
+        conn.commit()
+        return True, "Registered — menunggu approval superuser."
+    except sqlite3.IntegrityError:
+        return False, "Email sudah terdaftar."
 
+def login_user(email, password):
+    now = datetime.utcnow().isoformat()
+    if using_firestore("users"):
+        matches = fs_query("users", [("email", "==", email.lower())])
+        if not matches:
+            alasan = "User tidak ditemukan (Firestore)."
+            audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+            return False, alasan
+        user_doc = matches[0]
+        if user_doc.get("status") != "active":
+            alasan = f"User status: {user_doc.get('status')} — belum aktif."
+            audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+            return False, alasan
+        if user_doc.get("password_hash") != hash_password(password):
+            alasan = "Password salah."
+            audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+            return False, alasan
+        st.session_state["user"] = {
+            "id": user_doc.get("id"),
+            "email": user_doc.get("email"),
+            "role": user_doc.get("role"),
+            "full_name": user_doc.get("full_name"),
+            "status": user_doc.get("status"),
+        }
+        fs_set_document("users", user_doc.get("id"), {"last_login": now}, merge=True)
+        audit_log("auth", "login", target=email, details="Login sukses (Firestore)", actor=email)
+        return True, "Login sukses."
+    # SQLite fallback
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
+    if not row:
+        alasan = "User tidak ditemukan."
+        audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+        return False, alasan
+    if row["status"] != "active":
+        alasan = f"User status: {row['status']}. Tidak bisa login."
+        audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+        return False, alasan
+    if row["password_hash"] == hash_password(password):
+        st.session_state["user"] = {"id": row["id"], "email": row["email"], "role": row["role"], "full_name": row["full_name"]}
+        cur.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
+        audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
+        conn.commit()
+        return True, "Login sukses."
+    alasan = "Password salah."
+    audit_log("auth", "login_failed", target=email, details=alasan, actor=email)
+    return False, alasan
 
-# --- 6. LOGIKA UTAMA APLIKASI ---
-
-
-
+def logout():
+    # capture actor before clearing session
+    actor_email = None
+    if "user" in st.session_state and st.session_state["user"]:
+        actor_email = st.session_state["user"].get("email") or st.session_state["user"].get("full_name")
+    audit_log("auth", "logout", target=actor_email or "-", details="Logout", actor=actor_email)
+    for k in ("user",):
+        if k in st.session_state:
+            del st.session_state[k]
 
 def get_current_user():
     return st.session_state.get("user")
 
-
-def set_current_user(user_obj):
-    st.session_state.user = user_obj
-
-
-def logout():
-    user = get_current_user()
-    if user:
-        try:
-            notify_event("auth", "logout", "Notifikasi: User Logout", f"User '{user.get('email')}' telah LOGOUT dari aplikasi Anda.")
-        except Exception:
-            pass
-        # Audit logout event
-        try:
-            audit_log("auth", "logout", target=user.get("email", ""))
-        except Exception:
-            pass
-    st.session_state.user = None
-    st.session_state.logged_in = False
-    st.session_state.username = ""
-
-
-def _load_users_df():
-    spreadsheet = get_spreadsheet()
-    ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-    users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
-    try:
-        records = _cached_get_all_records(USERS_SHEET_NAME, users_headers)
-    except Exception:
-        records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    return ws, df
-
-
-def login_user(email: str, password: str):
-    try:
-        ws, df = _load_users_df()
-        email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
-        if email_col is None:
-            return False, "Sheet users tidak memiliki kolom email/username."
-        row = df[df[email_col].astype(str).str.lower() == email.lower()]
-        if row.empty:
-            return False, "Email/Username tidak ditemukan."
-        hashed = row.iloc[0].get("password_hash")
-        if not hashed:
-            return False, "Akun tidak memiliki password. Hubungi admin."
-        if not verify_password(password, hashed):
-            return False, "Password salah."
-        # Build user object
-        user_obj = {
-            "email": row.iloc[0].get("email", row.iloc[0].get("username")),
-            "full_name": row.iloc[0].get("full_name", ""),
-            "role": str(row.iloc[0].get("role", "user")).lower() or "user",
-            "active": int(row.iloc[0].get("active", 1)) if str(row.iloc[0].get("active", 1)).isdigit() else 1,
-        }
-        if not user_obj["active"]:
-            return False, "Akun dinonaktifkan."
-        set_current_user(user_obj)
-        st.session_state.logged_in = True
-        st.session_state.username = user_obj["email"]
-        try:
-            notify_event("auth", "login", "Notifikasi: User Login", f"User '{user_obj['email']}' telah berhasil LOGIN.")
-        except Exception:
-            pass
-        # Audit login event
-        try:
-            audit_log("auth", "login", target=user_obj.get("email", ""))
-        except Exception:
-            pass
-        return True, "Login berhasil."
-    except Exception as e:
-        return False, f"Gagal login: {e}"
-
-
-def register_user(email: str, full_name: str, password: str):
-    try:
-        spreadsheet = get_spreadsheet()
-        ws = spreadsheet.worksheet(USERS_SHEET_NAME)
-        users_headers = ["email", "password_hash", "full_name", "role", "created_at", "active"]
-        try:
-            df = pd.DataFrame(_cached_get_all_records(USERS_SHEET_NAME, users_headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        email_lower = email.lower()
-        # Check existing
-        email_col = "email" if "email" in df.columns else ("username" if "username" in df.columns else None)
-        if email_col and (df[email_col].astype(str).str.lower() == email_lower).any():
-            return False, "Email/Username sudah terdaftar."
-        hashed = hash_password(password)
-        now = now_wib_iso()
-        # Adapt to sheet schema
-        headers = ws.row_values(1)
-        row_values = []
-        for h in headers:
-            if h == "email":
-                row_values.append(email)
-            elif h == "username":
-                row_values.append(email)
-            elif h == "password_hash":
-                row_values.append(hashed)
-            elif h == "full_name":
-                row_values.append(full_name)
-            elif h == "role":
-                row_values.append("user")
-            elif h == "created_at":
-                row_values.append(now)
-            elif h == "active":
-                row_values.append(1)
-            else:
-                row_values.append("")
-        # Retry and cache invalidation
-        for i in range(3):
-            try:
-                ws.append_row(row_values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-        try:
-            notify_event("users", "register", "Notifikasi: User Baru", f"User baru '{email}' telah mendaftar.")
-        except Exception:
-            pass
-        # Audit register
-        try:
-            audit_log("users", "register", target=email)
-        except Exception:
-            pass
-        return True, "Registrasi berhasil."
-    except Exception as e:
-        return False, f"Gagal registrasi: {e}"
-
-
-def auth_sidebar():
-    user = get_current_user()
-    if user:
-                full_name = (user.get('full_name') or '').strip()
-                email = (user.get('email') or '').strip()
-                role = str(user.get('role', 'user')).strip().lower() or 'user'
-                role_label = 'Superuser' if role == 'superuser' else role.title()
-
-                # Small profile card in the sidebar
-                st.sidebar.markdown(
-                        f"""
-                        <div style="background:#EEF2FF;border:1px solid #c7d2fe;border-radius:10px;padding:12px 12px;margin:8px 0 14px 0;">
-                            <div style="font-weight:700;color:#1f2937;display:flex;align-items:center;gap:8px;">
-                                <span>👤</span>
-                                <span>{full_name or email}</span>
-                            </div>
-                            {f'<div style="font-size:12px;color:#4b5563;margin-left:24px;">{email}</div>' if full_name and email else ''}
-                            <div style="margin-top:8px;margin-left:24px;">
-                                <span style="background:#e0e7ff;color:#3730a3;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;">{role_label}</span>
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                )
-
-
-def _get_emails_by_role(role: str) -> list[str]:
-    """Kembalikan list email untuk user dengan role tertentu dan active=1 (jika ada)."""
-    try:
-        _, df = _load_users_df()
-        if df is None or df.empty:
-            return []
-        role_mask = df.get('role', pd.Series(dtype=str)).astype(str).str.lower() == str(role).lower()
-        # Interpret kolom active lebih fleksibel: terima 1/"1"/true/yes/y/aktif/active
-        if 'active' in df.columns:
-            active_col = df['active'].astype(str).str.strip().str.lower()
-            truthy_values = {"1", "true", "yes", "y", "aktif", "active"}
-            # Jika kolom numeric (0/1) tetap akan cocok dgn "1"
-            active_mask = active_col.isin(truthy_values)
-            role_mask = role_mask & active_mask
-        email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
-        if not email_col:
-            return []
-        emails = (
-            df.loc[role_mask, email_col]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .unique()
-            .tolist()
-        )
-        return emails
-    except Exception:
-        return []
-
-
-def _notify_role(role: str, subject: str, body: str):
-    """Kirim email ke semua user dengan role tersebut (async + bulk)."""
-    emails = _get_emails_by_role(role)
-    # Tambahkan superuser dan admin (fallback)
-    superusers = []
-    try:
-        superusers = _get_emails_by_role("superuser")
-    except Exception:
-        pass
-    admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip() if ADMIN_EMAIL_RECIPIENT else ""
-    pool = set(emails or []) | set(superusers or []) | ({admin_email} if admin_email else set())
-    recipients = sorted(e for e in pool if e)
-    if recipients:
-        _send_async(send_notification_bulk, recipients, subject, body)
-        st.toast(f"Mengirim notifikasi ke {len(recipients)} penerima ({role})…")
-    else:
-        st.toast(f"Tidak ada penerima untuk role {role}")
-
-
-def _notify_roles(roles: list[str], subject: str, body: str):
-    """Kirim email ke gabungan beberapa role (dedupe), selalu menyertakan superuser. Async + bulk."""
-    unique_roles = {*(r.strip().lower() for r in roles if r)}
-    if is_superuser_auto_enabled():
-        unique_roles.add("superuser")
-    all_emails: set[str] = set()  # Initialize a set to store unique emails
-    for r in unique_roles:
-        try:
-            for e in _get_emails_by_role(r):
-                if e:
-                    all_emails.add(str(e).strip())
-        except Exception:
-            continue
-    # Add admin fallback if available
-    admin_email = (ADMIN_EMAIL_RECIPIENT or "").strip() if ADMIN_EMAIL_RECIPIENT else ""
-    if admin_email:
-        all_emails.add(admin_email)
-    recipients = sorted(all_emails)
-    if recipients:
-        _send_async(send_notification_bulk, recipients, subject, body)
-        st.toast(f"Mengirim notifikasi ke {len(recipients)} penerima ({', '.join(sorted(unique_roles))})…")
-    else:
-        st.toast("Tidak ada penerima notifikasi untuk roles: " + ", ".join(sorted(unique_roles)))
-
-
+# -------------------------
+# Simple decorators / checks
+# -------------------------
 def require_login():
     user = get_current_user()
     if not user:
+        st.warning("Silakan login dulu.")
         st.stop()
     return user
 
+def require_role(roles):
+    user = require_login()
+    if user["role"] not in roles:
+        st.error(f"Akses ditolak. Diperlukan role: {roles}")
+        st.stop()
+    return user
 
-def gen_id(prefix: str):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-
-def _get_ws(name: str):
-    spreadsheet = get_spreadsheet()
-    # Basic call (kept for compatibility); higher-level wrappers will add retry.
-    return spreadsheet.worksheet(name)
-
-def _safe_get_ws(name: str, retries: int = 3, delay: float = 1.0):
-    """Dapatkan worksheet dengan retry sederhana untuk menangani APIError sementara.
-    Mengembalikan worksheet atau melempar exception terakhir jika gagal permanen.
-    """
-    last_err = None
-    for attempt in range(retries):
-        try:
-            return _get_ws(name)
-        except gspread.WorksheetNotFound as e:  # sheet memang tidak ada
-            raise e
-        except gspread.exceptions.APIError as e:
-            last_err = e
-            msg = str(e)
-            # Jika quota (429) atau 5xx, coba ulang
-            if any(code in msg for code in ["429", "500", "503"]):
-                time.sleep(delay * (attempt + 1))
-                continue
-            raise
-        except Exception as e:  # error lain (network transient)
-            last_err = e
-            time.sleep(delay * (attempt + 1))
-            continue
-    if last_err:
-        raise last_err
-    raise RuntimeError("Gagal mendapatkan worksheet tanpa error terdeteksi")
-
-
-def audit_log(module: str, action: str, target: str = "", details: str = ""):
-    try:
-        ws = _get_ws(AUDIT_SHEET_NAME)
-        actor = (get_current_user() or {}).get("email", "guest")
-        data = [now_wib_iso(), actor, module, action, target, details]
-        for i in range(3):
-            try:
-                ws.append_row(data)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-    except Exception:
-        # Non-blocking audit logging failure; swallow errors
-        pass
-
-
-# --- Helpers: Users sheet operations ---
-def _find_user_row(ws, email_or_username: str) -> int | None:
-    """Find row index (1-based) by matching email or username columns (case-insensitive). Returns None if not found."""
-    headers = ws.row_values(1)
-    email_col_idx = (headers.index('email') + 1) if 'email' in headers else None
-    user_col_idx = (headers.index('username') + 1) if 'username' in headers else None
-    # Prefer email search
-    try_cols = [email_col_idx, user_col_idx]
-    for col_idx in try_cols:
-        if not col_idx:
-            continue
-        try:
-            cell = ws.find(email_or_username, in_column=col_idx, case_sensitive=False)
-            if cell:
-                return cell.row
-        except Exception:
-            continue
-    return None
-
-
-def _users_update_row(ws, row_idx: int, updates: dict):
-    """Update specified columns for a given row with retries; clear cache after."""
-    headers = ws.row_values(1)
-    for k, v in updates.items():
-        if k not in headers:
-            continue
-        a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-        for i in range(3):
-            try:
-                ws.update(a1, [[v]])
-                break
-            except gspread.exceptions.APIError as e:
-                if '429' in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-    _invalidate_data_cache()
-
-
-def _users_delete_row(ws, row_idx: int):
-    for i in range(3):
-        try:
-            ws.delete_rows(row_idx)
-            _invalidate_data_cache()
-            break
-        except gspread.exceptions.APIError as e:
-            if '429' in str(e):
-                time.sleep(1.2 * (i + 1))
-                continue
-            raise
-
-
-def dashboard():
-    st.title("🏠 Dashboard Monitoring")
-    st.caption("Ringkasan cepat status operasional & approvals.")
-
-    # Helper generic loader
-    def _load_sheet(name: str, expected: list[str] | None = None) -> pd.DataFrame:
-        try:
-            ws = _get_ws(name)
-            if expected:
-                try:
-                    records = _cached_get_all_records(name, expected)
-                except Exception:
-                    records = ws.get_all_records()
+# -------------------------
+# UI Components: Authentication
+# -------------------------
+def auth_sidebar():
+    st.sidebar.title("Authentication")
+    user = get_current_user()
+    if user:
+        if using_firestore("users"):
+            doc = fs_get_document("users", user["id"]) or {}
+            st.sidebar.markdown("""
+                <b>Email:</b> {email}<br>
+                <b>Role:</b> {role}<br>
+                <b>Status:</b> {status}<br>
+                <b>Last Login:</b> {last_login}
+            """.format(
+                email=doc.get("email", user.get("email")),
+                role=doc.get("role", user.get("role")),
+                status=doc.get("status", "-"),
+                last_login=doc.get("last_login") or "-"
+            ), unsafe_allow_html=True)
+        else:
+            conn = get_db(); cur = conn.cursor(); cur.execute("SELECT email, full_name, role, status, last_login FROM users WHERE id = ?", (user["id"],)); u = cur.fetchone()
+            if u:
+                st.sidebar.markdown("""
+                    <b>Email:</b> {email}<br>
+                    <b>Role:</b> {role}<br>
+                    <b>Status:</b> {status}<br>
+                    <b>Last Login:</b> {last_login}
+                """.format(email=u["email"], role=u["role"], status=u["status"], last_login=u["last_login"] or "-"), unsafe_allow_html=True)
             else:
-                records = ws.get_all_records()
-            df = pd.DataFrame(records)
-            if expected:
-                for h in expected:
-                    if h not in df.columns:
-                        df[h] = ""
-            return df
-        except Exception:
-            return pd.DataFrame()
-
-    today = date.today()
-    this_month = today.strftime("%Y-%m")
-
-    # Throttle logic: avoid re-fetching all sheets if called again within 10s (unless refresh pressed)
-    now_ts = time.time()
-    last_load = st.session_state.get("_dash_last_load", 0)
-    throttle_active = (now_ts - last_load) < 10
-    if not throttle_active:
-        st.session_state["_dash_last_load"] = now_ts
-
-    # Fokus hanya calendar & mobil untuk percepat load.
-    @st.cache_data(ttl=90, show_spinner=False)
-    def _load_calendar_and_mobil():
-        cal_df = _load_sheet(CALENDAR_SHEET_NAME, ["jenis","judul","tgl_mulai","tgl_selesai","is_holiday"])
-        mobil_df = _load_sheet(MOBIL_SHEET_NAME, ["nama_pengguna","tgl_mulai","tgl_selesai","kendaraan","tujuan"])
-        return cal_df, mobil_df
-
-    cal, mobil = _load_calendar_and_mobil()
-   
-    # 6) Kalender Bersama (30 Hari) – gabungan multi sumber sebagai bullet list berwarna
-    st.markdown('<div class="wijna-section-title">📅 Kalender Bersama (30 Hari)</div>', unsafe_allow_html=True)
-    st.markdown('<div class="wijna-section-desc">Event & hari libur 30 hari ke depan (cuti, flex, delegasi, rapat, mobil kantor, libur nasional).</div>', unsafe_allow_html=True)
-    horizon_end = today + timedelta(days=30)
-
-    # Ambil data tambahan via sheet langsung (menghindari kueri DB, konsisten dengan arsitektur gsheet)
-    def _sheet_df(sheet_name: str, expected: list[str]):
-        df_ = _load_sheet(sheet_name, expected)
-        return df_ if not df_.empty else pd.DataFrame(columns=expected)
-
-    df_cuti = _sheet_df(CUTI_SHEET_NAME, ["nama","tgl_mulai","tgl_selesai","director_approved"])
-    if not df_cuti.empty:
-        df_cuti = df_cuti[pd.to_numeric(df_cuti.get('director_approved'), errors='coerce').fillna(0).astype(int) == 1]
-        df_cuti = df_cuti.rename(columns={"nama":"judul"})
-        df_cuti['jenis'] = 'Cuti'
-        df_cuti['nama_divisi'] = df_cuti.get('judul', '')
-
-    df_flex = _sheet_df(FLEX_SHEET_NAME, ["nama","tanggal","approval_director","jam_mulai","jam_selesai"])  # flex adalah per tanggal
-    if not df_flex.empty:
-        df_flex = df_flex[pd.to_numeric(df_flex.get('approval_director'), errors='coerce').fillna(0).astype(int) == 1]
-        df_flex = df_flex.rename(columns={"nama":"judul","tanggal":"tgl_mulai"})
-        df_flex['tgl_selesai'] = df_flex['tgl_mulai']
-        df_flex['jenis'] = 'Flex Time'
-        df_flex['nama_divisi'] = df_flex.get('judul','')
-
-    df_delegasi = _sheet_df(DELEGASI_SHEET_NAME, ["judul","pic","tgl_mulai","tgl_selesai"])  # semua delegasi tampil
-    if not df_delegasi.empty:
-        df_delegasi = df_delegasi.rename(columns={"pic":"nama_divisi"})
-        df_delegasi['jenis'] = 'Delegasi'
-
-    df_cal_rapat = cal[cal['jenis'].astype(str).str.lower() == 'rapat'].copy() if not cal.empty else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
-    if not df_cal_rapat.empty:
-        if 'nama_divisi' not in df_cal_rapat.columns:
-            df_cal_rapat['nama_divisi'] = ''
-
-    df_mobil = mobil.copy()
-    if not df_mobil.empty:
-        df_mobil = df_mobil.rename(columns={"tujuan":"judul","kendaraan":"nama_divisi"})
-        df_mobil['jenis'] = 'Mobil Kantor'
-
-    df_libur = cal[cal['is_holiday'].astype(str) == '1'].copy() if not cal.empty else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
-    if not df_libur.empty:
-        if 'jenis' not in df_libur.columns:
-            df_libur['jenis'] = 'Libur Nasional'
-        else:
-            df_libur['jenis'] = 'Libur Nasional'
-        if 'nama_divisi' not in df_libur.columns:
-            df_libur['nama_divisi'] = ''
-
-    # Normalisasi kolom minimal
-    frames = []
-    for df_part in [df_cuti, df_flex, df_delegasi, df_cal_rapat, df_mobil, df_libur]:
-        if df_part is None or df_part.empty:
-            continue
-        needed = ["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"]
-        for c in needed:
-            if c not in df_part.columns:
-                df_part[c] = ''
-        frames.append(df_part[needed].copy())
-    cal30 = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
-
-    if not cal30.empty:
-        # Parse dates & window filter 30 hari
-        for col in ["tgl_mulai","tgl_selesai"]:
-            cal30[col] = pd.to_datetime(cal30[col], errors='coerce')
-        cal30 = cal30[cal30['tgl_mulai'].notna() & cal30['tgl_selesai'].notna()]
-        mask = (cal30['tgl_selesai'].dt.date >= today) & (cal30['tgl_mulai'].dt.date <= horizon_end)
-        cal30 = cal30.loc[mask].copy().sort_values('tgl_mulai')
-        if cal30.empty:
-            st.info("Tidak ada event 30 hari ke depan.")
-        else:
-            def label_color(jenis: str) -> str:
-                c_map = {
-                    'Cuti': '#2563eb',
-                    'Flex Time': '#6d28d9',
-                    'Delegasi': '#ea580c',
-                    'Rapat': '#f59e42',
-                    'Mobil Kantor': '#374151',
-                    'Libur Nasional': '#dc2626',
-                }
-                return f"<span style='background:{c_map.get(jenis,'#9ca3af')};color:#fff;padding:2px 10px;border-radius:8px;font-size:0.7rem;font-weight:600'>{jenis}</span>"
-
-            st.markdown("<ul style='padding-left:1.1em;margin-top:0.5rem'>", unsafe_allow_html=True)
-            for _, r in cal30.iterrows():
-                try:
-                    t1 = r['tgl_mulai'].strftime('%d-%m-%Y'); t2 = r['tgl_selesai'].strftime('%d-%m-%Y')
-                except Exception:
-                    continue
-                tgl_str = t1 if t1 == t2 else f"{t1} s/d {t2}"
-                jenis_lbl = label_color(str(r.get('jenis','')))
-                judul = (r.get('judul') or '').strip() or '(Tanpa Judul)'
-                st.markdown(f"<li style='margin-bottom:4px'><b>{judul}</b> {jenis_lbl} <span style='color:#2563eb;font-size:0.75rem'>({tgl_str})</span></li>", unsafe_allow_html=True)
-            st.markdown("</ul>", unsafe_allow_html=True)
+                st.sidebar.write(f"Logged in: **{user['full_name']}** ({user['role']})")
     else:
-        st.info("Tidak ada event 30 hari ke depan.")
+        tabs = st.sidebar.tabs(["Login", "Register"])
+        with tabs[0]:
+            st.subheader("Login")
+            with st.form("login_form_sidebar"):
+                email_login = st.text_input("Email", key="login_email")
+                pwd_login = st.text_input("Password", type="password", key="login_pwd")
+                submit_login = st.form_submit_button("Login")
+                if submit_login:
+                    ok, msg = login_user(email_login.strip().lower(), pwd_login)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        with tabs[1]:
+            st.subheader("Register")
+            with st.form("register_form_sidebar"):
+                email_reg = st.text_input("Email", key="register_email")
+                name_reg = st.text_input("Nama Lengkap", key="register_name")
+                pwd_reg = st.text_input("Password", type="password", key="register_pwd")
+                submit_reg = st.form_submit_button("Register")
+                if submit_reg:
+                    if not (email_reg and name_reg and pwd_reg):
+                        st.error("Lengkapi semua field.")
+                    else:
+                        ok, msg = register_user(email_reg.strip().lower(), name_reg.strip(), pwd_reg)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
 
+# -------------------------
+# Admin (superuser) panel
+# -------------------------
+def superuser_panel():
+    require_role(["superuser"])
+    st.header("Superuser — Manajemen User & Approval")
+    if using_firestore("users"):
+        st.caption("Mode Firestore aktif — semua operasi user via Firestore.")
+        all_users = fs_query("users", [])
+        if all_users:
+            df = pd.DataFrame(all_users)
+            show_cols = [c for c in ["id","email","full_name","role","status","last_login","created_at"] if c in df.columns]
+            st.dataframe(df[show_cols], use_container_width=True)
+        else:
+            st.info("Belum ada user di Firestore.")
+    else:
+        st.subheader("Semua user")
+        conn = get_db()
+        cur = conn.cursor()
+        df = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn)
+        st.dataframe(df)
+
+    tab1, tab2 = st.tabs(["🕒 Pending Approval", "👥 Semua User"])
+
+    with tab1:
+        if using_firestore("users"):
+            pendings = fs_query("users", [("status","==","pending")])
+            if pendings:
+                for idx, p in enumerate(pendings):
+                    with st.expander(f"{p.get('full_name')} — {p.get('email')}"):
+                        st.markdown(f"""
+<div style='background:#f8fbff;border-radius:10px;padding:1.2em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);'>
+<b>Nama:</b> {p.get('full_name')}<br>
+<b>Email:</b> {p.get('email')}<br>
+<b>Role Saat Ini:</b> <span style='color:#2563eb;font-weight:600'>{p.get('role')}</span><br>
+<b>Status:</b> <span style='color:#eab308;font-weight:600'>{p.get('status')}</span><br>
+<b>Tanggal Daftar:</b> { (p.get('created_at') or '')[:10] }<br>
+<b>User ID:</b> <code>{p.get('id')}</code>
+</div>
+""", unsafe_allow_html=True)
+                        col1, col2, col3 = st.columns([1,1,2])
+                        with col1:
+                            if st.button("Approve", key=f"fsapprove_{p['id']}_{idx}"):
+                                fs_set_document("users", p['id'], {"status":"active"}, merge=True)
+                                audit_log("auth","approve",target=p['id'],details="Approve user (Firestore)")
+                                st.success("User diapprove.")
+                                st.rerun()
+                        with col2:
+                            if st.button("Reject", key=f"fsreject_{p['id']}_{idx}"):
+                                fs_set_document("users", p['id'], {"status":"inactive"}, merge=True)
+                                audit_log("auth","reject",target=p['id'],details="Reject user (Firestore)")
+                                st.info("User di-set inactive.")
+                                st.rerun()
+                        with col3:
+                            new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p.get('role','staff')), key=f"fsrole_{p['id']}_{idx}")
+                            if st.button("Update Role", key=f"fsroleupdate_{p['id']}_{idx}"):
+                                fs_set_document("users", p['id'], {"role": new_role}, merge=True)
+                                audit_log("auth","role_update",target=p['id'],details=f"Role -> {new_role}")
+                                st.success("Role diupdate.")
+                                st.rerun()
+            else:
+                st.info("Tidak ada user pending.")
+        else:
+            st.subheader("User baru menunggu approval")
+            conn1 = get_db()
+            cur1 = conn1.cursor()
+            cur1.execute("SELECT id,email,full_name,role,status,created_at FROM users WHERE status = 'pending'")
+            pendings = cur1.fetchall()
+            if pendings:
+                for idx, p in enumerate(pendings):
+                    with st.expander(f"{p['full_name']} — {p['email']}"):
+                        st.markdown(f'''<div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);"><b>Nama:</b> {p['full_name']}<br><b>Email:</b> {p['email']}<br><b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br><b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br><b>Tanggal Daftar:</b> {p['created_at'][:10]}<br><b>User ID:</b> <code>{p['id']}</code></div>''', unsafe_allow_html=True)
+                        col1, col2, col3 = st.columns([1,1,2])
+                        with col1:
+                            if st.button("Approve", key=f"approve_{p['id']}_card_{idx}"):
+                                conn_btn = get_db(); cur_btn = conn_btn.cursor(); cur_btn.execute("UPDATE users SET status='active' WHERE id = ?", (p['id'],)); conn_btn.commit(); conn_btn.close(); st.success("User diapprove."); st.rerun()
+                        with col2:
+                            if st.button("Reject", key=f"reject_{p['id']}_card_{idx}"):
+                                conn_btn = get_db(); cur_btn = conn_btn.cursor(); cur_btn.execute("UPDATE users SET status='inactive' WHERE id = ?", (p['id'],)); conn_btn.commit(); conn_btn.close(); st.info("User di-set inactive."); st.rerun()
+                        with col3:
+                            new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p['role']), key=f"role_{p['id']}_card_{idx}")
+                            if st.button("Update Role", key=f"setrole_{p['id']}_card_{idx}"):
+                                conn_btn = get_db(); cur_btn = conn_btn.cursor(); cur_btn.execute("UPDATE users SET role=? WHERE id=?", (new_role, p['id'])); conn_btn.commit(); conn_btn.close(); st.success("Role diupdate."); st.rerun()
+            else:
+                st.info("Tidak ada user pending.")
+            conn1.close()
+
+    with tab2:
+        if using_firestore("users"):
+            all_users = fs_query("users", [])
+            if all_users:
+                df2 = pd.DataFrame(all_users)
+                show_cols = [c for c in ["id","email","full_name","role","status","last_login","created_at"] if c in df2.columns]
+                st.dataframe(df2[show_cols], use_container_width=True)
+            else:
+                st.info("Belum ada user.")
+        else:
+            conn2 = get_db(); df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2); st.dataframe(df2, use_container_width=True); conn2.close()
+    # (No form here, only one form with key 'admin_change' exists below)
+
+    # Only one form, outside the tabs
+    st.markdown("---")
+    st.subheader("Aksi User Management")
+    if using_firestore("users"):
+        all_users_fs = fs_query("users", [])
+        opts = [f"{u.get('id')} | {u.get('email')} | {u.get('full_name')} | {u.get('role')} | {u.get('status')}" for u in all_users_fs]
+        id_map = {opt: opt.split(" | ")[0] for opt in opts}
+        with st.form("admin_change_fs"):
+            selected_user = st.selectbox("Pilih user (Firestore)", opts, key="admin_user_select_fs")
+            uid = id_map.get(selected_user, "")
+            newrole = st.selectbox("Role baru", ["staff","finance","director","superuser"], key="role_fs_select")
+            newpw = st.text_input("Password baru (opsional)", type="password", key="pw_fs")
+            action = st.selectbox("Aksi", ["Update User","Approve","Reject","Delete"], key="action_fs")
+            submit = st.form_submit_button("Apply")
+            if submit:
+                if not uid:
+                    st.error("Pilih user.")
+                else:
+                    if action == "Update User":
+                        data = {"role": newrole}
+                        if newpw:
+                            data["password_hash"] = hash_password(newpw)
+                        fs_set_document("users", uid, data, merge=True)
+                        audit_log("auth","update",target=uid,details="Update user FS")
+                        st.success("User updated.")
+                    elif action == "Approve":
+                        fs_set_document("users", uid, {"status":"active"}, merge=True)
+                        audit_log("auth","approve",target=uid,details="Approve user FS")
+                        st.success("User diapprove.")
+                    elif action == "Reject":
+                        fs_set_document("users", uid, {"status":"inactive"}, merge=True)
+                        audit_log("auth","reject",target=uid,details="Reject user FS")
+                        st.info("User di-set inactive.")
+                    elif action == "Delete":
+                        fs_delete("users", uid)
+                        audit_log("auth","delete",target=uid,details="Delete user FS")
+                        st.warning("User dihapus.")
+                    st.rerun()
+    else:
+        # Fetch all users for dropdown (SQLite)
+        conn3 = get_db(); cur3 = conn3.cursor(); cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC"); user_rows = cur3.fetchall(); conn3.close()
+        user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
+        user_id_map = {opt: opt.split(" | ")[0] for opt in user_options}
+        with st.form("admin_change"):
+            selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
+            uid = user_id_map.get(selected_user, "")
+            newrole = st.selectbox("Pilih role baru", ["staff","finance","director","superuser"])
+            newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
+            action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"]) 
+            submit = st.form_submit_button("Apply")
+            if submit:
+                conn3 = get_db(); cur3 = conn3.cursor()
+                if not uid:
+                    st.error("Masukkan user id.")
+                else:
+                    if action == "Update User":
+                        if newpw:
+                            cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
+                        else:
+                            cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
+                        conn3.commit(); st.success("User updated.")
+                    elif action == "Approve":
+                        cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,)); conn3.commit(); st.success("User diapprove.")
+                    elif action == "Reject":
+                        cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,)); conn3.commit(); st.info("User di-set inactive.")
+                conn3.close()
+
+        # (No form here, only one form with key 'admin_change' exists below)
+
+# -------------------------
+# Common helpers for modules
+# -------------------------
+def upload_file_and_store(file_uploader_obj):
+    uploaded = file_uploader_obj
+    if uploaded is None:
+        return None, None, None
+    raw = uploaded.read()
+    blob = to_blob(raw)
+    name = uploaded.name
+    # Audit trail log upload
     try:
-        if not cal30.empty:
-            csv_bytes = cal30.assign(
-                tgl_mulai=cal30['tgl_mulai'].dt.strftime('%Y-%m-%d'),
-                tgl_selesai=cal30['tgl_selesai'].dt.strftime('%Y-%m-%d')
-            ).to_csv(index=False).encode('utf-8')
-            st.download_button("⬇️ Export Kalender 30 Hari (CSV)", data=csv_bytes, file_name=f"kalender_30hari_{today.isoformat()}.csv", mime="text/csv")
+        user = get_current_user()
+        conn = get_db()
+        cur = conn.cursor()
+        log_id = gen_id("log")
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload) VALUES (?, ?, ?, ?, ?, ?)",
+            (log_id, "upload", name, 1, user["full_name"] if user else "-", now))
+        conn.commit()
+        conn.close()
     except Exception:
         pass
+    return blob, name, len(raw)
 
-    # --- Integrasi Status Kode Warna ke dalam Kalender ---
-    show_status = st.checkbox("Tampilkan Ringkasan Status (Kode Warna)", value=False)
-    if show_status:
-        st.caption("Ringkasan multi-modul prioritas & status (real-time 60s cache).")
-        legend_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px 0;'>"
-        legend_map = [
-            ("Overdue", "#dc2626"),
-            ("Due ≤3 Hari", "#ea580c"),
-            ("Due ≤7 Hari", "#d97706"),
-            ("Selesai", "#16a34a"),
-            ("Cuti", "#2563eb"),
-            ("Flex Time", "#6d28d9"),
-            ("Mobil Kantor", "#374151"),
-        ]
-        for n,c in legend_map:
-            legend_html += f"<div style='background:{c};color:#fff;padding:4px 10px;border-radius:14px;font-size:11px;font-weight:600'>{n}</div>"
-        legend_html += "</div>"
-        st.markdown(legend_html, unsafe_allow_html=True)
+def show_file_download(blob, filename):
+    data = from_blob(blob)
+    if data:
+        b64 = base64.b64encode(data).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">Download {filename}</a>'
+        st.markdown(href, unsafe_allow_html=True)
 
-        @st.cache_data(ttl=60, show_spinner=False)
-        def _collect_status_lists():
-            data = []
-            today_local = date.today()
-            try:
-                # Delegasi
-                try:
-                    ws = _get_ws(DELEGASI_SHEET_NAME); delegasi = pd.DataFrame(ws.get_all_records())
-                except Exception: delegasi = pd.DataFrame()
-                if not delegasi.empty:
-                    for _, r in delegasi.iterrows():
-                        judul = r.get('judul') or '(Tanpa Judul)'
-                        tgl_selesai = r.get('tgl_selesai') or ''
-                        try:
-                            warna = None
-                            if tgl_selesai:
-                                dline = datetime.fromisoformat(str(tgl_selesai)).date(); delta = (dline - today_local).days
-                                status = (r.get('status') or '').strip().lower()
-                                if status in ('done','selesai','complete','completed'): warna = 'Selesai'
-                                else:
-                                    if delta < 0: warna = 'Overdue'
-                                    elif delta <= 3: warna = 'Due ≤3 Hari'
-                                    elif delta <= 7: warna = 'Due ≤7 Hari'
-                            if warna:
-                                data.append({'label': f"Delegasi: {judul}", 'warna': warna, 'modul':'Delegasi'})
-                        except Exception: pass
-                # MoU
-                try:
-                    ws = _get_ws(MOU_SHEET_NAME); mou_df = pd.DataFrame(ws.get_all_records())
-                except Exception: mou_df = pd.DataFrame()
-                if not mou_df.empty:
-                    for _, r in mou_df.iterrows():
-                        tgl_selesai = r.get('tgl_selesai') or ''
-                        judul = r.get('nama') or r.get('nomor') or '(MoU)'
-                        try:
-                            warna=None
-                            if tgl_selesai:
-                                dline = datetime.fromisoformat(str(tgl_selesai)).date(); delta=(dline - today_local).days
-                                if delta < 0: warna='Overdue'
-                                elif delta <=7: warna='Due ≤7 Hari'
-                            if warna:
-                                data.append({'label': f"MoU: {judul}", 'warna': warna, 'modul':'MoU'})
-                        except Exception: pass
-                # Cuti (aktif hari ini)
-                try:
-                    ws = _get_ws(CUTI_SHEET_NAME); cuti_df = pd.DataFrame(ws.get_all_records())
-                except Exception: cuti_df = pd.DataFrame()
-                if not cuti_df.empty:
-                    for _, r in cuti_df.iterrows():
-                        try:
-                            mulai=r.get('tgl_mulai'); selesai=r.get('tgl_selesai')
-                            if mulai and selesai:
-                                d1=datetime.fromisoformat(str(mulai)).date(); d2=datetime.fromisoformat(str(selesai)).date()
-                                if d1 <= today_local <= d2:
-                                    data.append({'label': f"Cuti: {r.get('nama','')}", 'warna':'Cuti', 'modul':'Cuti'})
-                        except Exception: continue
-                # Flex Time (hari ini)
-                try:
-                    ws = _get_ws(FLEX_SHEET_NAME); flex_df = pd.DataFrame(ws.get_all_records())
-                except Exception: flex_df = pd.DataFrame()
-                if not flex_df.empty:
-                    for _, r in flex_df.iterrows():
-                        try:
-                            tgl=r.get('tanggal')
-                            if tgl and datetime.fromisoformat(str(tgl)).date()==today_local:
-                                data.append({'label': f"Flex: {r.get('nama','')} ({r.get('jam_mulai','')}-{r.get('jam_selesai','')})", 'warna':'Flex Time','modul':'Flex Time'})
-                        except Exception: continue
-                # Mobil Kantor (rentang aktif)
-                try:
-                    ws = _get_ws(MOBIL_SHEET_NAME); mob_df = pd.DataFrame(ws.get_all_records())
-                except Exception: mob_df = pd.DataFrame()
-                if not mob_df.empty:
-                    for _, r in mob_df.iterrows():
-                        try:
-                            mulai=r.get('tgl_mulai'); selesai=r.get('tgl_selesai')
-                            if mulai and selesai:
-                                d1=datetime.fromisoformat(str(mulai)).date(); d2=datetime.fromisoformat(str(selesai)).date()
-                                if d1 <= today_local <= d2:
-                                    data.append({'label': f"Mobil: {r.get('kendaraan','')} - {r.get('tujuan','')}", 'warna':'Mobil Kantor','modul':'Mobil Kantor'})
-                        except Exception: continue
-                return data
-            except Exception:
-                return []
-
-        items = _collect_status_lists()
-        if not items:
-            st.info("Belum ada item untuk divisualisasikan.")
-        else:
-            df_items = pd.DataFrame(items)
-            order = ["Overdue","Due ≤3 Hari","Due ≤7 Hari","Selesai","Cuti","Flex Time","Mobil Kantor"]
-            df_items['__order'] = df_items['warna'].apply(lambda w: order.index(w) if w in order else 999)
-            df_items = df_items.sort_values(['__order','label'])
-            color_lookup = {n:c for n,c in legend_map}
-            html = "<div style='display:flex;flex-direction:column;gap:4px;margin-top:4px;'>"
-            for _, r in df_items.iterrows():
-                c = color_lookup.get(r['warna'], '#6b7280')
-                html += f"<div style='background:{c};color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:500;display:flex;justify-content:space-between;'>"
-                html += f"<span>{r['label']}</span><span style='opacity:.85;font-size:11px'>{r['modul']}</span></div>"
-            html += "</div>"
-            st.markdown(html, unsafe_allow_html=True)
-
-    # --- Section: Dokumen Perlu Approval (lazy) ---
-    st.markdown("---")
-    # === Bulk Activate Notifications ===
-    with st.expander("🚀 Aktifkan Semua Notifikasi Default per Role", expanded=False):
-        st.caption("Generate/aktifkan mapping notifikasi standar untuk tiap kategori: input baru, perubahan status, mendekati / lewat tenggat, penetapan libur nasional, bentrok jadwal mobil, review & approval.")
-        st.markdown("""
-        Checklist kategori di bawah akan membuat (atau meng-update) baris mapping di sheet `config`.
-        Jika baris sudah ada, hanya kolom roles / active yang diperbarui.
-        Sumber role awal diambil dari NOTIF_ROLE_MAP (fallback) lalu bisa ditimpa template.
-        """)
-        # Definisikan template kategori -> daftar (module, action, default_roles)
-        bulk_templates = {
-            "Input Baru": [
-                ("inventory","create", ["finance"]),
-                ("cash_advance","create", ["finance"]),
-                ("delegasi","create", ["director"]),
-                ("flex","create", ["finance"]),
-                ("mobil","create", ["finance"]),
-                ("notulen","upload", ["director"]),
-                ("sop","upload", ["director"]),
-                ("pmr","upload", ["finance"]),
-                ("surat_masuk","draft", ["director"]),
-                ("surat_keluar","draft", ["director"]),
-                ("cuti","submit", ["finance"]),
-            ],
-            "Perubahan Status": [
-                ("inventory","finance_review", ["director"]),
-                ("inventory","director_approved", ["finance"]),
-                ("inventory","director_reject", ["finance"]),
-                ("cash_advance","finance_review", ["director"]),
-                ("cash_advance","director_approval", ["finance"]),
-                ("pmr","finance_review", ["director"]),
-                ("pmr","director_approval", ["finance"]),
-                ("flex","finance_review", ["director"]),
-                ("flex","director_approval", ["finance"]),
-                ("cuti","finance_review", ["director"]),
-                ("cuti","director_approved", ["finance"]),
-                ("cuti","director_reject", ["finance"]),
-                ("notulen","director_approval", ["staff","finance"]),
-                ("sop","director_approval", ["staff","finance"]),
-            ],
-            "Due Soon / Overdue": [
-                ("mou","due_soon", ["director","finance"]),
-            ],
-            "Libur Nasional": [
-                ("calendar","add_holiday", ["director"]),
-            ],
-            "Konflik Jadwal Mobil": [
-                # aksi hipotetis; jika ada deteksi konflik, bisa panggil notify_event("mobil","conflict",...)
-                ("mobil","conflict", ["finance","director"]),
-            ],
-            "Review & Approval": [
-                # sebagian overlap dengan Perubahan Status; disediakan jika ingin pisahkan paket
-                ("delegasi","update", ["director"]),
-            ],
-            "Autentikasi": [
-                ("auth","login", ["superuser"]),
-                ("auth","logout", ["superuser"]),
-                ("users","register", ["superuser"]),
-            ],
-        }
-        cols_sel = st.columns(3)
-        selected_categories = []
-        flat_keys = list(bulk_templates.keys())
-        for idx, cat in enumerate(flat_keys):
-            with cols_sel[idx % 3]:
-                if st.checkbox(cat, value=False, key=f"bulk_cat_{cat}"):
-                    selected_categories.append(cat)
-        st.markdown("---")
-        st.caption("Opsional override roles default (kosongkan untuk pakai default per action). Pisahkan dengan koma.")
-        role_override = st.text_input("Override Roles (misal: finance,director)", value="")
-        activate = st.checkbox("Set active=1 untuk semua entri", value=True)
-        if st.button("Generate / Update Mapping", type="primary"):
-            if not selected_categories:
-                st.warning("Pilih minimal satu kategori.")
-            else:
-                try:
-                    headers = ws.row_values(1)
-                    if 'module' not in headers or 'action' not in headers:
-                        st.error("Sheet config belum memiliki kolom module/action.")
-                    else:
-                        all_vals = ws.get_all_values()
-                        # index lookup
-                        col_index = {h: i for i, h in enumerate(headers)}
-                        updated_at = now_wib_iso()
-                        updater = (get_current_user() or {}).get('email','system')
-                        override_roles_clean = []
-                        if role_override.strip():
-                            override_roles_clean = [r.strip() for r in role_override.split(',') if r.strip() in ALLOWED_ROLES]
-                        total_created = 0; total_updated = 0
-                        existing_map = {}
-                        for ridx, row_vals in enumerate(all_vals[1:], start=2):
-                            try:
-                                m = str(row_vals[col_index['module']]).strip().lower()
-                                a = str(row_vals[col_index['action']]).strip().lower()
-                                if m and a:
-                                    existing_map[(m,a)] = ridx
-                            except Exception:
-                                continue
-                        # iterate selections
-                        for cat in selected_categories:
-                            for (mod, act, def_roles) in bulk_templates.get(cat, []):
-                                mod_l = mod.lower(); act_l = act.lower()
-                                roles_use = override_roles_clean if override_roles_clean else def_roles
-                                roles_use = [r for r in roles_use if r in ALLOWED_ROLES]
-                                if not roles_use:
-                                    continue
-                                payload = {
-                                    'module': mod_l,
-                                    'action': act_l,
-                                    'roles': ",".join(sorted(set(roles_use))),
-                                    'active': '1' if activate else '0',
-                                    'updated_at': updated_at,
-                                    'updated_by': updater
-                                }
-                                if (mod_l, act_l) in existing_map:
-                                    row_no = existing_map[(mod_l, act_l)]
-                                    # update row
-                                    for k,v in payload.items():
-                                        if k in col_index:
-                                            a1 = gspread.utils.rowcol_to_a1(row_no, col_index[k]+1)
-                                            for i in range(3):
-                                                try:
-                                                    ws.update(a1, v)
-                                                    break
-                                                except gspread.exceptions.APIError as e:
-                                                    if '429' in str(e):
-                                                        time.sleep(1+i)
-                                                        continue
-                                                    raise
-                                    total_updated += 1
-                                else:
-                                    # append new line with all headers order
-                                    row_values = [payload.get(h, '') for h in headers]
-                                    for i in range(3):
-                                        try:
-                                            ws.append_row(row_values)
-                                            break
-                                        except gspread.exceptions.APIError as e:
-                                            if '429' in str(e):
-                                                time.sleep(1+i)
-                                                continue
-                                            raise
-                                    total_created += 1
-                        try:
-                            audit_log('config','bulk_apply', target='bulk_notif', details=f"cat={len(selected_categories)} created={total_created} updated={total_updated}")
-                        except Exception:
-                            pass
-                        load_config_notif_map.clear()  # type: ignore[attr-defined]
-                        st.success(f"Selesai. Created: {total_created} | Updated: {total_updated}")
-                except Exception as e:
-                    st.error(f"Gagal bulk generate: {e}")
-        st.caption("Gunakan fitur ini dengan hati-hati. Anda dapat re-run untuk menyesuaikan roles.")
-
-    st.markdown("---")
-    user = get_current_user() or {}
-    user_role = (user.get("role") or "").lower()
-    with st.expander("📄 Dokumen Menunggu Approval", expanded=False):
-        st.caption("Menampilkan hanya modul relevan dengan peran Anda.")
-        # --- Filters: modul & tanggal (opsional) ---
-        filter_col1, filter_col2, filter_col3 = st.columns([2,2,2])
-        all_mod_names = []
-        # definisikan setelah role_modules agar tersedia
-        # (placeholder akan diisi nanti setelah role_modules)
-
-        # Role -> modul mapping untuk approval
-        role_modules = {
-            "finance": [
-                (INVENTORY_SHEET_NAME, "inventory", ["id","name","finance_approved","director_approved"], "finance_approved"),
-                (CASH_ADVANCE_SHEET_NAME, "cash_advance", ["id","finance_approved","director_approved","tanggal"], "finance_approved"),
-                (PMR_SHEET_NAME, "pmr", ["id","finance_approved","director_approved","tanggal_submit"], "finance_approved"),
-                (FLEX_SHEET_NAME, "flex", ["id","approval_finance","approval_director","tanggal"], "approval_finance"),
-                (CUTI_SHEET_NAME, "cuti", ["id","finance_approved","director_approved","nama","tgl_mulai"], "finance_approved")
-            ],
-            "director": [
-                (INVENTORY_SHEET_NAME, "inventory", ["id","name","finance_approved","director_approved"], "director_approved"),
-                (SURAT_MASUK_SHEET_NAME, "surat_masuk", ["id","nomor","perihal","director_approved"], "director_approved"),
-                (SURAT_KELUAR_SHEET_NAME, "surat_keluar", ["id","nomor","perihal","director_approved"], "director_approved"),
-                (MOU_SHEET_NAME, "mou", ["id","nomor","nama","board_approved"], "board_approved"),
-                (CASH_ADVANCE_SHEET_NAME, "cash_advance", ["id","finance_approved","director_approved","tanggal"], "director_approved"),
-                (PMR_SHEET_NAME, "pmr", ["id","finance_approved","director_approved","tanggal_submit"], "director_approved"),
-                (FLEX_SHEET_NAME, "flex", ["id","approval_finance","approval_director","tanggal"], "approval_director"),
-                (CUTI_SHEET_NAME, "cuti", ["id","finance_approved","director_approved","nama","tgl_mulai"], "director_approved"),
-                (NOTULEN_SHEET_NAME, "notulen", ["id","judul","director_approved"], "director_approved"),
-                (SOP_SHEET_NAME, "sop", ["id","judul","director_approved"], "director_approved")
-            ]
-        }
-
-        targets = role_modules.get(user_role, [])
-        # Siapkan pilihan modul untuk filter setelah targets diketahui
-        if targets:
-            all_mod_names = [mk for _, mk, _, _ in targets]
-            all_mod_names_sorted = sorted(set(all_mod_names))
-            with filter_col1:
-                selected_module = st.selectbox("Filter Modul", ["Semua"] + all_mod_names_sorted, key="approval_filter_mod")
-            with filter_col2:
-                date_from = st.date_input("Dari Tgl", value=None, key="approval_filter_from")
-            with filter_col3:
-                date_to = st.date_input("Sampai Tgl", value=None, key="approval_filter_to")
-        else:
-            selected_module = "Semua"; date_from = None; date_to = None
-        if not targets:
-            st.info("Peran Anda tidak memiliki approval yang menunggu di modul ini.")
-        else:
-            @st.cache_data(ttl=30, show_spinner=False)
-            def _load_min(sheet_name: str, headers: list[str]):
-                try:
-                    ws = _get_ws(sheet_name)
-                    recs = ws.get_all_records()
-                    df = pd.DataFrame(recs)
-                    # pastikan kolom
-                    for h in headers:
-                        if h not in df.columns:
-                            df[h] = ""
-                    return df
-                except Exception:
-                    return pd.DataFrame(columns=headers)
-
-            pending_rows_all = []
-            for sheet_name, module_key, headers, approval_col in targets:
-                if selected_module != "Semua" and module_key != selected_module:
-                    continue
-                dfm = _load_min(sheet_name, headers)
-                if dfm.empty or approval_col not in dfm.columns:
-                    continue
-                try:
-                    mask = dfm[approval_col].astype(str) == '0'
-                    # Terapkan filter tanggal jika ada kolom tanggal yang cocok
-                    if (date_from or date_to) and not dfm.empty:
-                        # Heuristik: cari kolom pertama yang mengandung 'tgl' atau 'tanggal' atau 'created'
-                        date_cols = [c for c in dfm.columns if any(k in c.lower() for k in ['tgl','tanggal','created_at','updated_at','tanggal_submit'])]
-                        target_date_col = None
-                        for dc in date_cols:
-                            if dfm[dc].astype(str).str.len().gt(0).any():
-                                target_date_col = dc; break
-                        if target_date_col:
-                            # parse tanggal
-                            parsed = pd.to_datetime(dfm[target_date_col], errors='coerce')
-                            if date_from:
-                                mask = mask & (parsed.dt.date >= date_from)
-                            if date_to:
-                                mask = mask & (parsed.dt.date <= date_to)
-                    rows = dfm[mask].head(50).copy()
-                    if rows.empty:
-                        continue
-                    # tampilkan ringkas
-                    display_cols = [c for c in rows.columns if c not in (approval_col,)][:3]
-                    st.markdown(f"**{module_key.upper()}** ({len(rows)})")
-                    safe_dataframe(rows[[c for c in display_cols if c in rows.columns]].head(10), index=False, height=180)
-                    # kumpulkan untuk multi approve
-                    for _, r in rows.iterrows():
-                        pending_rows_all.append({
-                            'sheet': sheet_name,
-                            'module': module_key,
-                            'approval_col': approval_col,
-                            'id': r.get('id')
-                        })
-                except Exception:
-                    continue
-
-            if pending_rows_all:
-                st.markdown("---")
-                st.write("Pilih item untuk di-approve:")
-                # Buat daftar id unik per modul
-                opts = [f"{pr['module']} | {pr['id']}" for pr in pending_rows_all if pr.get('id')]
-                selected_multi = st.multiselect("Item", opts, max_selections=25)
-                if selected_multi:
-                    if st.button("✅ Approve Terpilih"):
-                        approved_count = 0
-                        for sel in selected_multi:
-                            try:
-                                parts = sel.split('|')
-                                if len(parts) < 2:
-                                    continue
-                                mod = parts[0].strip().lower()
-                                obj_id = parts[1].strip()
-                                match = [p for p in pending_rows_all if p['module']==mod and p['id']==obj_id]
-                                if not match:
-                                    continue
-                                info = match[0]
-                                ws = _get_ws(info['sheet'])
-                                # find id cell
-                                try:
-                                    cell = ws.find(obj_id)
-                                except Exception:
-                                    cell = None
-                                if not cell:
-                                    continue
-                                headers_ws = ws.row_values(1)
-                                if info['approval_col'] not in headers_ws:
-                                    continue
-                                col_idx = headers_ws.index(info['approval_col']) + 1
-                                a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
-                                for attempt in range(3):
-                                    try:
-                                        ws.update(a1, [[1]])
-                                        approved_count += 1
-                                        # audit
-                                        try:
-                                            audit_log(info['module'], 'bulk_approve', target=obj_id, details=f"col={info['approval_col']}")
-                                        except Exception:
-                                            pass
-                                        break
-                                    except gspread.exceptions.APIError as e:
-                                        if '429' in str(e):
-                                            time.sleep(1.0*(attempt+1))
-                                            continue
-                                        raise
-                            except Exception:
-                                continue
-                        _invalidate_data_cache()
-                        st.success(f"Berhasil approve {approved_count} item.")
-                        st.experimental_rerun()
-            else:
-                st.info("Tidak ada dokumen pending untuk peran ini.")
-
-    st.markdown("---")
-
-
+# -------------------------
+# Modules Implementation (concise)
+# -------------------------
 def inventory_module():
     user = require_login()
-    st.markdown("# 📦 Inventory")
-
-    # Helpers for inventory sheet
-    def _inv_ws():
-        try:
-            return _safe_get_ws(INVENTORY_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            st.error("Sheet INVENTORY tidak ditemukan. Pastikan sudah dibuat.")
-            raise
-        except Exception as e:
-            st.warning(f"Inventory sementara tidak dapat diakses: {e}")
-            raise
-
-    def _inv_read_df():
-        try:
-            ws = _inv_ws()
-        except Exception:
-            # Kembalikan df kosong agar modul tidak crash total
-            return None, pd.DataFrame(columns=[
-                "id", "name", "location", "status", "pic", "updated_at",
-                "finance_note", "finance_approved", "director_note", "director_approved",
-                "file_id", "file_name", "file_link", "loan_info"
-            ])
-        inv_headers = [
-            "id", "name", "location", "status", "pic", "updated_at",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "file_id", "file_name", "file_link", "loan_info"
-        ]
-        try:
-            df = pd.DataFrame(_cached_get_all_records(INVENTORY_SHEET_NAME, inv_headers))
-        except Exception as e:
-            try:
-                df = pd.DataFrame(ws.get_all_records()) if ws else pd.DataFrame()
-            except Exception:
-                st.warning(f"Gagal membaca data inventory: {e}")
-                df = pd.DataFrame(columns=inv_headers)
-        # Ensure all expected columns exist to avoid KeyError in filters
-        for h in inv_headers:
-            if h not in df.columns:
-                # defaults: numeric approvals -> 0, others empty string
-                df[h] = 0 if h in ("finance_approved", "director_approved") else ""
-        return ws, df
-
-    def _inv_append(row: dict):
-        ws = _inv_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _inv_update_by_id(iid: str, updates: dict):
-        ws = _inv_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(iid)
-        if not id_cell:
-            raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            col_idx = headers.index(k) + 1
-            a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-            # Retry updates
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-
-    def format_datetime_wib(ts: str) -> str:
-        try:
-            dt = datetime.fromisoformat(str(ts).replace("Z", ""))
-            dt_wib = dt + timedelta(hours=7)
-            return dt_wib.strftime("%Y-%m-%d %H:%M") + " WIB"
-        except Exception:
-            return str(ts)
-
-    def upload_file_to_drive(file) -> tuple[str, str, str]:
-        """Upload to Drive and return (file_id, file_name, web_view_link)."""
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            file_metadata = {
-                'name': file.name,
-                'parents': [GDRIVE_FOLDER_ID]
-            }
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or 'application/octet-stream', resumable=True)
-            resp = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id, webViewLink',
-                supportsAllDrives=True
-            ).execute()
-            # Set permission anyone with link can view (optional, comment if not desired)
-            try:
-                service.permissions().create(fileId=resp['id'], body={
-                    'role': 'reader', 'type': 'anyone'
-                }, supportsAllDrives=True).execute()
-            except Exception:
-                pass
-            # Audit upload attachment
-            try:
-                audit_log("inventory", "upload_attachment", target=resp.get('id', ''), details=f"name={file.name}; type={file.type}")
-            except Exception:
-                pass
-            return resp.get('id', ''), file.name, resp.get('webViewLink', '')
-        except Exception as e:
-            st.warning(f"Gagal upload lampiran ke Drive: {e}")
-            return "", "", ""
-
-    def drive_download_button(file_id: str, file_name: str, key: str):
-        if not file_id or not file_name:
-            return
-        try:
-            service = get_gdrive_service()
-            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-            fh = io.BytesIO()
-            fh.write(request.execute())
-            fh.seek(0)
-            st.download_button(
-                label=f"⬇️ Download {file_name}",
-                data=fh.getvalue(),
-                file_name=file_name,
-                mime="application/octet-stream",
-                key=key
-            )
-        except Exception as e:
-            st.caption(f"Tidak dapat download lampiran: {e}")
-
-    # Prepare monthly rekap
-    _, df_all = _inv_read_df()
-    if df_all is None or df_all.empty:
-        st.info("Inventory tidak tersedia atau kosong saat ini.")
     this_month = date.today().strftime("%Y-%m")
-    df_month = df_all.copy()
-    if not df_month.empty and 'updated_at' in df_month.columns:
-        df_month = df_month[df_month['updated_at'].astype(str).str[:7] == this_month]
-
+    use_fs = using_firestore("inventory")
+    # Helper to load all inventory items
+    if use_fs:
+        items = fs_list("inventory", order_by=[["updated_at",]])
+        df_month = pd.DataFrame([i for i in items if isinstance(i.get("updated_at"), str) and i["updated_at"][:7] == this_month])
+    else:
+        conn = get_db(); cur = conn.cursor()
+        df_month = pd.read_sql_query(f"SELECT * FROM inventory WHERE substr(updated_at,1,7)=?", conn, params=(this_month,))
+    # --- UI with Tabs (always show tabs, even if df_month is empty) ---
     tab_labels = []
     tab_contents = []
-
-    # Staff tab: tambah barang
-    if can_create("inventory", user):
+    if user["role"] in ["staff", "superuser"]:
+        st.markdown("# 📦 Inventory")
         tab_labels.append("➕ Tambah Barang")
-
         def staff_tab():
             with st.form("inv_add"):
                 name = st.text_input("Nama Barang")
@@ -2074,165 +1205,171 @@ def inventory_module():
                     if not name:
                         st.warning("Nama barang wajib diisi.")
                     else:
-                        full_nama = name if not keterangan_opsi else f"{name} ({keterangan_opsi})"
+                        full_nama = name + (f" ({keterangan_opsi})" if keterangan_opsi else "")
                         iid = gen_id("inv")
-                        now = now_wib_iso()
-                        file_id, file_name, file_link = upload_file_to_drive(f) if f else ("", "", "")
-                        # PIC adalah user penginput
-                        pic = (user.get("full_name") or user.get("email") or "").strip()
-                        _inv_append({
+                        now_iso = datetime.utcnow().isoformat()
+                        blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
+                        record = {
                             "id": iid,
                             "name": full_nama,
                             "location": loc,
                             "status": status,
-                            "pic": pic,
-                            "updated_at": now,
+                            "pic": "",
+                            "updated_at": now_iso,
                             "finance_note": "",
                             "finance_approved": 0,
                             "director_note": "",
                             "director_approved": 0,
-                            "file_id": file_id,
-                            "file_name": file_name,
-                            "file_link": file_link,
-                            "loan_info": ""
-                        })
+                            "file_blob": blob.decode('utf-8') if isinstance(blob, (bytes, bytearray)) else (blob or None),
+                            "file_name": fname,
+                        }
+                        if use_fs:
+                            fs_create("inventory", record, custom_id=iid)
+                        else:
+                            cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        (iid, full_nama, loc, status, "", now_iso, '', 0, '', 0, blob, fname))
+                            conn.commit()
                         try:
                             audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
                         except Exception:
                             pass
-                        # Notify Finance users
-                        try:
-                            notify_event("inventory", "create", "[WIJNA] Draft Inventaris Baru",
-                                          f"Item inventaris baru menunggu review Finance.\n\nNama: {full_nama}\nID: {iid}\nLokasi: {loc}\nStatus: {status}\nPIC: {pic}")
-                        except Exception:
-                            pass
                         st.success("Item disimpan sebagai draft. Menunggu review Finance.")
-                        st.rerun()
-
         tab_contents.append(staff_tab)
-
-    # Finance review tab
-    if user.get("role") in ["finance", "superuser"]:
+    if user["role"] in ["finance", "superuser"]:
         tab_labels.append("💰 Review Finance")
-
         def finance_tab():
             st.info("Approve item yang sudah diinput staf.")
-            _, df = _inv_read_df()
-            if df.empty:
-                st.info("Tidak ada item untuk direview.")
-                return
-            df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
-            pending = df[df['finance_approved'] == 0].copy()
-            if pending.empty:
-                st.info("Tidak ada item pending untuk Finance.")
-                return
-            options = [f"{r['name']} (ID: {r['id']})" for _, r in pending.iterrows()]
-            mapping = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in pending.iterrows()}
-            pick = st.selectbox("Pilih item untuk direview:", options, key="fin_pick_inv")
-            if not pick:
-                return
-            sel_id = mapping[pick]
-            r = pending[pending['id'] == sel_id].iloc[0]
-            st.markdown(f"""
+            if use_fs:
+                rows = [r for r in fs_list("inventory", [("finance_approved", "==", 0)])]
+            else:
+                cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
+                rows = cur.fetchall()
+            for idx, r in enumerate(rows):
+                with st.container():
+                    name_val = r['name'] if isinstance(r, dict) else r['name']
+                    rid = r['id'] if isinstance(r, dict) else r['id']
+                    location_val = r.get('location') if isinstance(r, dict) else r['location']
+                    status_val = r.get('status') if isinstance(r, dict) else r['status']
+                    pic_val = r.get('pic') if isinstance(r, dict) else r['pic']
+                    updated_val = r.get('updated_at') if isinstance(r, dict) else r['updated_at']
+                    st.markdown(f"""
 <div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
-<b>📦 {r.get('name')}</b> <span style='color:#888;'>(ID: {r.get('id')})</span><br>
-<b>Lokasi:</b> {r.get('location')}<br>
-<b>Status:</b> {r.get('status')}<br>
-<b>Penanggung Jawab:</b> {r.get('pic','')}<br>
-<b>Terakhir Update:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
+<b>📦 {name_val}</b> <span style='color:#888;'>(ID: {rid})</span><br>
+<b>Lokasi:</b> {location_val}<br>
+<b>Status:</b> {status_val}<br>
+<b>Penanggung Jawab:</b> {pic_val}<br>
+<b>Terakhir Update:</b> {updated_val}<br>
 """, unsafe_allow_html=True)
-            file_id = r.get('file_id')
-            file_name = r.get('file_name')
-            if file_id and file_name:
-                drive_download_button(file_id, file_name, key=f"dl_fin_{r.get('id')}")
-            note = st.text_area("Catatan Finance (opsional)", value=r.get("finance_note") or "", key=f"fin_note_{r.get('id')}")
-            if st.button("🔎 Simpan Review Finance", key=f"ap_fin_{r.get('id')}"):
-                try:
-                    _inv_update_by_id(r.get('id'), {"finance_note": note, "finance_approved": 1})
-                    try:
-                        audit_log("inventory", "finance_review", target=r.get('id'), details=str(note))
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("inventory", "finance_review", "[WIJNA] Inventaris Menunggu Approval Director",
-                                      f"Item inventaris telah direview Finance dan menunggu Approval Director.\n\nNama: {r.get('name')}\nID: {r.get('id')}\nLokasi: {r.get('location')}\nStatus: {r.get('status')}\nPIC: {r.get('pic','')}")
-                    except Exception:
-                        pass
-                    st.success("Finance reviewed. Menunggu persetujuan Director.")
-                except Exception as e:
-                    st.error(f"Gagal menyimpan: {e}")
-                st.rerun()
-
+                    if use_fs:
+                        file_blob = r.get('file_blob')
+                        file_name = r.get('file_name')
+                        if file_blob and isinstance(file_blob, str):
+                            try:
+                                file_blob_bytes = base64.b64decode(file_blob.encode())
+                            except Exception:
+                                file_blob_bytes = None
+                        else:
+                            file_blob_bytes = None
+                    else:
+                        file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
+                        file_name = r['file_name'] if 'file_name' in r.keys() else None
+                        file_blob_bytes = file_blob
+                    if file_blob and file_name:
+                        show_file_download(file_blob_bytes, file_name)
+                    st.markdown("**Catatan Finance:**")
+                    note_current = r.get('finance_note') if isinstance(r, dict) else r['finance_note']
+                    note = st.text_area("Tulis catatan atau alasan jika perlu", value=note_current or "", key=f"fin_note_{rid}_finance_{idx}")
+                    colf1, colf2 = st.columns([1,2])
+                    with colf1:
+                        if st.button("🔎 Review", key=f"ap_fin_{rid}_finance_{idx}"):
+                            if use_fs:
+                                fs_update("inventory", rid, {"finance_note": note, "finance_approved": 1})
+                            else:
+                                cur.execute("UPDATE inventory SET finance_note=?, finance_approved=1 WHERE id=?", (note, rid)); conn.commit()
+                            try:
+                                audit_log("inventory", "finance_review", target=rid, details=note)
+                            except Exception:
+                                pass
+                            st.success("Finance reviewed. Menunggu persetujuan Director.")
+                    with colf2:
+                        st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
         tab_contents.append(finance_tab)
-
-    # Director approval tab
-    if user.get("role") in ["director", "superuser"]:
+    if user["role"] in ["director", "superuser"]:
         tab_labels.append("✅ Approval Director")
-
         def director_tab():
             st.info("Approve/Tolak item yang sudah di-approve Finance.")
-            _, df = _inv_read_df()
-            if not df.empty:
-                df['finance_approved'] = pd.to_numeric(df.get('finance_approved'), errors='coerce').fillna(0).astype(int)
-                df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
-            rows = df[(df['finance_approved'] == 1) & (df['director_approved'] == 0)].copy()
-            if rows.empty:
-                st.info("Tidak ada item yang menunggu Approval Director.")
-                return
-            options = [f"{r['name']} (ID: {r['id']})" for _, r in rows.iterrows()]
-            mapping = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in rows.iterrows()}
-            pick = st.selectbox("Pilih item untuk disetujui/ditolak:", options, key="dir_pick_inv")
-            if not pick:
-                return
-            sel_id = mapping[pick]
-            r = rows[rows['id'] == sel_id].iloc[0]
-            st.markdown(f"""
-            <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
-                <b>Nama:</b> {r.get('name')}<br>
-                <b>ID:</b> {r.get('id')}<br>
-                <b>Lokasi:</b> {r.get('location')}<br>
-                <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r.get('status')}</span><br>
-                <b>PIC:</b> {r.get('pic','')}<br>
-                <b>Update Terakhir:</b> {format_datetime_wib(r.get('updated_at',''))}<br>
-            </div>
-            """, unsafe_allow_html=True)
-            if r.get('file_id') and r.get('file_name'):
-                drive_download_button(r.get('file_id'), r.get('file_name'), key=f"dl_dir_{r.get('id')}")
-            note2 = st.text_area("Catatan Director", value=r.get("director_note") or "", key=f"dir_note_{r.get('id')}", height=80)
-            colA, colB = st.columns([1,1])
-            with colA:
-                if st.button("✅ Approve", key=f"ap_dir_{r.get('id')}"):
-                    try:
-                        _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": 1})
-                        try:
-                            audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=1; note={note2}")
-                        except Exception:
-                            pass
-                        st.success("Item telah di-approve Director.")
-                    except Exception as e:
-                        st.error(f"Gagal menyimpan: {e}")
-                    st.rerun()
-            with colB:
-                if st.button("❌ Tolak", key=f"reject_dir_{r.get('id')}"):
-                    try:
-                        _inv_update_by_id(r.get('id'), {"director_note": note2, "director_approved": -1})
-                        try:
-                            audit_log("inventory", "director_approval", target=r.get('id'), details=f"approve=0; note={note2}")
-                        except Exception:
-                            pass
-                        st.success("Item ditolak Director.")
-                    except Exception as e:
-                        st.error(f"Gagal menyimpan: {e}")
-                    st.rerun()
-
+            if use_fs:
+                rows = fs_list("inventory", [("finance_approved","==",1),("director_approved","==",0)])
+            else:
+                cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0")
+                rows = cur.fetchall()
+            for idx, r in enumerate(rows):
+                name_val = r['name'] if isinstance(r, dict) else r['name']
+                rid = r['id'] if isinstance(r, dict) else r['id']
+                updated_val = r.get('updated_at') if isinstance(r, dict) else r['updated_at']
+                updated_str = format_datetime_wib(updated_val) if updated_val else updated_val
+                location_val = r.get('location') if isinstance(r, dict) else r['location']
+                status_val = r.get('status') if isinstance(r, dict) else r['status']
+                pic_val = r.get('pic') if isinstance(r, dict) else r['pic']
+                with st.expander(f"[Menunggu Approval Director] {name_val} ({rid})"):
+                    st.markdown(f"""
+                    <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
+                        <b>Nama:</b> {name_val}<br>
+                        <b>ID:</b> {rid}<br>
+                        <b>Lokasi:</b> {location_val}<br>
+                        <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{status_val}</span><br>
+                        <b>PIC:</b> {pic_val}<br>
+                        <b>Update Terakhir:</b> {updated_str}<br>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if use_fs:
+                        file_blob = r.get('file_blob'); file_name = r.get('file_name')
+                        if file_blob and isinstance(file_blob, str):
+                            try:
+                                file_blob_bytes = base64.b64decode(file_blob.encode())
+                            except Exception:
+                                file_blob_bytes = None
+                        else:
+                            file_blob_bytes = None
+                        if file_blob and file_name:
+                            show_file_download(file_blob_bytes, file_name)
+                    else:
+                        if r['file_blob'] and r['file_name']:
+                            show_file_download(r['file_blob'], r['file_name'])
+                    st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
+                    note_current = r.get('director_note') if isinstance(r, dict) else r['director_note']
+                    note2 = st.text_area("", value=note_current or "", key=f"dir_note_{rid}_director_{idx}", placeholder="Tulis catatan atau alasan jika perlu...", height=80)
+                    colA, colB = st.columns([1,1])
+                    with colA:
+                        if st.button("✅ Approve", key=f"ap_dir_{rid}_director_{idx}"):
+                            if use_fs:
+                                fs_update("inventory", rid, {"director_note": note2, "director_approved": 1})
+                            else:
+                                cur.execute("UPDATE inventory SET director_note=?, director_approved=1 WHERE id=?", (note2, rid)); conn.commit()
+                            try:
+                                audit_log("inventory", "director_approval", target=rid, details=f"approve=1; note={note2}")
+                            except Exception:
+                                pass
+                            st.success("Item telah di-approve Director.")
+                    with colB:
+                        if st.button("❌ Tolak", key=f"reject_dir_{rid}_director_{idx}"):
+                            if use_fs:
+                                fs_update("inventory", rid, {"director_note": note2, "director_approved": -1})
+                            else:
+                                cur.execute("UPDATE inventory SET director_note=?, director_approved=-1 WHERE id=?", (note2, rid)); conn.commit()
+                            try:
+                                audit_log("inventory", "director_approval", target=rid, details=f"approve=0; note={note2}")
+                            except Exception:
+                                pass
         tab_contents.append(director_tab)
 
-    # Daftar Inventaris + Pinjam
+    # Tab Daftar Inventaris dan Pinjam Barang (selalu tambahkan labelnya)
     tab_labels.append("📦 Daftar Inventaris")
-
     def data_tab():
         st.subheader("Daftar Inventaris & Pinjam Barang")
         left_col, right_col = st.columns([2, 1])
+        # --- Kiri: Daftar Inventaris ---
         with left_col:
             filter_col1, filter_col2, filter_col3 = st.columns([2,2,2])
             with filter_col1:
@@ -2241,92 +1378,86 @@ def inventory_module():
                 filter_lokasi = st.text_input("Filter Lokasi", "")
             with filter_col3:
                 filter_status = st.selectbox("Filter Status", ["Semua", "Tersedia", "Dipinjam", "Rusak", "Dijual"], index=0)
-
-            _, df = _inv_read_df()
+            if use_fs:
+                inv_rows = fs_list("inventory", order_by=[["updated_at"]])
+                df = pd.DataFrame(inv_rows)
+            else:
+                df = pd.read_sql_query("SELECT id, name, location, status, pic, updated_at, file_name, file_blob FROM inventory ORDER BY updated_at DESC", conn)
             if not df.empty and 'updated_at' in df.columns:
-                df['updated_at'] = df['updated_at'].apply(format_datetime_wib)
+                try:
+                    df['updated_at'] = df['updated_at'].apply(lambda v: format_datetime_wib(v) if isinstance(v, str) else v)
+                except Exception:
+                    pass
 
             filtered_df = df.copy()
             if filter_nama:
-                filtered_df = filtered_df[filtered_df.get('name','').astype(str).str.contains(filter_nama, case=False, na=False)]
+                filtered_df = filtered_df[filtered_df['name'].str.contains(filter_nama, case=False, na=False)]
             if filter_lokasi:
-                filtered_df = filtered_df[filtered_df.get('location','').astype(str).str.contains(filter_lokasi, case=False, na=False)]
+                filtered_df = filtered_df[filtered_df['location'].str.contains(filter_lokasi, case=False, na=False)]
             if filter_status != "Semua":
-                filtered_df = filtered_df[filtered_df.get('status','') == filter_status]
+                filtered_df = filtered_df[filtered_df['status'] == filter_status]
 
             if filtered_df.empty:
                 st.info("Tidak ada data inventaris sesuai filter.")
             else:
-                # Tampilkan hanya kolom: id, name, location, status, pic, updated_at
-                cols_show = ["id", "name", "location", "status", "pic", "updated_at"]
-                show_df = filtered_df.reindex(columns=cols_show)
-                st.dataframe(show_df, width='stretch')
+                show_df = filtered_df.drop(columns=["file_blob"], errors="ignore")
+                st.dataframe(show_df, use_container_width=True)
 
-                lampiran_list = [
-                    f"{row.get('name')} - {row.get('file_name')}" for _, row in filtered_df.iterrows()
-                    if row.get('file_id') and row.get('file_name')
-                ]
-                lampiran_dict = {
-                    f"{row.get('name')} - {row.get('file_name')}": (row.get('file_name'), row.get('file_id'))
-                    for _, row in filtered_df.iterrows()
-                    if row.get('file_id') and row.get('file_name')
-                }
+                lampiran_list = []
+                lampiran_dict = {}
+                for idx2, row2 in filtered_df.iterrows():
+                    fb = row2.get('file_blob') if 'file_blob' in row2 else None
+                    fn = row2.get('file_name') if 'file_name' in row2 else None
+                    if fb and fn:
+                        lampiran_list.append(f"{row2['name']} - {fn}")
+                        lampiran_dict[f"{row2['name']} - {fn}"] = (fn, fb)
                 if lampiran_list:
                     selected = st.selectbox("Pilih lampiran untuk diunduh:", lampiran_list)
                     if selected:
-                        file_name, file_id = lampiran_dict[selected]
-                        drive_download_button(file_id, file_name, key=f"dl_sel_{hash(selected)}")
+                        file_name, file_blob = lampiran_dict[selected]
+                        if use_fs and isinstance(file_blob, str):
+                            try:
+                                file_blob = base64.b64decode(file_blob.encode())
+                            except Exception:
+                                pass
+                        st.download_button(
+                            label=f"⬇️ Download {file_name}",
+                            data=file_blob,
+                            file_name=file_name,
+                            mime="application/octet-stream"
+                        )
                 else:
                     st.info("Tidak ada lampiran yang tersedia untuk diunduh.")
 
+        # --- Kanan: Pinjam Barang ---
         with right_col:
             st.markdown("### 📋 Pinjam Barang")
-            _, df2 = _inv_read_df()
-            filtered_df2 = df2.copy()
-            if filter_nama:
-                filtered_df2 = filtered_df2[filtered_df2.get('name','').astype(str).str.contains(filter_nama, case=False, na=False)]
-            if filter_lokasi:
-                filtered_df2 = filtered_df2[filtered_df2.get('location','').astype(str).str.contains(filter_lokasi, case=False, na=False)]
-            if filter_status != "Semua":
-                filtered_df2 = filtered_df2[filtered_df2.get('status','') == filter_status]
-
-            # Pilih satu item saja agar UI ringan
-            available = filtered_df2[filtered_df2.get('status','') != "Dipinjam"].copy()
-            if available.empty:
-                st.info("Tidak ada barang yang bisa dipinjam sesuai filter.")
-            else:
-                opts = [f"{r['name']} (ID: {r['id']})" for _, r in available.iterrows()]
-                map_id = {f"{r['name']} (ID: {r['id']})": r['id'] for _, r in available.iterrows()}
-                choose = st.selectbox("Pilih barang untuk dipinjam:", opts, key="pinjam_pick")
-                if choose:
-                    rid = map_id[choose]
-                    row = available[available['id'] == rid].iloc[0]
-                    keperluan = st.text_input("Keperluan pinjam", key=f"keperluan_{rid}")
-                    tgl_kembali = st.date_input("Tanggal Kembali", key=f"tglkembali_{rid}", min_value=date.today())
-                    if st.button("Ajukan Pinjam", key=f"ajukan_{rid}"):
-                        try:
-                            info_pic = f"{user.get('email')}|{keperluan}|{tgl_kembali}|0|0"
-                            _inv_update_by_id(rid, {
-                                "loan_info": info_pic,
-                                "finance_approved": 0,
-                                "director_approved": 0,
-                                "updated_at": now_wib_iso()
-                            })
+            # Filter pinjam barang mengikuti filter kiri
+            pinjam_df = filtered_df.copy()
+            for idx3, row3 in pinjam_df.iterrows():
+                if row3['status'] != "Dipinjam":
+                    with st.expander(f"Pinjam: {row3['name']} ({row3['id']})"):
+                        keperluan = st.text_input(f"Keperluan pinjam untuk {row3['name']}", key=f"keperluan_{row3['id']}")
+                        tgl_kembali = st.date_input(f"Tanggal Kembali", key=f"tglkembali_{row3['id']}", min_value=date.today())
+                        ajukan = st.button(f"Ajukan Pinjam", key=f"ajukan_{row3['id']}")
+                        if ajukan:
+                            loan_pic_val = f"{user['id']}|{keperluan}|{tgl_kembali}|0|0"
+                            if use_fs:
+                                fs_update("inventory", row3['id'], {"pic": loan_pic_val, "finance_approved": 0, "director_approved": 0, "updated_at": datetime.utcnow().isoformat()})
+                            else:
+                                cur.execute("UPDATE inventory SET pic=?, finance_approved=0, director_approved=0, updated_at=? WHERE id=?", (loan_pic_val, datetime.utcnow().isoformat(), row3['id']))
+                                conn.commit()
                             try:
-                                audit_log("inventory", "loan_request", target=rid, details=f"keperluan={keperluan}; kembali={tgl_kembali}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("inventory", "loan_request", "[WIJNA] Permohonan Pinjam Barang",
-                                             f"Permohonan pinjam barang menunggu review Finance.\n\nBarang: {row.get('name')}\nID: {row.get('id')}\nLokasi: {row.get('location')}\nPemohon: {user.get('email')}\nKeperluan: {keperluan}\nRencana kembali: {tgl_kembali}")
+                                audit_log("inventory", "loan_request", target=row3['id'], details=f"keperluan={keperluan}; kembali={tgl_kembali}")
                             except Exception:
                                 pass
                             st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
-                        except Exception as e:
-                            st.error(f"Gagal mengajukan pinjam: {e}")
 
-    # Build tab labels and contents
-    # Ensure display names
+    # Tab Pinjam Barang terpisah (definisi dan penambahan tab di dalam scope agar variabel filter_* tersedia)
+
+
+    # Update tab_labels dan tab_contents
+    # Ganti label tab dengan icon/emoji yang lebih menarik
     for i, lbl in enumerate(tab_labels):
         if lbl.lower().startswith("tambah barang") or lbl.lower().startswith("➕ tambah barang"):
             tab_labels[i] = "➕ Tambah Barang"
@@ -2336,471 +1467,248 @@ def inventory_module():
             tab_labels[i] = "✅ Approval Director"
         elif lbl.lower().startswith("daftar inventaris") or lbl.lower().startswith("📦 daftar inventaris"):
             tab_labels[i] = "📦 Daftar Inventaris"
-
-    # Ensure Daftar Inventaris tab exists once and last
+    tab_contents[:] = [tab for tab in tab_contents if tab.__name__ != "download_tab"]
+    # Pastikan urutan tab: ... , 📦 Daftar Inventaris
+    # Hapus data_tab jika sudah ada agar tidak dobel
     tab_contents = [tab for tab in tab_contents if tab.__name__ != "data_tab"]
-    tab_contents.append(data_tab)
-    if "📦 Daftar Inventaris" not in tab_labels:
-        tab_labels.append("📦 Daftar Inventaris")
+    # Tambahkan sesuai urutan label
+    for lbl in tab_labels:
+        if lbl == "📦 Daftar Inventaris":
+            tab_contents.append(data_tab)
 
-    # Render tabs
+    # Sinkronisasi jumlah tab_labels dan tab_contents
+    if len(tab_labels) > len(tab_contents):
+        tab_labels = tab_labels[:len(tab_contents)]
+    elif len(tab_contents) > len(tab_labels):
+        tab_contents = tab_contents[:len(tab_labels)]
+
+    # Render the tabs dan panggil fungsi sesuai urutan
     selected = st.tabs(tab_labels)
     for i, tab_func in enumerate(tab_contents):
         with selected[i]:
             tab_func()
 
-
 def surat_masuk_module():
-    user = require_login()
     st.header("📥 Surat Masuk")
-
-    # Helpers for Surat Masuk sheet
-    def _sm_headers():
-        return [
-            "id", "nomor", "tanggal", "pengirim", "perihal",
-            "file_id", "file_name", "file_link",
-            "status", "follow_up",
-            "director_approved", "rekap",
-            "created_at", "submitted_by"
-        ]
-
-    def _sm_ws():
-        # Try to get the worksheet; if missing, create with headers
-        try:
-            return _get_ws(SURAT_MASUK_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            spreadsheet = get_spreadsheet()
-            return ensure_sheet_with_headers(spreadsheet, SURAT_MASUK_SHEET_NAME, _sm_headers())
-
-    def _sm_read_df():
-        ws = _sm_ws()
-        headers = _sm_headers()
-        try:
-            df = pd.DataFrame(_cached_get_all_records(SURAT_MASUK_SHEET_NAME, headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        for h in headers:
-            if h not in df.columns:
-                df[h] = 0 if h in ("director_approved", "rekap") else ""
-        # Normalize numeric flags
-        df["director_approved"] = pd.to_numeric(df.get("director_approved"), errors="coerce").fillna(0).astype(int)
-        df["rekap"] = pd.to_numeric(df.get("rekap"), errors="coerce").fillna(0).astype(int)
-        return ws, df
-
-    def _sm_append(row: dict):
-        ws = _sm_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _sm_update_by_id(sid: str, updates: dict):
-        ws = _sm_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(sid)
-        if not id_cell:
-            raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-
-    # Drive helpers
-    def _upload_surat_to_drive(file) -> tuple[str, str, str]:
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
-            resp = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id, webViewLink",
-                supportsAllDrives=True,
-            ).execute()
-            try:
-                service.permissions().create(
-                    fileId=resp["id"],
-                    body={"role": "reader", "type": "anyone"},
-                    supportsAllDrives=True,
-                ).execute()
-            except Exception:
-                pass
-            try:
-                audit_log("surat_masuk", "upload", target=resp.get("id", ""), details=f"name={file.name}; type={file.type}")
-            except Exception:
-                pass
-            return resp.get("id", ""), file.name, resp.get("webViewLink", "")
-        except Exception as e:
-            st.warning(f"Gagal upload surat ke Drive: {e}")
-            return "", "", ""
-
-    def _download_button(file_id: str, file_name: str, key: str):
-        if not file_id or not file_name:
-            return
-        try:
-            service = get_gdrive_service()
-            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-            fh = io.BytesIO()
-            fh.write(request.execute())
-            fh.seek(0)
-            st.download_button(
-                label=f"⬇️ Download {file_name}",
-                data=fh.getvalue(),
-                file_name=file_name,
-                mime="application/octet-stream",
-                key=key,
-            )
-        except Exception as e:
-            st.caption(f"Tidak dapat download surat: {e}")
-
-    # Authorization: who can input/approve
-    role = str(user.get("role", "")).lower()
-    allowed_submit = role in ["staff", "staf", "finance", "director", "superuser"]
+    user = get_current_user()
+    allowed_roles = ["staf", "finance", "director", "superuser"]
+    if not user or user["role"] not in allowed_roles:
+        st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
+        return
 
     tab1, tab2, tab3 = st.tabs([
         "📝 Input Draft Surat Masuk",
         "✅ Approval",
-        "📋 Daftar & Rekap Surat Masuk",
+        "📋 Daftar & Rekap Surat Masuk"
     ])
 
-    # Tab 1: Input
     with tab1:
         st.markdown("### Input Draft Surat Masuk")
-        if not allowed_submit:
-            st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
-        else:
-            with st.form("form_surat_masuk", clear_on_submit=True):
-                nomor = st.text_input("Nomor Surat")
-                pengirim = st.text_input("Pengirim")
-                tanggal = st.date_input("Tanggal Surat", value=date.today())
-                perihal = st.text_input("Perihal")
-                file_upload = st.file_uploader("Upload File Surat (wajib)", type=None)
-                status = st.selectbox(
-                    "Status",
-                    [
-                        "Diusulkan dibahas ke rapat rutin",
-                        "Langsung dilegasikan ke salah satu user",
-                        "Selesai",
-                    ],
-                    index=0,
-                )
-                follow_up = st.text_area("Tindak Lanjut (Follow Up)")
-                submitted = st.form_submit_button("Catat Surat Masuk")
+        with st.form("form_surat_masuk", clear_on_submit=True):
+            nomor = st.text_input("Nomor Surat")
+            pengirim = st.text_input("Pengirim")
+            tanggal = st.date_input("Tanggal Surat", value=date.today())
+            perihal = st.text_input("Perihal")
+            file_upload = st.file_uploader("Upload File Surat (wajib)", type=None)
+            status = st.selectbox("Status", ["Diusulkan dibahas ke rapat rutin", "Langsung dilegasikan ke salah satu user", "Selesai"], index=0)
+            follow_up = st.text_area("Tindak Lanjut (Follow Up)")
+            submitted = st.form_submit_button("Catat Surat Masuk")
 
-                if submitted:
-                    if not file_upload:
-                        st.error("File surat wajib diupload.")
-                    else:
-                        fid, fname, flink = _upload_surat_to_drive(file_upload)
-                        if not fid:
-                            st.error("Gagal mengupload file ke Drive.")
-                        else:
-                            sid = gen_id("sm")
-                            now = now_wib_iso()
-                            _sm_append(
-                                {
-                                    "id": sid,
-                                    "nomor": nomor,
-                                    "tanggal": tanggal.isoformat(),
-                                    "pengirim": pengirim,
-                                    "perihal": perihal,
-                                    "file_id": fid,
-                                    "file_name": fname,
-                                    "file_link": flink,
-                                    "status": status,
-                                    "follow_up": follow_up,
-                                    "director_approved": 0,
-                                    "rekap": 0,
-                                    "created_at": now,
-                                    "submitted_by": user.get("email"),
-                                }
-                            )
-                            audit_log(
-                                "surat_masuk",
-                                "create",
-                                target=sid,
-                                details=f"{nomor} - {perihal} ({pengirim})",
-                            )
-                            # Notifikasi: Ada surat masuk baru perlu review/approve oleh Director
-                            try:
-                                notify_event("surat_masuk", "draft", "[WIJNA] Surat Masuk Baru",
-                                             f"Surat Masuk baru menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nPengirim: {pengirim}\nTanggal: {tanggal}")
-                            except Exception:
-                                pass
-                            st.success("Surat masuk berhasil dicatat.")
-                            st.rerun()
+            if submitted:
+                if not file_upload:
+                    st.error("File surat wajib diupload.")
+                else:
+                    conn = get_db()
+                    cur = conn.cursor()
+                    file_blob = file_upload.read()
+                    file_name = file_upload.name
+                    # Simpan data ke DB (indeks otomatis di rekap)
+                    sid = str(uuid.uuid4())
+                    cur.execute("""
+                        INSERT INTO surat_masuk (id, nomor, tanggal, pengirim, perihal, file_blob, file_name, status, follow_up)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        sid,
+                        nomor,
+                        tanggal.isoformat(),
+                        pengirim,
+                        perihal,
+                        file_blob,
+                        file_name,
+                        status,
+                        follow_up
+                    ))
+                    conn.commit()
+                    try:
+                        audit_log("surat_masuk", "create", target=sid, details=f"{nomor} - {perihal} ({pengirim})")
+                    except Exception:
+                        pass
+                    st.success("Surat masuk berhasil dicatat.")
 
-    # Tab 2: Approval (Director/Superuser)
     with tab2:
         st.markdown("### Approval Surat Masuk")
-        if role in ["director", "superuser"]:
-            _, df = _sm_read_df()
-            pending = df[pd.to_numeric(df.get("director_approved", 0), errors="coerce").fillna(0).astype(int) == 0]
-            if pending.empty:
-                st.info("Tidak ada surat masuk yang menunggu approval.")
-            else:
-                opts = [f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')}" for _, r in pending.sort_values(by="tanggal", ascending=False).iterrows()]
-                map_id = {f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')}": r.get('id') for _, r in pending.iterrows()}
-                pick = st.selectbox("Pilih surat untuk approval:", opts, key="sm_pick")
-                if pick:
-                    row = pending[pending['id'] == map_id[pick]].iloc[0]
-                    st.write(f"Pengirim: {row.get('pengirim','')}")
-                    st.write(f"Status: {row.get('status','')}")
-                    st.write(f"Follow Up: {row.get('follow_up','')}")
-                    if row.get("file_link"):
-                        st.markdown(f"[Link Surat]({row.get('file_link')})")
-                    if row.get("file_id") and row.get("file_name"):
-                        _download_button(row.get("file_id"), row.get("file_name"), key=f"dl_sm_{row.get('id')}")
-                    colA, colB = st.columns(2)
-                    with colA:
-                        if st.button("Approve Surat Masuk", key=f"approve_{row.get('id')}"):
-                            _sm_update_by_id(row.get("id"), {"director_approved": 1})
-                            audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=1")
-                            try:
-                                submitter = str(row.get("submitted_by",""))
-                                if submitter:
-                                    send_notification_email(submitter, "[WIJNA] Surat Masuk Disetujui",
-                                                            f"Surat Masuk {row.get('nomor','')} telah disetujui Director.")
-                            except Exception:
-                                pass
-                            st.success("Surat masuk di-approve Director.")
-                            st.rerun()
-                    with colB:
-                        if st.button("Reject Surat Masuk", key=f"reject_{row.get('id')}"):
-                            _sm_update_by_id(row.get("id"), {"director_approved": -1})
-                            audit_log("surat_masuk", "director_approval", target=row.get("id"), details="approve=0")
-                            try:
-                                submitter = str(row.get("submitted_by",""))
-                                if submitter:
-                                    send_notification_email(submitter, "[WIJNA] Surat Masuk Ditolak",
-                                                            f"Surat Masuk {row.get('nomor','')} ditolak Director.")
-                            except Exception:
-                                pass
-                            st.warning("Surat masuk ditolak Director.")
-                            st.rerun()
-                elif int(row.get("director_approved", 0)) == 1:
-                    st.success(
-                        f"Sudah di-approve Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
-                    )
-                elif int(row.get("director_approved", 0)) == -1:
-                    st.error(
-                        f"Surat masuk ditolak Director: {row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}"
-                    )
+        if user["role"] in ["director", "superuser"]:
+            conn = get_db()
+            cur = conn.cursor()
+            df = pd.read_sql_query("SELECT id, nomor, tanggal, pengirim, perihal, file_name, status, follow_up, director_approved, rekap FROM surat_masuk ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                if row.get("director_approved", 0) == 0:
+                    with st.expander(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}"):
+                        st.write(f"Pengirim: {row['pengirim']}")
+                        st.write(f"Status: {row['status']}")
+                        st.write(f"Follow Up: {row['follow_up']}")
+                        if row['file_name']:
+                            if str(row['file_name']).startswith('http'):
+                                st.markdown(f"[Link Surat]({row['file_name']})")
+                            else:
+                                lihat = st.button(f"Lihat File Surat", key=f"dl_{row['id']}")
+                                if lihat:
+                                    try:
+                                        audit_log("surat_masuk", "view_file", target=row['id'], details=row['file_name'])
+                                    except Exception:
+                                        pass
+                                    cur.execute("SELECT file_blob, file_name FROM surat_masuk WHERE id= ?", (row['id'],))
+                                    f = cur.fetchone()
+                                    if f and f['file_blob']:
+                                        st.download_button("Lihat File Surat", data=f['file_blob'], file_name=f['file_name'])
+                        colA, colB = st.columns(2)
+                        with colA:
+                            if st.button("Approve Surat Masuk", key=f"approve_{row['id']}"):
+                                cur.execute("UPDATE surat_masuk SET director_approved=1 WHERE id= ?", (row['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("surat_masuk", "director_approval", target=row['id'], details="approve=1")
+                                except Exception:
+                                    pass
+                                st.success("Surat masuk di-approve Director.")
+                                st.rerun()
+                        with colB:
+                            if st.button("Reject Surat Masuk", key=f"reject_{row['id']}"):
+                                cur.execute("UPDATE surat_masuk SET director_approved=-1 WHERE id= ?", (row['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("surat_masuk", "director_approval", target=row['id'], details="approve=0")
+                                except Exception:
+                                    pass
+                                st.warning("Surat masuk ditolak Director.")
+                                st.rerun()
+                elif row.get("director_approved", 0) == 1:
+                    st.success(f"Sudah di-approve Director: {row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                elif row.get("director_approved", 0) == -1:
+                    st.error(f"Surat masuk ditolak Director: {row['nomor']} | {row['perihal']} | {row['tanggal']}")
         else:
             st.info("Hanya Director atau Superuser yang dapat meng-approve surat masuk.")
-
-    # Tab 3: Daftar & Rekap
+    # Tab Rekap Surat Masuk
     with tab3:
         st.markdown("### Daftar & Rekap Surat Masuk")
-        _, df = _sm_read_df()
+        conn = get_db()
+        cur = conn.cursor()
+        df = pd.read_sql_query("SELECT id, nomor, tanggal, pengirim, perihal, file_name, rekap, director_approved FROM surat_masuk ORDER BY tanggal DESC", conn)
+        # Indeks otomatis
         if not df.empty:
-            df_show = df.copy()
-            # Indeks otomatis
-            df_show = df_show.sort_values(by="tanggal", ascending=False).reset_index(drop=True)
-            df_show["indeks"] = [f"SM-{i+1:04d}" for i in range(len(df_show))]
-            show_cols = [
-                c
-                for c in ["indeks", "nomor", "tanggal", "pengirim", "perihal", "file_name"]
-                if c in df_show.columns
-            ]
+            df = df.copy()
+            df['indeks'] = [f"SM-{i+1:04d}" for i in range(len(df))]
+            show_cols = ["indeks","nomor","tanggal","pengirim","perihal","file_name"]
         else:
-            df_show = df
-            show_cols = [c for c in ["nomor", "tanggal", "pengirim", "perihal", "file_name"] if c in df.columns]
+            show_cols = ["nomor","tanggal","pengirim","perihal","file_name"]
 
-        # Rekap only
-        rekap_df = df[df.get("rekap", 0) == 1].copy() if not df.empty else df.copy()
+        # Tabel rekap dengan tombol download di kolom, styled modern UI
+        rekap_df = df[df['rekap']==1].copy() if 'rekap' in df.columns else df.copy()
         if not rekap_df.empty:
-            # Build download links column via buttons below table
-            st.dataframe(rekap_df[show_cols], width='stretch', hide_index=True)
-            # Optional: quick download selector
-            files = [
-                f"{r.get('nomor','')}: {r.get('file_name','')}" for _, r in rekap_df.iterrows() if r.get("file_id") and r.get("file_name")
-            ]
-            mapping = {
-                f"{r.get('nomor','')}: {r.get('file_name','')}": (r.get("file_id"), r.get("file_name"))
-                for _, r in rekap_df.iterrows()
-                if r.get("file_id") and r.get("file_name")
-            }
-            if files:
-                pick = st.selectbox("Pilih surat untuk diunduh:", files, key="rekap_pick")
-                if pick:
-                    fid, fname = mapping.get(pick, ("", ""))
-                    _download_button(fid, fname, key=f"dl_rekap_{hash(pick)}")
+            download_links = []
+            for idx, row in rekap_df.iterrows():
+                cur.execute("SELECT file_blob FROM surat_masuk WHERE id=?", (row['id'],))
+                f = cur.fetchone()
+                if f and f['file_blob']:
+                    import base64
+                    b64 = base64.b64encode(f['file_blob']).decode()
+                    href = f'<a class="rekap-download-btn" href="data:application/octet-stream;base64,{b64}" download="{row["file_name"]}"><span style="font-size:1.1em;">⬇️</span> Download</a>'
+                else:
+                    href = '<span style="color:#bbb">-</span>'
+                download_links.append(href)
+            rekap_df = rekap_df.reset_index(drop=True)
+            rekap_df['Download'] = download_links
+            # Custom styled HTML table
+            table_html = rekap_df[show_cols + ["Download"]].to_html(escape=False, index=False, classes="rekap-table")
+            st.markdown('''
+<style>
+.rekap-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    font-size: 1.05em;
+    background: #f8fbff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(80,140,255,0.07);
+}
+.rekap-table th {
+    background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+    color: #fff;
+    font-weight: 700;
+    text-align: center;
+    padding: 10px 8px;
+    border: none;
+}
+.rekap-table td {
+    text-align: center;
+    padding: 8px 6px;
+    border-bottom: 1px solid #e3eaff;
+    background: #fff;
+    font-size: 1em;
+}
+.rekap-table tr:last-child td {
+    border-bottom: none;
+}
+.rekap-download-btn {
+    display: inline-block;
+    background: linear-gradient(90deg, #38c6ff 0%, #4f8cff 100%);
+    color: #fff !important;
+    padding: 4px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    text-decoration: none;
+    box-shadow: 0 1px 4px rgba(80,140,255,0.10);
+    transition: background 0.2s;
+}
+.rekap-download-btn:hover {
+    background: linear-gradient(90deg, #4f8cff 0%, #38c6ff 100%);
+    color: #fff !important;
+}
+</style>
+''', unsafe_allow_html=True)
+            st.markdown(table_html, unsafe_allow_html=True)
         else:
             st.info("Belum ada surat masuk yang direkap.")
-
-        # Add to rekap (Director/Superuser only)
-        if role in ["director", "superuser"] and not df.empty:
-            st.markdown("#### Masukan ke Daftar Rekap Surat")
-            for idx, row in df.sort_values(by="tanggal", ascending=False).iterrows():
-                if int(row.get("rekap", 0)) == 0 and int(row.get("director_approved", 0)) == 1:
-                    if st.button("Masukan ke Daftar Rekap Surat", key=f"rekap_{row.get('id')}"):
-                        _sm_update_by_id(row.get("id"), {"rekap": 1})
-                        audit_log("surat_masuk", "rekap_add", target=row.get("id"))
+        # Approval Director: masukan ke rekap
+        if user["role"] in ["director", "superuser"]:
+            for idx, row in df.iterrows():
+                if row.get("rekap", 0) == 0 and row.get("director_approved", 0) == 1:
+                    if st.button("Masukan ke Daftar Rekap Surat", key=f"rekap_{row['id']}"):
+                        cur.execute("UPDATE surat_masuk SET rekap=1 WHERE id= ?", (row['id'],))
+                        conn.commit()
+                        try:
+                            audit_log("surat_masuk", "rekap_add", target=row['id'])
+                        except Exception:
+                            pass
                         st.success("Surat masuk dimasukan ke rekap.")
                         st.rerun()
 
-
 def surat_keluar_module():
+    conn = get_db()
+    cur = conn.cursor()
     user = require_login()
-    st.header("📤 Surat Keluar")
 
-    # Headers and worksheet helpers
-    def _sk_headers():
-        return [
-            "id", "nomor", "tanggal", "ditujukan", "perihal", "pengirim",
-            "status", "follow_up", "director_note", "director_approved",
-            "draft_file_id", "draft_name", "draft_link",
-            "final_file_id", "final_name", "final_link",
-            "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _sk_ws():
-        try:
-            return _get_ws(SURAT_KELUAR_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            spreadsheet = get_spreadsheet()
-            return ensure_sheet_with_headers(spreadsheet, SURAT_KELUAR_SHEET_NAME, _sk_headers())
-
-    def _sk_read_df():
-        ws = _sk_ws()
-        headers = _sk_headers()
-        try:
-            df = pd.DataFrame(_cached_get_all_records(SURAT_KELUAR_SHEET_NAME, headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        # Ensure columns
-        for h in headers:
-            if h not in df.columns:
-                df[h] = 0 if h in ("director_approved",) else ""
-        df["director_approved"] = pd.to_numeric(df.get("director_approved"), errors="coerce").fillna(0).astype(int)
-        return ws, df
-
-    def _sk_append(row: dict):
-        ws = _sk_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _sk_update_by_id(sid: str, updates: dict):
-        ws = _sk_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(sid)
-        if not id_cell:
-            raise ValueError("ID tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-
-    # Drive helpers
-    def _upload_to_drive(file) -> tuple[str, str, str]:
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            file_metadata = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
-            media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type or "application/octet-stream", resumable=True)
-            resp = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id, webViewLink",
-                supportsAllDrives=True,
-            ).execute()
-            try:
-                service.permissions().create(
-                    fileId=resp["id"],
-                    body={"role": "reader", "type": "anyone"},
-                    supportsAllDrives=True,
-                ).execute()
-            except Exception:
-                pass
-            try:
-                audit_log("surat_keluar", "upload", target=resp.get("id", ""), details=f"name={file.name}; type={file.type}")
-            except Exception:
-                pass
-            return resp.get("id", ""), file.name, resp.get("webViewLink", "")
-        except Exception as e:
-            st.warning(f"Gagal upload ke Drive: {e}")
-            return "", "", ""
-
-    def _download_button(file_id: str, file_name: str, key: str):
-        if not file_id or not file_name:
-            return
-        try:
-            service = get_gdrive_service()
-            request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-            fh = io.BytesIO()
-            fh.write(request.execute())
-            fh.seek(0)
-            st.download_button(
-                label=f"⬇️ Download {file_name}",
-                data=fh.getvalue(),
-                file_name=file_name,
-                mime="application/octet-stream",
-                key=key,
-            )
-        except Exception as e:
-            st.caption(f"Tidak dapat download: {e}")
-
+    st.markdown("# 📤 Surat Keluar")
     tab1, tab2, tab3 = st.tabs([
         "📝 Input Draft Surat Keluar",
         "✅ Approval",
-        "📋 Daftar & Rekap Surat Keluar",
+        "📋 Daftar & Rekap Surat Keluar"
     ])
 
-    # Tab 1: Input Draft
+    # --- Tab 1: Input Draft oleh Staf ---
     with tab1:
         st.markdown("### Input Draft Surat Keluar (Staf)")
-        # Pilih jenis draft di luar form agar perubahan memicu rerun dan input muncul dinamis
-        st.session_state.setdefault("sk_draft_type", "Upload File")
-        st.radio(
-            "Jenis Draft Surat",
-            ["Upload File", "Link URL"],
-            horizontal=True,
-            key="sk_draft_type",
-        )
         with st.form("sk_add", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
@@ -2809,560 +1717,283 @@ def surat_keluar_module():
             with col2:
                 ditujukan = st.text_input("Ditujukan Kepada")
                 perihal = st.text_input("Perihal")
-            # Gunakan pilihan dari radio di luar form agar dinamis
-            draft_type = st.session_state.get("sk_draft_type", "Upload File")
-            draft_file = None
-            draft_link = None
+            draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True)
+            draft_blob, draft_name, draft_url = None, None, None
             if draft_type == "Upload File":
-                draft_file = st.file_uploader(
-                    "Upload Draft Surat (PDF/DOC)",
-                    type=["pdf", "doc", "docx"],
-                    key="sk_draft_file",
-                )
+                draft = st.file_uploader("Upload Draft Surat (PDF/DOC)")
             else:
-                draft_link = st.text_input(
-                    "Link Draft Surat (Google Drive, dll)",
-                    key="sk_draft_link",
-                )
+                draft = None
+                draft_url = st.text_input("Link Draft Surat (Google Drive, dll)")
             follow_up = st.text_area("Tindak Lanjut (opsional)")
             submit = st.form_submit_button("💾 Simpan Draft Surat Keluar")
             if submit:
-                if draft_type == "Upload File" and not draft_file:
+                if draft_type == "Upload File" and not draft:
                     st.error("File draft surat wajib diupload.")
-                elif draft_type == "Link URL" and not draft_link:
+                elif draft_type == "Link URL" and not draft_url:
                     st.error("Link draft surat wajib diisi.")
                 else:
                     sid = gen_id("sk")
-                    now = now_wib_iso()
-                    draft_file_id, draft_name, draft_web = "", "", ""
                     if draft_type == "Upload File":
-                        draft_file_id, draft_name, draft_web = _upload_to_drive(draft_file)
-                        if not draft_file_id:
-                            st.error("Gagal mengupload draft ke Drive.")
-                            st.stop()
-                    _sk_append({
-                        "id": sid,
-                        "nomor": nomor,
-                        "tanggal": tanggal.isoformat(),
-                        "ditujukan": ditujukan,
-                        "perihal": perihal,
-                        "pengirim": user.get("full_name") or user.get("email"),
-                        "status": "Draft",
-                        "follow_up": follow_up,
-                        "director_note": "",
-                        "director_approved": 0,
-                        "draft_file_id": draft_file_id,
-                        "draft_name": draft_name,
-                        "draft_link": draft_link or draft_web,
-                        "final_file_id": "",
-                        "final_name": "",
-                        "final_link": "",
-                        "created_at": now,
-                        "updated_at": now,
-                        "submitted_by": user.get("email"),
-                    })
-                    audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; draft={'file:'+draft_name if draft_name else 'url:'+str(draft_link)}")
-                    # Notifikasi: Ada draft Surat Keluar yang perlu direview/approve
+                        draft_blob, draft_name, _ = upload_file_and_store(draft)
+                    cur.execute("""INSERT INTO surat_keluar (id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,draft_blob,draft_name,status,follow_up, draft_url)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (sid, '', nomor, tanggal.isoformat(), ditujukan, perihal, user['full_name'], draft_blob, draft_name, "Draft", follow_up, draft_url))
+                    conn.commit()
                     try:
-                        notify_event("surat_keluar", "draft", "[WIJNA] Draft Surat Keluar Baru",
-                                     f"Draft Surat Keluar menunggu review/approve.\n\nNomor: {nomor}\nPerihal: {perihal}\nDitujukan: {ditujukan}\nDibuat oleh: {user.get('full_name') or user.get('email')}\nTanggal: {tanggal}")
+                        det = f"draft_file={draft_name}" if draft_name else f"draft_url={draft_url}"
+                        audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; {det}")
                     except Exception:
                         pass
                     st.success("✅ Surat keluar (draft) tersimpan.")
-                    st.rerun()
 
-    # Tab 2: Approval Director
+    # --- Tab 2: Approval Director ---
     with tab2:
         st.markdown("### Approval Surat Keluar (Director)")
-        role = str(user.get("role", "")).lower()
-        if role in ["director", "superuser"]:
-            _, df = _sk_read_df()
-            df = df.copy().sort_values(by="tanggal", ascending=False)
-            opts = [f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')} | {r.get('status','')}" for _, r in df.iterrows()]
-            map_id = {f"{r.get('nomor','')} | {r.get('perihal','')} | {r.get('tanggal','')} | {r.get('status','')}": r.get('id') for _, r in df.iterrows()}
-            pick = st.selectbox("Pilih surat untuk diproses:", opts, key="sk_pick")
-            if pick:
-                row = df[df['id'] == map_id[pick]].iloc[0]
-                st.write(f"Ditujukan: {row.get('ditujukan','')}")
-                st.write(f"Pengirim: {row.get('pengirim','')}")
-                st.write(f"Follow Up: {row.get('follow_up','')}")
-                if row.get("draft_file_id") and row.get("draft_name"):
-                    st.markdown(f"**Draft Surat (file):** {row.get('draft_name')}")
-                    _download_button(row.get("draft_file_id"), row.get("draft_name"), key=f"dl_sk_draft_{row.get('id')}")
-                elif row.get("draft_link"):
-                    st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row.get('draft_link')})")
-                note = st.text_area("Catatan Director", value=str(row.get("director_note","")), key=f"sk_note_{row.get('id')}")
-                final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"sk_final_{row.get('id')}")
-                colA, colB = st.columns(2)
-                with colA:
-                    approve = st.button("✅ Approve & Upload Final", key=f"sk_approve_{row.get('id')}")
-                with colB:
-                    disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"sk_disapprove_{row.get('id')}")
-                if approve:
-                    if not final:
-                        st.error("File final wajib diupload agar surat keluar tercatat resmi.")
-                    else:
-                        fid, fname, flink = _upload_to_drive(final)
-                        if not fid:
-                            st.error("Gagal mengupload final ke Drive.")
+        if user["role"] in ["director","superuser"]:
+            df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_blob, draft_name, draft_url FROM surat_keluar ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['nomor']} | {row['perihal']} | {row['tanggal']} | Status: {row['status']}"):
+                    st.write(f"Ditujukan: {row['ditujukan']}")
+                    st.write(f"Pengirim: {row['pengirim']}")
+                    st.write(f"Follow Up: {row['follow_up']}")
+                    # Preview/download draft
+                    if row['draft_blob'] and row['draft_name']:
+                        st.markdown(f"**Draft Surat (file):** {row['draft_name']}")
+                        show_file_download(row['draft_blob'], row['draft_name'])
+                    elif row.get('draft_url'):
+                        st.markdown(f"**Draft Surat (link):** [Lihat Draft]({row['draft_url']})")
+                    # Catatan dan upload final
+                    note = st.text_area("Catatan Director", value="", key=f"note_{row['id']}")
+                    final = st.file_uploader("Upload File Final (wajib untuk status resmi)", key=f"final_{row['id']}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        approve = st.button("✅ Approve & Upload Final", key=f"approve_{row['id']}")
+                    with colB:
+                        disapprove = st.button("❌ Disapprove (Revisi ke Draft)", key=f"disapprove_{row['id']}")
+                    if approve:
+                        if not final:
+                            st.error("File final wajib diupload agar surat keluar tercatat resmi.")
                         else:
+                            blob, fname, _ = upload_file_and_store(final)
+                            cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
+                                        (blob, fname, note, row['id']))
+                            conn.commit()
                             try:
-                                audit_log("surat_keluar", "final_upload", target=fid, details=f"name={fname}")
+                                audit_log("surat_keluar", "director_approval", target=row['id'], details=f"final={fname}; note={note}")
                             except Exception:
                                 pass
-                            _sk_update_by_id(row.get("id"), {
-                                "final_file_id": fid,
-                                "final_name": fname,
-                                "final_link": flink,
-                                "director_note": note,
-                                "director_approved": 1,
-                                "status": "Final",
-                                "updated_at": now_wib_iso(),
-                            })
-                            audit_log("surat_keluar", "director_approval", target=row.get("id"), details=f"final={fname}; note={note}")
                             st.success("Final uploaded & approved.")
                             st.rerun()
-                if disapprove:
-                    _sk_update_by_id(row.get("id"), {
-                        "status": "Draft",
-                        "director_note": note,
-                        "director_approved": 0,
-                        "updated_at": now_wib_iso(),
-                    })
-                    audit_log("surat_keluar", "director_disapprove", target=row.get("id"), details=f"note={note}")
-                    st.warning("Surat dikembalikan ke draft untuk direvisi.")
-                    st.rerun()
+                    if disapprove:
+                        cur.execute("UPDATE surat_keluar SET status='Draft', director_note=?, director_approved=0 WHERE id=?", (note, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("surat_keluar", "director_disapprove", target=row['id'], details=f"note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Surat dikembalikan ke draft untuk direvisi.")
+                        st.rerun()
         else:
             st.info("Hanya Director yang dapat meng-approve dan upload file final.")
 
-    # Tab 3: Daftar & Rekap
+    # --- Tab 3: Daftar & Rekap Surat Keluar ---
     with tab3:
         st.markdown("### Daftar & Rekap Surat Keluar")
-        _, df = _sk_read_df()
+        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_name, draft_url, final_blob FROM surat_keluar ORDER BY tanggal DESC", conn)
+        # Indeks otomatis: urutan
         if not df.empty:
-            df = df.copy().sort_values(by="tanggal", ascending=False).reset_index(drop=True)
-            # Kode referensi tampilan
-            df["indeks"] = [f"SK-{i+1:04d}" for i in range(len(df))]
-            st.dataframe(df[[c for c in ["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"] if c in df.columns]], width='stretch', hide_index=True)
-            st.markdown("#### Download File Final Surat Keluar")
-            for idx, row in df.iterrows():
-                if row.get("final_file_id") and row.get("final_name"):
-                    st.write(f"{row.get('nomor','')} | {row.get('perihal','')} | {row.get('tanggal','')}")
-                    _download_button(row.get("final_file_id"), row.get("final_name"), key=f"dl_sk_final_{row.get('id')}_{idx}")
-        else:
-            st.info("Belum ada surat keluar.")
-
+            df = df.copy()
+            df['indeks'] = [f"SK-{i+1:04d}" for i in range(len(df))]
+        # Kolom file final dapat diunduh
+        def file_final_link(row):
+            if row['final_blob'] and row['final_name']:
+                show_file_download(row['final_blob'], row['final_name'])
+        st.dataframe(df[["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"]], use_container_width=True, hide_index=True)
+        st.markdown("#### Download File Final Surat Keluar")
+        for idx, row in df.iterrows():
+            if row['final_blob'] and row['final_name']:
+                st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                show_file_download(row['final_blob'], row['final_name'])
         # Rekap Bulanan
         st.markdown("#### 📊 Rekap Bulanan Surat Keluar")
         this_month = date.today().strftime("%Y-%m")
         df_month = pd.DataFrame()
         if not df.empty:
-            df_month = df[df["tanggal"].astype(str).str[:7] == this_month]
+            df_month = df[df['tanggal'].str[:7] == this_month]
         st.write(f"Total surat keluar bulan ini: **{len(df_month)}**")
         if not df_month.empty:
-            approved = df_month[df_month["director_approved"] == 1]
-            draft = df_month[df_month["status"].astype(str).str.lower() == "draft"]
-            percent_final = (len(approved) / len(df_month)) * 100 if len(df_month) > 0 else 0
+            approved = df_month[df_month['director_approved']==1]
+            draft = df_month[df_month['status'].str.lower() == 'draft']
+            percent_final = (len(approved)/len(df_month))*100 if len(df_month) > 0 else 0
             st.info(f"Approved: {len(approved)} | Masih Draft: {len(draft)} | % Finalisasi: {percent_final:.1f}%")
-            # Export Excel/CSV
-            export_cols = [c for c in ["nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name","director_approved"] if c in df_month.columns]
-            xbuf = io.BytesIO()
-            try:
-                df_month[export_cols].to_excel(xbuf, index=False, engine="openpyxl")
-            except Exception:
-                # Fallback without engine name if not available in env
-                df_month[export_cols].to_excel(xbuf, index=False)
-            xbuf.seek(0)
-            st.download_button("⬇️ Download Rekap Bulanan (Excel)", xbuf, file_name=f"rekap_suratkeluar_{this_month}.xlsx")
-            st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month[export_cols].to_csv(index=False), file_name=f"rekap_suratkeluar_{this_month}.csv")
-
+            # Perbaiki export Excel
+            import io
+            excel_buffer = io.BytesIO()
+            df_month.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+            st.download_button("⬇️ Download Rekap Bulanan (Excel)", excel_buffer, file_name=f"rekap_suratkeluar_{this_month}.xlsx")
+            st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_suratkeluar_{this_month}.csv")
 
 def mou_module():
-    """Module Manajemen MoU menggunakan Google Sheets + Google Drive.
-    Sheet: MOU_SHEET_NAME dengan kolom:
-      id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai,
-      draft_file_id, draft_file_name, draft_file_link,
-      board_note, board_approved,
-      final_file_id, final_file_name, final_file_link,
-      created_at, updated_at, submitted_by
-    """
     user = require_login()
     st.header("🤝 MoU")
-
-    # Helpers
-    def _mou_ws():
-        """Return worksheet for MoU, create if not exists (idempotent)."""
-        try:
-            return _get_ws(MOU_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            # Kemungkinan flag _core_sheets_ok sudah True sebelum penambahan sheet MoU.
-            # Buat sheet baru dengan header standar.
-            try:
-                spreadsheet = get_spreadsheet()
-                mou_headers = [
-                    "id", "nomor", "nama", "pihak", "jenis",
-                    "tgl_mulai", "tgl_selesai",
-                    "draft_file_id", "draft_file_name", "draft_file_link",
-                    "board_note", "board_approved",
-                    "final_file_id", "final_file_name", "final_file_link",
-                    "created_at", "updated_at", "submitted_by"
-                ]
-                ws = ensure_sheet_with_headers(spreadsheet, MOU_SHEET_NAME, mou_headers)
-                st.toast("Sheet MoU dibuat otomatis.")
-                return ws
-            except Exception as e:
-                st.error(f"Gagal membuat sheet MoU: {e}")
-                raise
-
-    def _mou_headers():
-        return [
-            "id", "nomor", "nama", "pihak", "jenis",
-            "tgl_mulai", "tgl_selesai",
-            "draft_file_id", "draft_file_name", "draft_file_link",
-            "board_note", "board_approved",
-            "final_file_id", "final_file_name", "final_file_link",
-            "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _mou_read_df():
-        ws = _mou_ws()
-        headers = _mou_headers()
-        try:
-            df = pd.DataFrame(_cached_get_all_records(MOU_SHEET_NAME, headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        # Normalize board_approved
-        df['board_approved'] = pd.to_numeric(df.get('board_approved'), errors='coerce').fillna(0).astype(int)
-        return ws, df
-
-    def _mou_append(row: dict):
-        ws = _mou_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                break
-            except gspread.exceptions.APIError as e:
-                if '429' in str(e):
-                    time.sleep(1 + i)
-                    continue
-                raise
-        st.cache_data.clear()
-
-    def _mou_update_by_id(mid: str, updates: dict):
-        ws = _mou_ws()
-        headers = ws.row_values(1)
-        id_cell = ws.find(mid)
-        if not id_cell:
-            raise ValueError("ID MoU tidak ditemukan")
-        row_idx = id_cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, v)
-                    break
-                except gspread.exceptions.APIError as e:
-                    if '429' in str(e):
-                        time.sleep(1 + i)
-                        continue
-                    raise
-        st.cache_data.clear()
-
-    def _upload_file(file) -> tuple[str, str, str]:
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
-            folder_id = GDRIVE_FOLDER_ID
-            file_metadata = {"name": file.name, "parents": [folder_id]}
-            created = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink, name").execute()
-            fid = created.get("id", "")
-            link = created.get("webViewLink", "")
-            name = created.get("name", file.name)
-            return fid, name, link
-        except Exception as e:
-            st.error(f"Upload gagal: {e}")
-            return "", "", ""
-
-    tab1, tab2, tab3 = st.tabs([
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab4 = st.tabs([
         "📝 Input Draft MoU",
         "👥 Review Board",
         "📋 Daftar & Rekap MoU"
     ])
 
-    jenis_options = [
-        "Programmatic MoU",
-        "Funding MoU / Grant Agreement",
-        "Strategic Partnership MoU",
-        "Capacity Building MoU",
-        "Secondment MoU",
-        "Internship/Volunteer MoU",
-        "Advocacy MoU",
-        "Operational MoU",
-        "Research & Development MoU",
-        "MoU Advokasi Kebijakan Publik",
-        "MoU Operasional",
-    ]
-
-    # TAB 1: Input Draft
+    # --- Tab 1: Input Draft MoU ---
     with tab1:
-        st.markdown("### Input Draft MoU (Draft Baru)")
-        if not can_create("mou", user):
-            st.info("Peran Anda tidak memiliki akses membuat draft MoU.")
-            return
+        st.markdown("### Input Draft MoU (Staf)")
+        jenis_options = [
+            "Programmatic MoU",
+            "Funding MoU / Grant Agreement",
+            "Strategic Partnership MoU",
+            "Capacity Building MoU",
+            "Secondment MoU",
+            "Internship/Volunteer MoU",
+            "Advocacy MoU",
+            "Operational MoU",
+            "Research & Development MoU",
+            "MoU Advokasi Kebijakan Publik",
+            "MoU Operasional",
+        ]
         with st.form("mou_add", clear_on_submit=True):
             nomor = st.text_input("Nomor MoU")
             nama = st.text_input("Nama MoU")
             pihak = st.text_input("Pihak Terlibat")
             jenis = st.selectbox("Jenis MoU", jenis_options)
             tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
-            tgl_selesai = st.date_input("Tgl Selesai", value=date.today() + timedelta(days=365))
-            draft_file = st.file_uploader("File Draft MoU (wajib)")
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today()+timedelta(days=365))
+            f = st.file_uploader("File Draft MoU (wajib)")
             submit = st.form_submit_button("Simpan Draft MoU")
             if submit:
-                if not draft_file:
+                if not f:
                     st.error("File draft MoU wajib diupload.")
                 elif tgl_selesai < tgl_mulai:
                     st.error("Tanggal selesai tidak boleh sebelum tanggal mulai.")
                 else:
                     mid = gen_id("mou")
-                    fid, fname, flink = _upload_file(draft_file)
-                    now = now_wib_iso()
-                    row = {
-                        "id": mid,
-                        "nomor": nomor,
-                        "nama": nama,
-                        "pihak": pihak,
-                        "jenis": jenis,
-                        "tgl_mulai": tgl_mulai.isoformat(),
-                        "tgl_selesai": tgl_selesai.isoformat(),
-                        "draft_file_id": fid,
-                        "draft_file_name": fname,
-                        "draft_file_link": flink,
-                        "board_note": "",
-                        "board_approved": 0,
-                        "final_file_id": "",
-                        "final_file_name": "",
-                        "final_file_link": "",
-                        "created_at": now,
-                        "updated_at": now,
-                        "submitted_by": user.get("email", "")
-                    }
-                    _mou_append(row)
+                    blob, fname, _ = upload_file_and_store(f)
+                    cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,board_note,board_approved,final_blob,final_name)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, "", 0, None, None))
+                    conn.commit()
                     try:
                         audit_log("mou", "create", target=mid, details=f"{nomor} - {nama} ({jenis})")
-                        notify_event("mou", "create", "MoU Draft Baru", f"Draft MoU baru dibuat: {nomor} - {nama}")
                     except Exception:
                         pass
                     st.success("MoU tersimpan (draft).")
-                    st.rerun()
 
-    # TAB 2: Review Board
+    # --- Tab 2: Review Board (opsional) ---
     with tab2:
         st.markdown("### Review Board (Opsional)")
-        if user.get("role") in ["board", "superuser"]:
-            _, df_mou = _mou_read_df()
-            if df_mou.empty:
-                st.info("Belum ada MoU untuk direview.")
-            else:
-                # Urutkan tgl_selesai asc
-                try:
-                    df_mou = df_mou.sort_values(by="tgl_selesai")
-                except Exception:
-                    pass
-                for idx, row in df_mou.iterrows():
-                    exp_label = f"{row['nomor']} | {row['nama']} | {row['tgl_mulai']} - {row['tgl_selesai']}"
-                    with st.expander(exp_label):
-                        st.write(f"Pihak: {row['pihak']}")
-                        st.write(f"Jenis: {row['jenis']}")
-                        st.write(f"Catatan Board: {row['board_note']}")
-                        note = st.text_area("Catatan Board", value=row['board_note'], key=f"board_note_{row['id']}")
-                        approve = st.checkbox("Approve Board", value=bool(row['board_approved']), key=f"board_appr_{row['id']}")
-                        if st.button("Simpan Review Board", key=f"save_board_{row['id']}"):
-                            try:
-                                _mou_update_by_id(row['id'], {
-                                    "board_note": note,
-                                    "board_approved": 1 if approve else 0,
-                                    "updated_at": now_wib_iso()
-                                })
-                                try:
-                                    audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
-                                except Exception:
-                                    pass
-                                st.success("Review Board disimpan.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Gagal menyimpan: {e}")
+        if user["role"] in ["board","superuser"]:
+            df = pd.read_sql_query("SELECT id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai, board_note, board_approved FROM mou ORDER BY tgl_selesai ASC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['nomor']} | {row['nama']} | {row['tgl_mulai']} - {row['tgl_selesai']}"):
+                    st.write(f"Pihak: {row['pihak']}")
+                    st.write(f"Jenis: {row['jenis']}")
+                    st.write(f"Catatan Board: {row['board_note']}")
+                    note = st.text_area("Catatan Board", value=row['board_note'], key=f"board_note_{row['id']}")
+                    approve = st.checkbox("Approve Board", value=bool(row['board_approved']), key=f"board_approved_{row['id']}")
+                    if st.button("Simpan Review Board", key=f"save_board_{row['id']}"):
+                        cur.execute("UPDATE mou SET board_note=?, board_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
+                        st.success("Review Board disimpan.")
+                        conn.commit()
+                        st.success("Review Board disimpan.")
+                        try:
+                            audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        st.rerun()
         else:
             st.info("Hanya Board yang dapat review di sini.")
 
-    # TAB 3: Daftar & Rekap
-    with tab3:
-        st.markdown("### Daftar & Rekap MoU")
-        _, df_all = _mou_read_df()
-        today = date.today()
-        if not df_all.empty:
-            # Status aktif
-            def _status(row):
-                try:
-                    mulai = datetime.fromisoformat(str(row['tgl_mulai'])).date()
-                    selesai = datetime.fromisoformat(str(row['tgl_selesai'])).date()
-                    return 'Aktif' if mulai <= today <= selesai else 'Tidak Aktif'
-                except Exception:
-                    return 'Tidak Aktif'
-            df_all['status_aktif'] = df_all.apply(_status, axis=1)
-        else:
-            df_all['status_aktif'] = []
 
-        cols_show = ["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","draft_file_name","board_approved","status_aktif"]
-        show_df = df_all[cols_show].copy() if not df_all.empty else pd.DataFrame(columns=cols_show)
+
+    # --- Tab 4: Daftar & Rekap MoU ---
+    with tab4:
+        st.markdown("### Daftar & Rekap MoU")
+        df = pd.read_sql_query("SELECT id, nomor, nama, pihak, jenis, tgl_mulai, tgl_selesai, file_name, board_approved FROM mou ORDER BY tgl_selesai ASC", conn)
+        # Status aktif (berdasarkan rentang tanggal)
+        today = pd.to_datetime(date.today())
+        if not df.empty:
+            df = df.copy()
+            df['status_aktif'] = [
+                'Aktif' if pd.to_datetime(row['tgl_mulai']) <= today <= pd.to_datetime(row['tgl_selesai']) else 'Tidak Aktif'
+                for _, row in df.iterrows()
+            ]
+        else:
+            df['status_aktif'] = []
+
+        # Siapkan dataframe untuk tampilan
+        show_df = df[["id", "nomor", "nama", "pihak", "jenis", "tgl_mulai", "tgl_selesai", "file_name", "board_approved", "status_aktif"]].copy() if not df.empty else pd.DataFrame(columns=["id","nomor","nama","pihak","jenis","tgl_mulai","tgl_selesai","file_name","board_approved","status_aktif"])
         if not show_df.empty:
             show_df['Board Approved'] = show_df['board_approved'].map({0: '❌', 1: '✅'})
             show_df = show_df.rename(columns={
-                "id":"ID","nomor":"Nomor","nama":"Nama","pihak":"Pihak","jenis":"Jenis",
-                "tgl_mulai":"Tgl Mulai","tgl_selesai":"Tgl Selesai","draft_file_name":"File",
-                "status_aktif":"Status Aktif"
+                "id": "ID",
+                "nomor": "Nomor",
+                "nama": "Nama",
+                "pihak": "Pihak",
+                "jenis": "Jenis",
+                "tgl_mulai": "Tgl Mulai",
+                "tgl_selesai": "Tgl Selesai",
+                "file_name": "File",
+                "status_aktif": "Status Aktif",
             })
+
         left, right = st.columns([3,2])
         with left:
             st.subheader("📋 Daftar MoU")
-            if show_df.empty:
-                st.info("Belum ada data MoU.")
-            else:
-                safe_dataframe(show_df, index=False)
+            cols_order = ["ID","Nomor","Nama","Pihak","Jenis","Tgl Mulai","Tgl Selesai","File","Board Approved","Status Aktif"]
+            disp = show_df[cols_order] if not show_df.empty else show_df
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
         with right:
             st.subheader("⬇️ Download File")
-            if df_all.empty:
-                st.info("Belum ada data.")
-            else:
-                opt_map = {f"{r['nomor']} | {r['nama']} — {r['draft_file_name']}": r['id'] for _, r in df_all.iterrows() if r.get('draft_file_name')}
+            if not df.empty:
+                # Hanya tampilkan opsi yang memiliki file
+                opt_map = {f"{r['nomor']} | {r['nama']} — {r['file_name']}": r['id'] for _, r in df.iterrows() if r.get('file_name')}
                 pilihan = st.selectbox("Pilih MoU", [""] + list(opt_map.keys()))
                 if pilihan:
                     mid = opt_map[pilihan]
-                    # Provide download via Google Drive link if available
-                    _, df_tmp = _mou_read_df()
-                    row = df_tmp[df_tmp['id'] == mid]
-                    if not row.empty:
-                        link = row.iloc[0].get('draft_file_link') or ''
-                        if link:
-                            st.markdown(f"[Buka File Draft di Google Drive]({link})")
-                        else:
-                            st.info("Link file tidak tersedia.")
+                    row = pd.read_sql_query("SELECT file_blob, file_name FROM mou WHERE id=?", conn, params=(mid,))
+                    if not row.empty and row.iloc[0]["file_blob"] is not None and row.iloc[0]["file_name"]:
+                        data_bytes = from_blob(row.iloc[0]["file_blob"])  # decode if base64
+                        st.download_button(
+                            label=f"Download {row.iloc[0]['file_name']}",
+                            data=data_bytes,
+                            file_name=row.iloc[0]['file_name'],
+                            mime="application/octet-stream"
+                        )
+                    else:
+                        st.info("File tidak tersedia untuk MoU terpilih.")
+            else:
+                st.info("Belum ada data MoU.")
+
+        # Rekap Bulanan MoU (opsional, ringkas)
         st.markdown("#### 📅 Rekap Bulanan MoU (Otomatis)")
         this_month = date.today().strftime("%Y-%m")
-        if not df_all.empty:
-            df_month = df_all[(df_all['tgl_mulai'].astype(str).str[:7] == this_month) | (df_all['tgl_selesai'].astype(str).str[:7] == this_month)]
+        if not df.empty:
+            df_month = df[(df['tgl_mulai'].astype(str).str[:7] == this_month) | (df['tgl_selesai'].astype(str).str[:7] == this_month)]
         else:
             df_month = pd.DataFrame()
         st.write(f"Total MoU terkait bulan ini: {len(df_month)}")
         if not df_month.empty:
             by_jenis = df_month['jenis'].value_counts()
             st.write("Rekap per Jenis:")
-            safe_dataframe(by_jenis.to_frame(name='Jumlah'), index=True)
-
+            st.dataframe(by_jenis)
 
 def cash_advance_module():
     user = require_login()
     st.header("💸 Cash Advance")
-
-    # Helpers
-    def _ca_headers():
-        return [
-            "id", "divisi", "items_json", "totals", "tanggal",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "tor_file_id", "tor_file_name", "tor_file_link", "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _ca_ws():
-        try:
-            return _get_ws(CASH_ADVANCE_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            ws = ensure_sheet_with_headers(get_spreadsheet(), CASH_ADVANCE_SHEET_NAME, _ca_headers())
-            return ws
-
-    def _ca_read_df():
-        ws = _ca_ws()
-        headers = _ca_headers()
-        try:
-            records = _cached_get_all_records(CASH_ADVANCE_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        # Ensure required columns
-        for h in headers:
-            if h not in df.columns:
-                df[h] = "" if h not in ("finance_approved", "director_approved") else 0
-        # Normalize numeric approvals
-        for col in ["finance_approved", "director_approved"]:
-            df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0).astype(int)
-        return ws, df
-
-    def _ca_append(row: dict):
-        ws = _ca_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _ca_update_by_id(cid: str, updates: dict):
-        ws = _ca_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(cid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _upload_tor(file) -> tuple[str, str, str] | tuple[None, None, None]:
-        if not file:
-            return None, None, None
-        try:
-            drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
-            meta = {
-                'name': file.name,
-                'parents': [GDRIVE_FOLDER_ID]
-            }
-            created = drive.files().create(body=meta, media_body=media, fields='id, name, webViewLink').execute()
-            file_id = created.get('id')
-            file_link = created.get('webViewLink')
-            return file_id, file.name, file_link
-        except Exception:
-            return None, None, None
-
+    conn = get_db()
+    cur = conn.cursor()
     tab1, tab2, tab3, tab4 = st.tabs([
         "📝 Input Staf",
         "💰 Review Finance",
@@ -3373,11 +2004,11 @@ def cash_advance_module():
     # --- Tab 1: Input Staf ---
     with tab1:
         st.markdown("### Pengajuan Cash Advance (Staf)")
+        # --- Real-time total calculation ---
         if 'ca_nominals' not in st.session_state:
-            st.session_state['ca_nominals'] = [0.0] * 10
-        items: list[dict] = []
-        nama_program = st.text_input("Nama Program / Divisi", key="ca_divisi")
-
+            st.session_state['ca_nominals'] = [0.0]*10
+        items = []
+        nama_program = st.text_input("Nama Program")
         import re
         def format_ribuan(val):
             if val is None or val == "":
@@ -3389,7 +2020,7 @@ def cash_advance_module():
             return f"{int(val_str):,}".replace(",", ".")
 
         for i in range(1, 11):
-            col1, col2 = st.columns([3, 2])
+            col1, col2 = st.columns([3,2])
             with col1:
                 item = st.text_input(f"Item {i}", key=f"ca_item_{i}")
             with col2:
@@ -3397,13 +2028,14 @@ def cash_advance_module():
                 val = st.session_state.get(key_nom, "")
                 val_disp = format_ribuan(val)
                 nominal_str = st.text_input(f"Nominal {i}", value=val_disp, key=key_nom)
+                # Remove non-digit and update session state
                 clean_nom = re.sub(r'[^\d]', '', nominal_str)
                 st.session_state['ca_nominals'][i-1] = float(clean_nom) if clean_nom else 0.0
             if item:
                 items.append({"item": item, "nominal": float(st.session_state['ca_nominals'][i-1])})
         total = sum(st.session_state['ca_nominals'])
         tanggal = st.date_input("Tanggal", value=date.today())
-
+        # Format total as Rp with thousand separator
         def format_rp(val):
             return f"Rp. {val:,.0f}".replace(",", ".")
         st.info(f"Total: {format_rp(total)}")
@@ -3412,310 +2044,139 @@ def cash_advance_module():
                 st.error("Nama Program dan minimal 1 item wajib diisi.")
             else:
                 cid = gen_id("ca")
-                row = {
-                    "id": cid,
-                    "divisi": nama_program,
-                    "items_json": json.dumps(items),
-                    "totals": total,
-                    "tanggal": tanggal.isoformat(),
-                    "finance_note": "",
-                    "finance_approved": 0,
-                    "director_note": "",
-                    "director_approved": 0,
-                    "tor_file_id": "",
-                    "tor_file_name": "",
-                    "tor_file_link": "",
-                    "created_at": now_wib_iso(),
-                    "updated_at": now_wib_iso(),
-                    "submitted_by": (get_current_user() or {}).get("email", "")
-                }
-                _ca_append(row)
+                cur.execute("INSERT INTO cash_advance (id,divisi,items_json,totals,tanggal,finance_note,finance_approved,director_note,director_approved) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (cid, nama_program, json.dumps(items), total, tanggal.isoformat(), "", 0, "", 0))
+                conn.commit()
                 try:
                     audit_log("cash_advance", "create", target=cid, details=f"divisi={nama_program}; total={total}")
                 except Exception:
                     pass
-                try:
-                    notify_event("cash_advance", "create", subject="Cash Advance Baru", body=f"Pengajuan baru {cid} total {format_rp(total)} oleh {row['submitted_by']}")
-                except Exception:
-                    pass
                 st.success("Cash advance diajukan.")
-                st.session_state['ca_nominals'] = [0.0] * 10
-                st.rerun()
+                st.session_state['ca_nominals'] = [0.0]*10
 
     # --- Tab 2: Review Finance ---
     with tab2:
         st.markdown("### Review & Approval Finance")
-        if user.get("role") in ["finance", "superuser"]:
-            _, df_fin = _ca_read_df()
-            if df_fin.empty:
-                st.info("Belum ada pengajuan.")
-            else:
-                # Order by tanggal desc
-                try:
-                    df_fin = df_fin.sort_values(by="tanggal", ascending=False)
-                except Exception:
-                    pass
-                def format_rp(val):
-                    try:
-                        return f"Rp. {float(val):,.0f}".replace(",", ".")
-                    except Exception:
-                        return str(val)
-                for idx, row in df_fin.iterrows():
-                    title = f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"
-                    with st.expander(title):
-                        items = []
+        if user["role"] in ["finance", "superuser"]:
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"):
+                    items = json.loads(row['items_json']) if row['items_json'] else []
+                    # Format nominal columns as Rp
+                    if items:
+                        df_items = pd.DataFrame(items)
+                        if 'nominal' in df_items.columns:
+                            df_items['nominal'] = df_items['nominal'].apply(format_rp)
+                        st.write(df_items)
+                    st.write(f"Catatan: {row['finance_note']}")
+                    note = st.text_area("Catatan Finance", value=row['finance_note'], key=f"fin_note_{row['id']}")
+                    # Opsi upload ToR jika diminta
+                    tor_file = st.file_uploader("Upload File ToR (jika diminta)", key=f"tor_{row['id']}")
+                    # Opsi: Ajukan ke Director atau Kembalikan ke User
+                    colA, colB = st.columns(2)
+                    with colA:
+                        approve = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                    with colB:
+                        return_user = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                    if approve:
+                        # Simpan ToR jika ada
+                        if tor_file:
+                            tor_blob, tor_name, _ = upload_file_and_store(tor_file)
+                            cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=1 WHERE id=?", (note + "\n[ToR diupload: " + tor_name + "]", row['id']))
+                        else:
+                            cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=1 WHERE id=?", (note, row['id']))
+                        conn.commit()
                         try:
-                            items = json.loads(row.get('items_json') or "[]")
+                            tor_info = f"; ToR={tor_file.name}" if tor_file else ""
+                            audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=1; note={note}{tor_info}")
                         except Exception:
-                            items = []
-                        if items:
-                            df_items = pd.DataFrame(items)
-                            if 'nominal' in df_items.columns:
-                                df_items['nominal'] = df_items['nominal'].apply(format_rp)
-                            st.dataframe(df_items, width='stretch')
-                        st.write(f"Catatan Finance: {row.get('finance_note','')}")
-                        note = st.text_area("Catatan Finance", value=row.get('finance_note',''), key=f"fin_note_{row['id']}")
-                        tor_file = st.file_uploader("Upload File ToR (jika ada)", key=f"tor_{row['id']}")
-                        colA, colB = st.columns(2)
-                        with colA:
-                            approve = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
-                        with colB:
-                            return_user = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
-                        if approve:
-                            tor_note = ""
-                            if tor_file:
-                                fid, fname, flink = _upload_tor(tor_file)
-                                if fid:
-                                    tor_note = f"\n[ToR diupload: {fname}]"
-                                    _ca_update_by_id(row['id'], {
-                                        "tor_file_id": fid,
-                                        "tor_file_name": fname,
-                                        "tor_file_link": flink,
-                                    })
-                            _ca_update_by_id(row['id'], {
-                                "finance_note": note + tor_note,
-                                "finance_approved": 1,
-                                "updated_at": now_wib_iso(),
-                            })
-                            try:
-                                audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=1; note={note}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("cash_advance", "finance_review", subject="Cash Advance ke Director", body=f"Pengajuan {row['id']} diajukan ke Director")
-                            except Exception:
-                                pass
-                            st.success("Diajukan ke Director.")
-                            st.rerun()
-                        if return_user:
-                            _ca_update_by_id(row['id'], {
-                                "finance_note": note + "\n[Perlu revisi oleh user]",
-                                "finance_approved": 0,
-                                "updated_at": now_wib_iso(),
-                            })
-                            try:
-                                audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=0; note={note}")
-                            except Exception:
-                                pass
-                            st.warning("Dikembalikan ke user peminta.")
-                            st.rerun()
+                            pass
+                        st.success("Diajukan ke Director.")
+                        st.rerun()
+                    if return_user:
+                        cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=0 WHERE id=?", (note + "\n[Perlu revisi oleh user]", row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("cash_advance", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Dikembalikan ke user peminta.")
+                        st.rerun()
         else:
             st.info("Hanya Finance yang dapat review di sini.")
 
     # --- Tab 3: Approval Director ---
     with tab3:
         st.markdown("### Approval Director Cash Advance")
-        if user.get("role") in ["director", "superuser"]:
-            _, df_dir = _ca_read_df()
-            if df_dir.empty:
-                st.info("Belum ada pengajuan.")
-            else:
-                try:
-                    df_dir = df_dir.sort_values(by="tanggal", ascending=False)
-                except Exception:
-                    pass
-                for idx, row in df_dir.iterrows():
-                    with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {float(row.get('totals',0)) :,.0f}".replace(",", ".")):
-                        items = []
+        if user["role"] in ["director", "superuser"]:
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            for idx, row in df.iterrows():
+                with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {row['totals']:,.0f}"):
+                    items = json.loads(row['items_json']) if row['items_json'] else []
+                    st.write(pd.DataFrame(items))
+                    st.write(f"Finance Approved: {'Ya' if row['finance_approved'] else 'Belum'}")
+                    st.write(f"Catatan Director: {row['director_note']}")
+                    note = st.text_area("Catatan Director", value=row['director_note'], key=f"dir_note_{row['id']}")
+                    approve = st.checkbox("Approve Director", value=bool(row['director_approved']), key=f"dir_approved_{row['id']}")
+                    if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                        cur.execute("UPDATE cash_advance SET director_note=?, director_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
                         try:
-                            items = json.loads(row.get('items_json') or "[]")
+                            audit_log("cash_advance", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
                         except Exception:
                             pass
-                        if items:
-                            st.dataframe(pd.DataFrame(items), width='stretch')
-                        st.write(f"Finance Approved: {'Ya' if row.get('finance_approved') else 'Belum'}")
-                        st.write(f"Catatan Director: {row.get('director_note','')}")
-                        note = st.text_area("Catatan Director", value=row.get('director_note',''), key=f"dir_note_{row['id']}")
-                        approve = st.checkbox("Approve Director", value=bool(row.get('director_approved')), key=f"dir_app_{row['id']}")
-                        if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
-                            _ca_update_by_id(row['id'], {
-                                "director_note": note,
-                                "director_approved": 1 if approve else 0,
-                                "updated_at": now_wib_iso(),
-                            })
-                            try:
-                                audit_log("cash_advance", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("cash_advance", "director_approval", subject="Cash Advance Director", body=f"Director update untuk {row['id']} approve={bool(approve)}")
-                            except Exception:
-                                pass
-                            st.success("Approval Director disimpan.")
-                            st.rerun()
+                        st.success("Approval Director disimpan.")
+                        st.rerun()
         else:
             st.info("Hanya Director yang dapat approve di sini.")
 
     # --- Tab 4: Daftar & Rekap ---
     with tab4:
         st.markdown("### Daftar & Rekap Cash Advance")
-        _, df_all = _ca_read_df()
-        if df_all.empty:
-            st.info("Belum ada data.")
-            return
-        df_all['status'] = df_all.apply(lambda x: 'Cair' if x.get('finance_approved') and x.get('director_approved') else 'Proses', axis=1)
-        # Filter UI
+        df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+        df['status'] = df.apply(lambda x: 'Cair' if x['finance_approved'] and x['director_approved'] else 'Proses', axis=1)
+        # --- FILTER UI ---
         with st.container():
             col_div, col_status, col_tgl = st.columns([2,2,3])
             with col_div:
-                divisi_list = ["Semua"] + sorted(set(str(v) for v in df_all['divisi'].dropna().unique().tolist()))
+                divisi_list = ["Semua"] + sorted(df["divisi"].dropna().unique().tolist())
                 filter_divisi = st.selectbox("Filter Divisi", divisi_list)
             with col_status:
                 status_list = ["Semua", "Cair", "Proses"]
                 filter_status = st.selectbox("Status", status_list)
             with col_tgl:
-                try:
-                    df_all['tanggal_dt'] = pd.to_datetime(df_all['tanggal'], errors='coerce')
-                except Exception:
-                    df_all['tanggal_dt'] = pd.NaT
-                min_tgl = df_all['tanggal_dt'].min() if not df_all.empty else date.today()
-                max_tgl = df_all['tanggal_dt'].max() if not df_all.empty else date.today()
-                if pd.isna(min_tgl):
-                    min_tgl = date.today()
-                if pd.isna(max_tgl):
-                    max_tgl = date.today()
-                filter_tgl = st.date_input("Tanggal", value=(min_tgl.date() if hasattr(min_tgl, 'date') else min_tgl, max_tgl.date() if hasattr(max_tgl, 'date') else max_tgl))
+                min_tgl = df["tanggal"].min() if not df.empty else date.today()
+                max_tgl = df["tanggal"].max() if not df.empty else date.today()
+                filter_tgl = st.date_input("Tanggal", value=(min_tgl, max_tgl) if min_tgl and max_tgl else (date.today(), date.today()))
 
-        dff = df_all.copy()
+        dff = df.copy()
         if filter_divisi != "Semua":
-            dff = dff[dff['divisi'] == filter_divisi]
+            dff = dff[dff["divisi"] == filter_divisi]
         if filter_status != "Semua":
-            dff = dff[dff['status'] == filter_status]
+            dff = dff[dff["status"] == filter_status]
         if filter_tgl and isinstance(filter_tgl, tuple) and len(filter_tgl) == 2:
             tgl_start, tgl_end = filter_tgl
-            try:
-                dff = dff[(pd.to_datetime(dff['tanggal']) >= pd.to_datetime(tgl_start)) & (pd.to_datetime(dff['tanggal']) <= pd.to_datetime(tgl_end))]
-            except Exception:
-                pass
+            dff = dff[(pd.to_datetime(dff["tanggal"]) >= pd.to_datetime(tgl_start)) & (pd.to_datetime(dff["tanggal"]) <= pd.to_datetime(tgl_end))]
 
-        show_cols = ["id", "divisi", "totals", "tanggal", "finance_approved", "director_approved", "status"]
-        st.dataframe(dff[show_cols], width='stretch', hide_index=True)
-
+        st.dataframe(dff)
         # Rekap Bulanan
         st.markdown("#### Rekap Bulanan Cash Advance (Otomatis)")
         this_month = date.today().strftime("%Y-%m")
-        try:
-            df_month = dff[dff['tanggal'].astype(str).str[:7] == this_month]
-        except Exception:
-            df_month = pd.DataFrame(columns=dff.columns)
+        df_month = dff[dff['tanggal'].str[:7] == this_month] if not dff.empty else pd.DataFrame()
         st.write(f"Jumlah pengajuan bulan ini: {len(df_month)}")
         if not df_month.empty:
-            try:
-                by_div = df_month.groupby('divisi').agg({'id': 'count', 'totals': 'sum'}).rename(columns={'id': 'jumlah_pengajuan', 'totals': 'total_nominal'})
-                st.write("Rekap per Divisi:")
-                st.dataframe(by_div, width='stretch')
-                approved = df_month[(df_month['finance_approved'] == 1) & (df_month['director_approved'] == 1)]
-                pending = df_month[(df_month['finance_approved'] == 0) | (df_month['director_approved'] == 0)]
-                st.write(f"Approved (Cair): {len(approved)} | Pending: {len(pending)}")
-            except Exception:
-                st.warning("Gagal menghitung rekap bulanan.")
-
+            by_div = df_month.groupby('divisi').agg({'id':'count','totals':'sum'}).rename(columns={'id':'jumlah_pengajuan','totals':'total_nominal'})
+            st.write("Rekap per Divisi:")
+            st.dataframe(by_div)
+            approved = df_month[(df_month['finance_approved']==1) & (df_month['director_approved']==1)]
+            pending = df_month[(df_month['finance_approved']==0) | (df_month['director_approved']==0)]
+            st.write(f"Approved (Cair): {len(approved)} | Pending: {len(pending)}")
 
 def pmr_module():
     user = require_login()
     st.header("📑 PMR")
-
-    def _pmr_headers():
-        return [
-            "id", "nama", "bulan", "file1_id", "file1_name", "file2_id", "file2_name",
-            "finance_note", "finance_approved", "director_note", "director_approved",
-            "tanggal_submit", "updated_at", "submitted_by"
-        ]
-
-    def _pmr_ws():
-        try:
-            return _get_ws(PMR_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), PMR_SHEET_NAME, _pmr_headers())
-
-    def _pmr_read_df():
-        ws = _pmr_ws()
-        headers = _pmr_headers()
-        try:
-            records = _cached_get_all_records(PMR_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = "" if h not in ("finance_approved", "director_approved") else 0
-        for col in ["finance_approved", "director_approved"]:
-            df[col] = pd.to_numeric(df.get(col), errors='coerce').fillna(0).astype(int)
-        return ws, df
-
-    def _pmr_append(row: dict):
-        ws = _pmr_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _pmr_update_by_id(pid: str, updates: dict):
-        ws = _pmr_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(pid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _upload_file(file):
-        if not file:
-            return None, None, None
-        try:
-            drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
-            meta = {'name': file.name, 'parents': [GDRIVE_FOLDER_ID]}
-            created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
-            return created.get('id'), file.name, created.get('webViewLink')
-        except Exception:
-            return None, None, None
-
+    conn = get_db()
+    cur = conn.cursor()
     tab_upload, tab_finance, tab_director, tab_rekap = st.tabs([
         "📝 Upload Laporan Bulanan (Staf)",
         "💰 Review & Approval Finance",
@@ -3723,21 +2184,18 @@ def pmr_module():
         "📋 Daftar & Rekap PMR"
     ])
 
-    # --- Upload (Staf) ---
     with tab_upload:
         st.markdown("### Upload Laporan Bulanan (Staf)")
         with st.form("pmr_add", clear_on_submit=True):
             nama = st.text_input("Nama Pegawai")
-            year_now = date.today().year
-            bulan_opts = [f"{y}-{m:02d}" for y in range(year_now - 1, year_now + 2) for m in range(1, 13)]
-            bulan = st.selectbox("Bulan (YYYY-MM)", options=bulan_opts, index=bulan_opts.index(f"{year_now}-{date.today().month:02d}") if f"{year_now}-{date.today().month:02d}" in bulan_opts else 0)
-            f1 = st.file_uploader("File Laporan 1 (wajib)", key="pmr_file1")
-            f2 = st.file_uploader("File Laporan 2 (opsional)", key="pmr_file2")
-            # Duplicate check
-            _, df_pmr = _pmr_read_df()
+            bulan = st.selectbox("Bulan (YYYY-MM)", options=[f"{y}-{m:02d}" for y in range(date.today().year-1, date.today().year+2) for m in range(1,13)])
+            f1 = st.file_uploader("File Laporan 1 (wajib)")
+            f2 = st.file_uploader("File Laporan 2 (opsional)")
             duplicate = False
-            if nama and bulan and not df_pmr.empty:
-                duplicate = not df_pmr[(df_pmr['nama'].astype(str).str.lower() == nama.lower()) & (df_pmr['bulan'] == bulan)].empty
+            if nama and bulan:
+                cek = cur.execute("SELECT COUNT(*) FROM pmr WHERE nama=? AND bulan=?", (nama, bulan)).fetchone()[0]
+                if cek > 0:
+                    duplicate = True
             submit = st.form_submit_button("Submit")
             if submit:
                 if not nama or not bulan:
@@ -3748,259 +2206,245 @@ def pmr_module():
                     st.error("Minimal 1 file wajib diupload.")
                 else:
                     pid = gen_id("pmr")
-                    fid1, fname1, link1 = _upload_file(f1)
-                    fid2, fname2, link2 = (None, None, None)
+                    b1, n1, _ = upload_file_and_store(f1)
                     if f2:
-                        fid2, fname2, link2 = _upload_file(f2)
-                    row = {
-                        "id": pid,
-                        "nama": nama,
-                        "bulan": bulan,
-                        "file1_id": fid1 or "",
-                        "file1_name": fname1 or "",
-                        "file2_id": fid2 or "",
-                        "file2_name": fname2 or "",
-                        "finance_note": "",
-                        "finance_approved": 0,
-                        "director_note": "",
-                        "director_approved": 0,
-                        "tanggal_submit": now_wib_iso(),
-                        "updated_at": now_wib_iso(),
-                        "submitted_by": (get_current_user() or {}).get("email", "")
-                    }
-                    _pmr_append(row)
+                        b2, n2, _ = upload_file_and_store(f2)
+                    else:
+                        b2, n2 = None, None
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file2_blob,file2_name,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pid, nama, b1, n1, b2, n2, bulan, "", 0, "", 0, now))
+                    conn.commit()
                     try:
-                        audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={fname1}; file2={fname2 or '-'}")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("pmr", "upload", subject="Upload PMR Baru", body=f"PMR {pid} oleh {nama} bulan {bulan}")
+                        audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={n1}; file2={n2 or '-'}")
                     except Exception:
                         pass
                     st.success("Laporan bulanan berhasil diupload.")
-                    st.rerun()
 
-    # --- Finance Review ---
     with tab_finance:
         st.markdown("### Review & Approval Finance")
         st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Superuser yang dapat mengakses.")
-        if user.get("role") in ["finance", "superuser"]:
-            _, df_fin = _pmr_read_df()
-            if df_fin.empty:
-                st.info("Belum ada laporan.")
-            else:
-                try:
-                    df_fin = df_fin.sort_values(by="tanggal_submit", ascending=False)
-                except Exception:
-                    pass
-                for idx, row in df_fin.iterrows():
-                    with st.expander(f"{row['nama']} | {row['bulan']}"):
-                        st.write(f"File 1: {row.get('file1_name','-')}")
-                        if row.get('file2_name'):
-                            st.write(f"File 2: {row.get('file2_name')}")
-                        st.write(f"Catatan: {row.get('finance_note','')}")
-                        note = st.text_area("Catatan Finance", value=row.get('finance_note',''), key=f"fin_note_{row['id']}")
-                        colA, colB = st.columns(2)
-                        with colA:
-                            ajukan = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
-                        with colB:
-                            kembalikan = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
-                        if ajukan:
-                            _pmr_update_by_id(row['id'], {"finance_note": note, "finance_approved": 1, "updated_at": now_wib_iso()})
-                            try:
-                                audit_log("pmr", "finance_review", target=row['id'], details=f"approve=1; note={note}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("pmr", "finance_review", subject="PMR ke Director", body=f"PMR {row['id']} diajukan ke Director")
-                            except Exception:
-                                pass
-                            st.success("Diajukan ke Director.")
-                            st.rerun()
-                        if kembalikan:
-                            _pmr_update_by_id(row['id'], {"finance_note": note + "\n[Perlu revisi oleh user]", "finance_approved": 0, "updated_at": now_wib_iso()})
-                            try:
-                                audit_log("pmr", "finance_review", target=row['id'], details=f"approve=0; note={note}")
-                            except Exception:
-                                pass
-                            st.warning("Dikembalikan ke user peminta.")
-                            st.rerun()
+        if user["role"] in ["finance", "superuser"]:
+            df_fin = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, finance_note, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
+            for idx, row in df_fin.iterrows():
+                with st.expander(f"{row['nama']} | {row['bulan']}"):
+                    st.write(f"File 1: {row['file1_name']}")
+                    if row['file2_name']:
+                        st.write(f"File 2: {row['file2_name']}")
+                    st.write(f"Catatan: {row['finance_note']}")
+                    note = st.text_area("Catatan Finance", value=row['finance_note'], key=f"fin_note_{row['id']}")
+                    colA, colB = st.columns(2)
+                    with colA:
+                        ajukan = st.button("Ajukan ke Director", key=f"ajukan_dir_{row['id']}")
+                    with colB:
+                        kembalikan = st.button("Kembalikan ke User", key=f"kembali_user_{row['id']}")
+                    if ajukan:
+                        cur.execute("UPDATE pmr SET finance_note=?, finance_approved=1 WHERE id=?", (note, row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "finance_review", target=row['id'], details=f"approve=1; note={note}")
+                        except Exception:
+                            pass
+                        st.success("Diajukan ke Director.")
+                        st.rerun()
+                    if kembalikan:
+                        cur.execute("UPDATE pmr SET finance_note=?, finance_approved=0 WHERE id=?", (note+"\n[Perlu revisi oleh user]", row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "finance_review", target=row['id'], details=f"approve=0; note={note}")
+                        except Exception:
+                            pass
+                        st.warning("Dikembalikan ke user peminta.")
+                        st.rerun()
         else:
             st.info("Hanya Finance yang dapat review di sini.")
 
-    # --- Director Approval ---
     with tab_director:
         st.markdown("### Approval Director PMR")
         st.caption("Director melakukan approval akhir dan memberi catatan. Hanya Director/Superuser yang dapat mengakses.")
-        if user.get("role") in ["director", "superuser"]:
-            _, df_dir = _pmr_read_df()
-            if df_dir.empty:
-                st.info("Belum ada laporan.")
-            else:
-                try:
-                    df_dir = df_dir.sort_values(by="tanggal_submit", ascending=False)
-                except Exception:
-                    pass
-                for idx, row in df_dir.iterrows():
-                    with st.expander(f"{row['nama']} | {row['bulan']}"):
-                        st.write(f"File 1: {row.get('file1_name','-')}")
-                        if row.get('file2_name'):
-                            st.write(f"File 2: {row.get('file2_name')}")
-                        st.write(f"Finance Approved: {'Ya' if row.get('finance_approved') else 'Belum'}")
-                        st.write(f"Catatan: {row.get('director_note','')}")
-                        note = st.text_area("Catatan Director", value=row.get('director_note',''), key=f"dir_note_{row['id']}")
-                        approve = st.checkbox("Approve Director", value=bool(row.get('director_approved')), key=f"dir_approved_{row['id']}")
-                        if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
-                            _pmr_update_by_id(row['id'], {"director_note": note, "director_approved": 1 if approve else 0, "updated_at": now_wib_iso()})
-                            try:
-                                audit_log("pmr", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("pmr", "director_approval", subject="PMR Director", body=f"Director update untuk {row['id']} approve={bool(approve)}")
-                            except Exception:
-                                pass
-                            st.success("Approval Director disimpan.")
-                            st.rerun()
+        if user["role"] in ["director", "superuser"]:
+            df_dir = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, director_note, director_approved, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
+            for idx, row in df_dir.iterrows():
+                with st.expander(f"{row['nama']} | {row['bulan']}"):
+                    st.write(f"File 1: {row['file1_name']}")
+                    if row['file2_name']:
+                        st.write(f"File 2: {row['file2_name']}")
+                    st.write(f"Finance Approved: {'Ya' if row['finance_approved'] else 'Belum'}")
+                    st.write(f"Catatan: {row['director_note']}")
+                    note = st.text_area("Catatan Director", value=row['director_note'], key=f"dir_note_{row['id']}")
+                    approve = st.checkbox("Approve Director", value=bool(row['director_approved']), key=f"dir_approved_{row['id']}")
+                    if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
+                        cur.execute("UPDATE pmr SET director_note=?, director_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        conn.commit()
+                        try:
+                            audit_log("pmr", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        st.success("Approval Director disimpan.")
+                        st.rerun()
         else:
             st.info("Hanya Director yang dapat approve di sini.")
 
-    # --- Rekap ---
     with tab_rekap:
-        # Hanya Finance / Director / Superuser yang dapat melihat rekap
-        if user.get("role") in ["finance", "director", "superuser"]:  # review scope tetap
+        if user["role"] in ["finance", "director", "superuser"]:
             st.markdown("### Daftar & Rekap PMR")
-            _, df_all = _pmr_read_df()
-            if df_all.empty:
-                st.info("Belum ada data PMR.")
+            df = pd.read_sql_query("SELECT id, nama, bulan, tanggal_submit, finance_approved, director_approved, file1_name, file2_name FROM pmr ORDER BY tanggal_submit DESC", conn)
+            bulan_list = sorted(df['bulan'].unique(), reverse=True) if not df.empty else []
+            filter_bulan = st.selectbox("Pilih Bulan", bulan_list, index=0 if bulan_list else None, key="rekap_bulan")
+            if filter_bulan:
+                df_month = df[df['bulan'] == filter_bulan]
             else:
-                # Filter bulan
-                try:
-                    bulan_list = sorted(df_all['bulan'].dropna().unique().tolist(), reverse=True)
-                except Exception:
-                    bulan_list = []
-                filter_bulan = st.selectbox("Pilih Bulan", bulan_list, index=0 if bulan_list else None, key="rekap_bulan")
-                if filter_bulan:
-                    df_month = df_all[df_all['bulan'] == filter_bulan].copy()
-                else:
-                    df_month = pd.DataFrame(columns=df_all.columns)
-                st.write(f"Total laporan bulan ini: {len(df_month)}")
-                if not df_month.empty:
-                    try:
-                        df_month['Status'] = df_month.apply(
-                            lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else (
-                                'Proses Finance' if not x['finance_approved'] else 'Proses Director'
-                            ), axis=1
-                        )
-                    except Exception:
-                        df_month['Status'] = ''
-                    show_cols = [c for c in ["nama", "bulan", "tanggal_submit", "Status", "file1_name", "file2_name"] if c in df_month.columns]
-                    if show_cols:
-                        st.dataframe(df_month[show_cols], width='stretch', hide_index=True)
+                df_month = pd.DataFrame()
+            st.write(f"Total laporan bulan ini: {len(df_month)}")
+            if not df_month.empty:
+                df_month_disp = df_month.copy()
+                df_month_disp['Status'] = df_month_disp.apply(lambda x: 'Approved' if x['finance_approved'] and x['director_approved'] else ('Proses Finance' if not x['finance_approved'] else 'Proses Director'), axis=1)
+                def make_download_link(row, col):
+                    if row[col]:
+                        return f'<a href="/download_pmr/{row["id"]}/{col}" target="_blank">{row[col]}</a>'
+                    return "-"
+                df_month_disp['Download File 1'] = df_month_disp.apply(lambda r: make_download_link(r, 'file1_name'), axis=1)
+                df_month_disp['Download File 2'] = df_month_disp.apply(lambda r: make_download_link(r, 'file2_name'), axis=1)
+                show_cols = ["nama","bulan","tanggal_submit","Status","Download File 1","Download File 2"]
+                st.markdown(df_month_disp[show_cols].to_html(escape=False, index=False), unsafe_allow_html=True)
         else:
             st.info("Hanya Finance/Director yang dapat melihat rekap PMR.")
 
+ 
 
+def delegasi_module():
+    user = require_login()
+    st.header("🗂️ Delegasi Tugas & Monitoring")
+    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Alur: Pemberi tugas membuat → PIC update status/upload bukti → Director monitor → Sinkron kalender & peringatan tenggat.</div>", unsafe_allow_html=True)
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab3, tab4 = st.tabs(["🆕 Buat Tugas", "📝 Update Status/Bukti", "👀 Monitoring Director", "📅 Rekap & Filter"])
+
+    # Tab 1: Buat Tugas
+    with tab1:
+        st.markdown("### 🆕 Buat Tugas Baru (Pemberi Tugas)")
+        with st.form("del_add"):
+            judul = st.text_input("Judul Tugas")
+            deskripsi = st.text_area("Deskripsi")
+            pic = st.text_input("Penanggung Jawab (PIC)")
+            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+            if st.form_submit_button("Buat Tugas"):
+                if not (judul and deskripsi and pic):
+                    st.warning("Semua field wajib diisi.")
+                elif tgl_selesai < tgl_mulai:
+                    st.warning("Tanggal selesai tidak boleh sebelum mulai.")
+                else:
+                    did = gen_id("del")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
+                        (did, judul, deskripsi, pic, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
+                    conn.commit()
+                    try:
+                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    st.success("Tugas berhasil dibuat.")
+
+    # Tab 2: Update Status & Upload Bukti (PIC)
+    with tab2:
+        st.markdown("### 📝 PIC Update Status & Upload Bukti")
+        tugas_pic = pd.read_sql_query("SELECT * FROM delegasi WHERE pic=? ORDER BY tgl_selesai ASC", conn, params=(user["full_name"],))
+        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_pic")
+        if filter_status != "Semua":
+            tugas_pic = tugas_pic[tugas_pic["status"] == filter_status]
+        for idx, row in tugas_pic.iterrows():
+            with st.expander(f"{row['judul']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | Status: {row['status']}"):
+                st.write(f"Deskripsi: {row['deskripsi']}")
+                st.write(f"Tenggat: {row['tgl_mulai']} s/d {row['tgl_selesai']}")
+                status = st.selectbox("Status", ["Belum Selesai", "Proses", "Selesai"], index=["Belum Selesai", "Proses", "Selesai"].index(row["status"]), key=f"status_{row['id']}")
+                file_bukti = st.file_uploader("Upload Bukti (wajib jika selesai)", key=f"bukti_{row['id']}")
+                if st.button("Update Status", key=f"update_{row['id']}"):
+                    if status == "Selesai" and not file_bukti:
+                        st.error("Status 'Selesai' wajib upload file dokumentasi!")
+                    else:
+                        blob, fname, _ = upload_file_and_store(file_bukti) if file_bukti else (None, None, None)
+                        now = datetime.utcnow().isoformat()
+                        if status == "Selesai":
+                            cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, tanggal_update=? WHERE id=?",
+                                (status, blob, fname, now, row["id"]))
+                        else:
+                            cur.execute("UPDATE delegasi SET status=?, tanggal_update=? WHERE id=?",
+                                (status, now, row["id"]))
+                        conn.commit()
+                        try:
+                            det = f"status={status}" + (f"; bukti={fname}" if fname else "")
+                            audit_log("delegasi", "update", target=row['id'], details=det)
+                        except Exception:
+                            pass
+                        st.success("Status tugas diperbarui.")
+
+    # Tab 3: Monitoring Director
+    with tab3:
+        st.markdown("### 👀 Monitoring Director")
+        if user["role"] in ["director", "superuser"]:
+            df_all = pd.read_sql_query("SELECT id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,file_name,tanggal_update FROM delegasi ORDER BY tgl_selesai ASC", conn)
+            filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_dir")
+            if filter_status != "Semua":
+                df_all = df_all[df_all["status"] == filter_status]
+            st.dataframe(df_all)
+            for idx, row in df_all.iterrows():
+                with st.expander(f"{row['judul']} | {row['pic']} | Status: {row['status']}"):
+                    st.write(f"Deskripsi: {row['deskripsi']}")
+                    st.write(f"Tenggat: {row['tgl_mulai']} s/d {row['tgl_selesai']}")
+                    st.write(f"Update terakhir: {row['tanggal_update']}")
+                    if row["status"] == "Selesai" and row["file_name"]:
+                        st.download_button("Download Bukti", data=row["file_blob"], file_name=row["file_name"])
+                    st.write(f"Status: {row['status']}")
+
+    # Tab 4: Rekap Bulanan & Statistik
+    with tab4:
+        st.markdown("### 📅 Rekap Bulanan Delegasi & Filter")
+        df = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status,tanggal_update FROM delegasi ORDER BY tgl_selesai ASC", conn)
+        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_rekap")
+        if filter_status != "Semua":
+            df = df[df["status"] == filter_status]
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df[df['tgl_mulai'].str[:7] == this_month] if not df.empty else pd.DataFrame()
+        if not df_month.empty:
+            st.download_button("Download Rekap Bulanan (Excel)", df_month.to_excel(index=False, engine='openpyxl'), file_name=f"rekap_delegasi_{this_month}.xlsx")
+            st.download_button("Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_delegasi_{this_month}.csv")
+            by_pic = df_month['pic'].value_counts().head(5)
+            st.write("Top 5 PIC:")
+            st.dataframe(by_pic)
+            status_count = df_month['status'].value_counts().to_dict()
+            st.write("Status:", status_count)
+        st.write(f"Total tugas bulan ini: {len(df_month)}")
+        # Preview warna tenggat
+        st.subheader("⏰ Status Tenggat (preview warna)")
+        rows = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi", conn)
+        def color_for_deadline(end_str):
+            end = datetime.fromisoformat(end_str).date()
+            today = date.today()
+            d = (end - today).days
+            if d < 0:
+                return "Merah"
+            if d <= 3:
+                return "Oranye"
+            if d <= 7:
+                return "Kuning"
+            return "Hijau"
+        rows["color"] = rows["tgl_selesai"].apply(color_for_deadline)
+        st.dataframe(rows)
 def flex_module():
     user = require_login()
     st.header("⏰ Flex Time")
-    st.markdown("<div style='color:#2563eb;margin-bottom:0.75rem'>Alur: Staf ajukan → Finance review → Director approval → Rekap bulanan.</div>", unsafe_allow_html=True)
-
-    def _flex_headers():
-        return [
-            "id", "nama", "tanggal", "jam_mulai", "jam_selesai", "alasan",
-            "catatan_finance", "approval_finance", "catatan_director", "approval_director",
-            "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _flex_ws():
-        try:
-            return _get_ws(FLEX_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), FLEX_SHEET_NAME, _flex_headers())
-
-    def _flex_read_df():
-        ws = _flex_ws()
-        headers = _flex_headers()
-        try:
-            records = _cached_get_all_records(FLEX_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        # numeric approvals
-        for col in ["approval_finance", "approval_director"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-        return ws, df
-
-    def _flex_append(row: dict):
-        ws = _flex_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-
-    def _flex_update_by_id(fid: str, updates: dict):
-        ws = _flex_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(fid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    # Helpers for overlap detection (only among approved director=1)
-    def _check_overlap(tanggal: date, jam_mulai: datetime.time, jam_selesai: datetime.time) -> bool:
-        _, df_all = _flex_read_df()
-        if df_all.empty:
-            return False
-        day_df = df_all[(df_all['tanggal'] == tanggal.isoformat()) & (df_all['approval_director'] == 1)].copy()
-        if day_df.empty:
-            return False
-        try:
-            new_start = datetime.fromisoformat(f"{tanggal.isoformat()}T{jam_mulai.isoformat()}")
-            new_end = datetime.fromisoformat(f"{tanggal.isoformat()}T{jam_selesai.isoformat()}")
-        except Exception:
-            return False
-        for _, r in day_df.iterrows():
-            try:
-                r_start = datetime.fromisoformat(f"{r['tanggal']}T{str(r['jam_mulai'])}")
-                r_end = datetime.fromisoformat(f"{r['tanggal']}T{str(r['jam_selesai'])}")
-            except Exception:
-                continue
-            # overlap if intervals intersect
-            if not (new_end <= r_start or new_start >= r_end):
-                return True
-        return False
-
+    conn = get_db()
+    cur = conn.cursor()
+    # Cek kolom tabel flex
+    cur.execute("PRAGMA table_info(flex)")
+    flex_cols = [row[1] for row in cur.fetchall()]
+    required_cols = ["alasan","catatan_finance","approval_finance","catatan_director","approval_director"]
+    missing = [c for c in required_cols if c not in flex_cols]
+    if missing:
+        st.error(f"Struktur tabel flex belum sesuai. Kolom berikut belum ada: {', '.join(missing)}.\n\nSilakan backup data, drop tabel flex, lalu jalankan ulang aplikasi agar tabel otomatis dibuat ulang.")
+        return
     tabs = st.tabs([
         "📝 Input Staf",
         "💰 Review Finance",
@@ -4012,43 +2456,30 @@ def flex_module():
     with tabs[0]:
         st.subheader(":bust_in_silhouette: Ajukan Flex Time")
         with st.form("flex_add_form"):
-            nama = st.text_input("Nama", value=(user.get("full_name") or user.get("email") or ""))
-            tanggal = st.date_input("Tanggal", value=date.today())
+            nama = st.text_input("Nama")
+            tanggal = st.date_input("Tanggal")
             jam_mulai = st.time_input("Jam Mulai")
             jam_selesai = st.time_input("Jam Selesai")
             alasan = st.text_area("Alasan")
             submit = st.form_submit_button("Ajukan")
             if submit:
+                # Validasi jam tidak overlap
+                q = "SELECT * FROM flex WHERE tanggal=? AND ((jam_mulai <= ? AND jam_selesai > ?) OR (jam_mulai < ? AND jam_selesai >= ?) OR (jam_mulai >= ? AND jam_selesai <= ?)) AND approval_director=1"
+                params = (tanggal.isoformat(), jam_mulai.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat(), jam_selesai.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat())
+                overlap = pd.read_sql_query(q, conn, params=params)
                 if not nama or not alasan:
                     st.warning("Nama dan alasan wajib diisi.")
                 elif jam_mulai >= jam_selesai:
                     st.warning("Jam selesai harus setelah jam mulai.")
-                elif _check_overlap(tanggal, jam_mulai, jam_selesai):
+                elif not overlap.empty:
                     st.error("Jam flex time bentrok/overlap dengan pengajuan lain yang sudah disetujui.")
                 else:
                     fid = gen_id("flex")
-                    row = {
-                        "id": fid,
-                        "nama": nama,
-                        "tanggal": tanggal.isoformat(),
-                        "jam_mulai": jam_mulai.isoformat(),
-                        "jam_selesai": jam_selesai.isoformat(),
-                        "alasan": alasan,
-                        "catatan_finance": "",
-                        "approval_finance": 0,
-                        "catatan_director": "",
-                        "approval_director": 0,
-                        "created_at": now_wib_iso(),
-                        "updated_at": now_wib_iso(),
-                        "submitted_by": (get_current_user() or {}).get("email", ""),
-                    }
-                    _flex_append(row)
+                    cur.execute("INSERT INTO flex (id, nama, tanggal, jam_mulai, jam_selesai, alasan, catatan_finance, approval_finance, catatan_director, approval_director) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (fid, nama, tanggal.isoformat(), jam_mulai.isoformat(), jam_selesai.isoformat(), alasan, '', 0, '', 0))
+                    conn.commit()
                     try:
                         audit_log("flex", "create", target=fid, details=f"{nama} {tanggal} {jam_mulai}-{jam_selesai}; alasan={alasan}")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("flex", "create", subject="Pengajuan Flex Baru", body=f"{nama} mengajukan flex {tanggal} {jam_mulai}-{jam_selesai}")
                     except Exception:
                         pass
                     st.success("Flex time diajukan.")
@@ -4056,508 +2487,86 @@ def flex_module():
     # --- Tab 2: Review Finance ---
     with tabs[1]:
         st.subheader(":money_with_wings: Review Finance")
-        _, df_all = _flex_read_df()
-        df_fin = df_all[df_all['approval_finance'] == 0].copy() if not df_all.empty else pd.DataFrame()
+        df_fin = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=0 ORDER BY tanggal DESC", conn)
         if df_fin.empty:
             st.info("Tidak ada pengajuan flex time yang perlu direview.")
         else:
-            # Sort by tanggal desc
-            try:
-                df_fin = df_fin.sort_values(by='tanggal', ascending=False)
-            except Exception:
-                pass
-            for _, row in df_fin.iterrows():
+            for idx, row in df_fin.iterrows():
                 with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
                     st.write(f"Alasan: {row['alasan']}")
-                    catatan = st.text_area("Catatan Finance", value=row.get('catatan_finance','') or "", key=f"catatan_fin_{row['id']}")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        approve = st.button("Approve", key=f"approve_fin_{row['id']}")
-                    with c2:
-                        reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
+                    catatan = st.text_area("Catatan Finance", value=row['catatan_finance'] or "", key=f"catatan_fin_{row['id']}")
+                    approve = st.button("Approve", key=f"approve_fin_{row['id']}")
+                    reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
                     if approve or reject:
-                        app_val = 1 if approve else -1
-                        _flex_update_by_id(row['id'], {
-                            "catatan_finance": catatan,
-                            "approval_finance": app_val,
-                            "updated_at": now_wib_iso(),
-                        })
+                        cur.execute("UPDATE flex SET catatan_finance=?, approval_finance=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                        conn.commit()
                         try:
                             audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
                         except Exception:
                             pass
-                        try:
-                            notify_event("flex", "finance_review", subject="Review Finance Flex", body=f"{row['nama']} {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']} status finance {app_val}")
-                        except Exception:
-                            pass
                         st.success("Status review finance diperbarui.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # --- Tab 3: Approval Director ---
     with tabs[2]:
         st.subheader("👨‍💼 Approval Director")
-        _, df_all = _flex_read_df()
-        df_dir = df_all[(df_all['approval_finance'] == 1) & (df_all['approval_director'] == 0)].copy() if not df_all.empty else pd.DataFrame()
+        df_dir = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=1 AND approval_director=0 ORDER BY tanggal DESC", conn)
         if df_dir.empty:
             st.info("Tidak ada pengajuan flex time yang menunggu approval director.")
         else:
-            try:
-                df_dir = df_dir.sort_values(by='tanggal', ascending=False)
-            except Exception:
-                pass
-            for _, row in df_dir.iterrows():
+            for idx, row in df_dir.iterrows():
                 with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
                     st.write(f"Alasan: {row['alasan']}")
                     st.write(f"Catatan Finance: {row['catatan_finance']}")
-                    catatan = st.text_area("Catatan Director", value=row.get('catatan_director','') or "", key=f"catatan_dir_{row['id']}")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        approve = st.button("Approve", key=f"approve_dir_{row['id']}")
-                    with c2:
-                        reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
+                    catatan = st.text_area("Catatan Director", value=row['catatan_director'] or "", key=f"catatan_dir_{row['id']}")
+                    approve = st.button("Approve", key=f"approve_dir_{row['id']}")
+                    reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
                     if approve or reject:
-                        app_val = 1 if approve else -1
-                        _flex_update_by_id(row['id'], {
-                            "catatan_director": catatan,
-                            "approval_director": app_val,
-                            "updated_at": now_wib_iso(),
-                        })
+                        cur.execute("UPDATE flex SET catatan_director=?, approval_director=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                        conn.commit()
                         try:
                             audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
                         except Exception:
                             pass
-                        try:
-                            notify_event("flex", "director_approval", subject="Approval Director Flex", body=f"{row['nama']} {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']} director={app_val}")
-                        except Exception:
-                            pass
                         st.success("Status approval director diperbarui.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # --- Tab 4: Daftar Flex ---
     with tabs[3]:
         st.subheader(":clipboard: Daftar Flex Time")
-        _, df_all = _flex_read_df()
-        if df_all.empty:
+        df = pd.read_sql_query("SELECT * FROM flex ORDER BY tanggal DESC, jam_mulai ASC", conn)
+        if df.empty:
             st.info("Belum ada data flex time.")
         else:
-            try:
-                df_all = df_all.sort_values(by=['tanggal', 'jam_mulai'])
-            except Exception:
-                pass
-            df_disp = df_all.copy()
-            df_disp['status'] = df_disp.apply(lambda r: '✅ Disetujui' if r['approval_director']==1 else ('❌ Ditolak' if r['approval_finance']==-1 or r['approval_director']==-1 else '🕒 Proses'), axis=1)
-            # Shorten time display
-            for col in ['jam_mulai','jam_selesai']:
-                if col in df_disp.columns:
-                    df_disp[col] = df_disp[col].astype(str).str.slice(0,5)
-            safe_dataframe(df_disp[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], index=False)
+            df['status'] = df.apply(lambda r: '✅ Disetujui' if r['approval_director']==1 else ('❌ Ditolak' if r['approval_finance']==-1 or r['approval_director']==-1 else ('🕒 Proses')), axis=1)
+            df['jam_mulai'] = df['jam_mulai'].str[:5]
+            df['jam_selesai'] = df['jam_selesai'].str[:5]
+            st.dataframe(df[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], use_container_width=True)
+        # Rekap Bulanan
         st.markdown("#### Rekap Bulanan Flex Time (Otomatis)")
         this_month = date.today().strftime("%Y-%m")
-        df_month = df_all[df_all['tanggal'].astype(str).str[:7] == this_month] if not df_all.empty else pd.DataFrame()
+        df_month = df[df['tanggal'].str[:7] == this_month] if not df.empty else pd.DataFrame()
         st.write(f"Total pengajuan flex bulan ini: {len(df_month)}")
         if not df_month.empty:
             by_pegawai = df_month.groupby('nama').agg({'id':'count'}).rename(columns={'id':'jumlah_pengajuan'})
             st.write("Rekap per Pegawai:")
-            safe_dataframe(by_pegawai, index=True)
+            st.dataframe(by_pegawai)
 
-
-def delegasi_module():
-    user = require_login()
-    st.header("🗂️ Delegasi Tugas & Monitoring")
-    st.markdown("<div style='color:#2563eb;font-size:1.05rem;margin-bottom:1.0em'>Alur: Pemberi tugas membuat → PIC update status/upload bukti → Director monitor → Rekap & peringatan tenggat.</div>", unsafe_allow_html=True)
-
-    def _del_headers():
-        return [
-            "id", "judul", "deskripsi", "pic", "tgl_mulai", "tgl_selesai",
-            "status", "file_id", "file_name", "file_link", "tanggal_update", "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _del_ws():
-        try:
-            return _get_ws(DELEGASI_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), DELEGASI_SHEET_NAME, _del_headers())
-
-    def _del_read_df():
-        ws = _del_ws()
-        headers = _del_headers()
-        try:
-            records = _cached_get_all_records(DELEGASI_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        if 'status' in df.columns:
-            df['status'] = df['status'].replace({None: ''}).fillna('')
-        return ws, df
-
-    def _del_append(row: dict):
-        ws = _del_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                raise
-
-    def _del_update_by_id(did: str, updates: dict):
-        ws = _del_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(did)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _upload_file(file):
-        if not file:
-            return None, None, None
-        try:
-            drive = get_gdrive_service()
-            media = MediaIoBaseUpload(file, mimetype=file.type, resumable=True)
-            meta = {"name": file.name, "parents": [GDRIVE_FOLDER_ID]}
-            created = drive.files().create(body=meta, media_body=media, fields='id,name,webViewLink').execute()
-            return created.get('id'), file.name, created.get('webViewLink')
-        except Exception:
-            return None, None, None
-
-    def _deadline_color(end_date_str: str) -> str:
-        try:
-            end = datetime.fromisoformat(end_date_str).date()
-        except Exception:
-            return "-"
-        today = date.today()
-        d = (end - today).days
-        if d < 0:
-            return "Merah"
-        if d <= 3:
-            return "Oranye"
-        if d <= 7:
-            return "Kuning"
-        return "Hijau"
-
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🆕 Buat Tugas", "📝 Update Status/Bukti", "👀 Monitoring Director", "📅 Rekap & Filter"
-    ])
-
-    # --- Tab 1: Buat Tugas ---
-    with tab1:
-        st.markdown("### 🆕 Buat Tugas Baru (Pemberi Tugas)")
-        with st.form("del_add"):
-            judul = st.text_input("Judul Tugas")
-            deskripsi = st.text_area("Deskripsi")
-            pic = st.text_input("Penanggung Jawab (PIC)")
-            tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
-            tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
-            submit = st.form_submit_button("Buat Tugas")
-            if submit:
-                if not (judul and deskripsi and pic):
-                    st.warning("Semua field wajib diisi.")
-                elif tgl_selesai < tgl_mulai:
-                    st.warning("Tanggal selesai tidak boleh sebelum mulai.")
-                else:
-                    did = gen_id("del")
-                    row = {
-                        "id": did,
-                        "judul": judul,
-                        "deskripsi": deskripsi,
-                        "pic": pic,
-                        "tgl_mulai": tgl_mulai.isoformat(),
-                        "tgl_selesai": tgl_selesai.isoformat(),
-                        "status": "Belum Selesai",
-                        "file_id": "",
-                        "file_name": "",
-                        "file_link": "",
-                        "tanggal_update": now_wib_iso(),
-                        "created_at": now_wib_iso(),
-                        "updated_at": now_wib_iso(),
-                        "submitted_by": (get_current_user() or {}).get("email", "")
-                    }
-                    _del_append(row)
-                    try:
-                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("delegasi", "create", subject="Delegasi Baru", body=f"Tugas {judul} untuk {pic}")
-                    except Exception:
-                        pass
-                    st.success("Tugas berhasil dibuat.")
-
-    # --- Tab 2: Update Status & Upload Bukti (PIC) ---
-    with tab2:
-        st.markdown("### 📝 PIC Update Status & Upload Bukti")
-        _, df_all = _del_read_df()
-        nama_user = (user.get("full_name") or user.get("email") or "").strip()
-        tugas_pic = df_all[df_all['pic'].astype(str).str.lower() == nama_user.lower()].copy() if not df_all.empty else pd.DataFrame()
-        filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_pic")
-        if filter_status != "Semua" and not tugas_pic.empty:
-            tugas_pic = tugas_pic[tugas_pic['status'] == filter_status]
-        if tugas_pic.empty:
-            st.info("Tidak ada tugas untuk Anda.")
-        else:
-            try:
-                tugas_pic = tugas_pic.sort_values(by='tgl_selesai')
-            except Exception:
-                pass
-            for idx, row in tugas_pic.iterrows():
-                header = f"{row['judul']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | Status: {row['status']}"
-                with st.expander(header):
-                    st.write(f"Deskripsi: {row.get('deskripsi','')}")
-                    st.write(f"Tenggat: {row.get('tgl_mulai','')} s/d {row.get('tgl_selesai','')}")
-                    status = st.selectbox("Status", ["Belum Selesai", "Proses", "Selesai"], index=["Belum Selesai", "Proses", "Selesai"].index(row.get('status','Belum Selesai') or "Belum Selesai"), key=f"status_{row['id']}")
-                    file_bukti = st.file_uploader("Upload Bukti (wajib jika selesai)", key=f"bukti_{row['id']}")
-                    if st.button("Update Status", key=f"update_{row['id']}"):
-                        if status == "Selesai" and not file_bukti and not row.get('file_id'):
-                            st.error("Status 'Selesai' wajib upload file dokumentasi!")
-                        else:
-                            fid, fname, flink = (row.get('file_id'), row.get('file_name'), row.get('file_link'))
-                            if file_bukti:
-                                fid, fname, flink = _upload_file(file_bukti)
-                            updates = {
-                                "status": status,
-                                "tanggal_update": now_wib_iso(),
-                                "updated_at": now_wib_iso(),
-                            }
-                            if status == "Selesai" and fid:
-                                updates.update({"file_id": fid or "", "file_name": fname or "", "file_link": flink or ""})
-                            _del_update_by_id(row['id'], updates)
-                            try:
-                                det = f"status={status}" + (f"; bukti={fname}" if fname else "")
-                                audit_log("delegasi", "update", target=row['id'], details=det)
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("delegasi", "update", subject="Update Delegasi", body=f"Tugas {row['judul']} status {status}")
-                            except Exception:
-                                pass
-                            st.success("Status tugas diperbarui.")
-                            st.rerun()
-
-    # --- Tab 3: Monitoring Director ---
-    with tab3:
-        st.markdown("### 👀 Monitoring Director")
-        if user.get("role") in ["director", "superuser"]:
-            _, df_all = _del_read_df()
-            if df_all.empty:
-                st.info("Belum ada tugas delegasi.")
-            else:
-                filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_dir")
-                if filter_status != "Semua":
-                    df_view = df_all[df_all['status'] == filter_status].copy()
-                else:
-                    df_view = df_all.copy()
-                try:
-                    df_view = df_view.sort_values(by='tgl_selesai')
-                except Exception:
-                    pass
-                st.dataframe(df_view[[c for c in ["id","judul","pic","tgl_mulai","tgl_selesai","status","file_name","tanggal_update"] if c in df_view.columns]], width='stretch', hide_index=True)
-                for idx, row in df_view.iterrows():
-                    with st.expander(f"{row['judul']} | {row['pic']} | Status: {row['status']}"):
-                        st.write(f"Deskripsi: {row.get('deskripsi','')}")
-                        st.write(f"Tenggat: {row.get('tgl_mulai','')} s/d {row.get('tgl_selesai','')}")
-                        st.write(f"Update terakhir: {row.get('tanggal_update','')}")
-                        if row.get('status') == 'Selesai' and row.get('file_name') and row.get('file_link'):
-                            st.markdown(f"📎 Bukti: <a href='{row['file_link']}' target='_blank'>{row['file_name']}</a>", unsafe_allow_html=True)
-                        st.write(f"Status: {row.get('status','')}")
-        else:
-            st.info("Hanya Director yang dapat monitoring di sini.")
-
-    # --- Tab 4: Rekap & Filter ---
-    with tab4:
-        st.markdown("### 📅 Rekap Bulanan Delegasi & Filter")
-        _, df_all = _del_read_df()
-        if df_all.empty:
-            st.info("Belum ada data delegasi.")
-        else:
-            filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_rekap")
-            df_view = df_all.copy()
-            if filter_status != "Semua":
-                df_view = df_view[df_view['status'] == filter_status]
-            this_month = date.today().strftime("%Y-%m")
-            df_month = df_view[df_view['tgl_mulai'].astype(str).str[:7] == this_month] if not df_view.empty else pd.DataFrame()
-            st.write(f"Total tugas bulan ini: {len(df_month)}")
-            if not df_month.empty:
-                # Top PIC & Status dist
-                top_pic = df_month['pic'].value_counts().head(5)
-                st.write("Top 5 PIC:")
-                st.dataframe(top_pic, width='stretch')
-                status_count = df_month['status'].value_counts().to_dict()
-                st.write("Status:", status_count)
-            # Add deadline color preview
-            if not df_view.empty:
-                prev = df_view[["id","judul","pic","tgl_mulai","tgl_selesai","status"]].copy()
-                prev['color'] = prev['tgl_selesai'].apply(_deadline_color)
-                st.subheader("⏰ Status Tenggat (Preview Warna)")
-                st.dataframe(prev, width='stretch', hide_index=True)
-
-
+# Modul Mobil Kantor
 def kalender_pemakaian_mobil_kantor():
     user = require_login()
     st.header("🚗 Kalender & Booking Mobil Kantor")
-    st.markdown("<div style='color:#2563eb;font-size:1.05rem;margin-bottom:1.0em'>Input/edit/hapus hanya Finance & Superuser. Semua user dapat melihat dan memfilter. Sistem mendeteksi potensi bentrok jadwal per kendaraan.</div>", unsafe_allow_html=True)
-
-    def _mobil_headers():
-        return [
-            "id", "nama_pengguna", "divisi", "tgl_mulai", "tgl_selesai", "tujuan",
-            "kendaraan", "driver", "status", "finance_note",
-            "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _mobil_ws():
-        try:
-            return _get_ws(MOBIL_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), MOBIL_SHEET_NAME, _mobil_headers())
-
-    def _mobil_read_df():
-        ws = _mobil_ws()
-        headers = _mobil_headers()
-        try:
-            records = _cached_get_all_records(MOBIL_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        return ws, df
-
-    def _mobil_has_overlap(kendaraan: str, start_date: date, end_date: date, exclude_id: str | None = None) -> tuple[bool, pd.DataFrame]:
-        """Cek apakah ada booking lain dengan kendaraan sama dan rentang tanggal overlap.
-        - Mengabaikan status Ditolak
-        - exclude_id: id yang diabaikan (saat edit)
-        Return: (True/False, df_conflicts)
-        Overlap rule (inclusive dates): (start1 <= end2) and (end1 >= start2)
-        """
-        try:
-            _, df_all = _mobil_read_df()
-            if df_all.empty:
-                return False, pd.DataFrame()
-            # Normalisasi & filter kendaraan + status
-            dff = df_all.copy()
-            dff = dff[dff['kendaraan'].astype(str).str.lower() == (kendaraan or '').lower()]
-            if dff.empty:
-                return False, pd.DataFrame()
-            dff = dff[~dff['status'].astype(str).str.lower().eq('ditolak')]
-            if exclude_id:
-                dff = dff[dff['id'] != exclude_id]
-            if dff.empty:
-                return False, pd.DataFrame()
-            # Parse tanggal
-            def _parse(d):
-                try:
-                    return datetime.fromisoformat(str(d)).date()
-                except Exception:
-                    return None
-            dff['d_mulai'] = dff['tgl_mulai'].apply(_parse)
-            dff['d_selesai'] = dff['tgl_selesai'].apply(_parse)
-            dff = dff.dropna(subset=['d_mulai','d_selesai'])
-            if dff.empty:
-                return False, pd.DataFrame()
-            mask = (dff['d_mulai'] <= end_date) & (dff['d_selesai'] >= start_date)
-            conflicts = dff[mask]
-            if conflicts.empty:
-                return False, pd.DataFrame()
-            return True, conflicts[['id','nama_pengguna','tgl_mulai','tgl_selesai','kendaraan','status','tujuan']]
-        except Exception:
-            return False, pd.DataFrame()
-
-    def _mobil_append(row: dict):
-        ws = _mobil_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-
-    def _mobil_update_by_id(mid: str, updates: dict):
-        ws = _mobil_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(mid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _mobil_delete(mid: str):
-        ws = _mobil_ws()
-        try:
-            cell = ws.find(mid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for i in range(3):
-            try:
-                ws.delete_rows(row_idx)
-                _invalidate_data_cache()
-                return True
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-        return False
-
+    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Input/edit/hapus hanya oleh Finance, view oleh semua user, cek bentrok jadwal, sinkron ke Kalender Bersama.</div>", unsafe_allow_html=True)
+    conn = get_db()
+    cur = conn.cursor()
     tab1, tab2, tab3 = st.tabs(["📝 Input/Edit/Hapus (Finance)", "📋 Daftar Booking & Filter", "📅 Rekap Bulanan & Bentrok"])
 
-    # --- Tab 1: Input/Edit/Hapus ---
+    # Tab 1: Input/Edit/Hapus (Finance)
     with tab1:
         st.markdown("### 📝 Input/Edit/Hapus Jadwal Mobil (Finance)")
-        if user.get("role") in ["finance", "superuser"]:
-            with st.form("form_mobil"):
-                nama_pengguna = st.text_input("Nama", value=(user.get("full_name") or user.get("email") or ""))
+        if user["role"] in ["finance", "superuser"]:
+            with st.form("form_mobil"):  
+                nama_pengguna = st.text_input("Nama")
                 divisi = st.text_input("Divisi")
                 tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
                 tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
@@ -4566,922 +2575,271 @@ def kalender_pemakaian_mobil_kantor():
                 driver = st.text_input("Driver")
                 status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
                 finance_note = st.text_area("Catatan")
-                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil")
-                if submitted_btn:
-                    if not (nama_pengguna and kendaraan and tujuan):
-                        st.warning("Nama, Kendaraan, Tujuan wajib diisi.")
-                    elif tgl_selesai < tgl_mulai:
-                        st.warning("Tanggal selesai harus >= tanggal mulai.")
-                    else:
-                        # Overlap prevention
-                        has_conflict, conflicts = _mobil_has_overlap(kendaraan, tgl_mulai, tgl_selesai)
-                        if has_conflict:
-                            st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Periksa daftar berikut dan pilih tanggal lain.")
-                            try:
-                                safe_dataframe(conflicts, index=False)
-                            except Exception:
-                                st.write(conflicts)
-                            try:
-                                audit_log("mobil", "overlap_block", target=kendaraan, details=f"create {tgl_mulai}..{tgl_selesai}")
-                            except Exception:
-                                pass
-                        else:
-                            mid = gen_id("mobil")
-                            row = {
-                                "id": mid,
-                                "nama_pengguna": nama_pengguna,
-                                "divisi": divisi,
-                                "tgl_mulai": tgl_mulai.isoformat(),
-                                "tgl_selesai": tgl_selesai.isoformat(),
-                                "tujuan": tujuan,
-                                "kendaraan": kendaraan,
-                                "driver": driver,
-                                "status": status,
-                                "finance_note": finance_note,
-                                "created_at": now_wib_iso(),
-                                "updated_at": now_wib_iso(),
-                                "submitted_by": (get_current_user() or {}).get("email", ""),
-                            }
-                            _mobil_append(row)
-                            try:
-                                audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
-                            except Exception:
-                                pass
-                            try:
-                                notify_event("mobil", "create", subject="Booking Mobil Baru", body=f"{kendaraan} {tgl_mulai}..{tgl_selesai} oleh {nama_pengguna}")
-                            except Exception:
-                                pass
-                            st.success("Jadwal mobil berhasil disimpan.")
-            # Edit / Hapus jadwal
-            st.markdown("#### ✏️ Edit / 🗑️ Hapus Jadwal Mobil")
-            _, df_all = _mobil_read_df()
-            if df_all.empty:
-                st.info("Belum ada jadwal mobil.")
-            else:
-                try:
-                    df_all = df_all.sort_values(by='tgl_mulai')
-                except Exception:
-                    pass
-                for _, row in df_all.iterrows():
-                    with st.expander(f"{row['nama_pengguna']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | {row['kendaraan']} | Status: {row['status']}"):
-                        with st.form(f"edit_mobil_{row['id']}"):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                nama_pengguna_e = st.text_input("Nama", value=row.get('nama_pengguna',''), key=f"nama_{row['id']}")
-                                divisi_e = st.text_input("Divisi", value=row.get('divisi',''), key=f"div_{row['id']}")
-                                tujuan_e = st.text_input("Tujuan", value=row.get('tujuan',''), key=f"tujuan_{row['id']}")
-                                kendaraan_e = st.text_input("Kendaraan", value=row.get('kendaraan',''), key=f"kend_{row['id']}")
-                            with col2:
-                                driver_e = st.text_input("Driver", value=row.get('driver',''), key=f"drv_{row['id']}")
-                                status_e = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"], index=["Menunggu Approve", "Disetujui", "Ditolak"].index(row.get('status','Menunggu Approve') or "Menunggu Approve"), key=f"status_{row['id']}")
-                                finance_note_e = st.text_area("Catatan", value=row.get('finance_note',''), key=f"note_{row['id']}")
-                            tgl_mulai_e = st.date_input("Tgl Mulai", value=pd.to_datetime(row.get('tgl_mulai')).date() if row.get('tgl_mulai') else date.today(), key=f"mulai_{row['id']}")
-                            tgl_selesai_e = st.date_input("Tgl Selesai", value=pd.to_datetime(row.get('tgl_selesai')).date() if row.get('tgl_selesai') else date.today(), key=f"selesai_{row['id']}")
-                            c_upd, c_del = st.columns(2)
-                            with c_upd:
-                                update_btn = st.form_submit_button("💾 Simpan Perubahan")
-                            with c_del:
-                                del_btn = st.form_submit_button("🗑️ Hapus Jadwal")
-                            if update_btn:
-                                if tgl_selesai_e < tgl_mulai_e:
-                                    st.warning("Tanggal selesai tidak valid.")
-                                else:
-                                    # Overlap check (exclude this id)
-                                    has_conflict, conflicts = _mobil_has_overlap(kendaraan_e, tgl_mulai_e, tgl_selesai_e, exclude_id=row['id'])
-                                    if has_conflict:
-                                        st.error("Bentrok dengan jadwal lain untuk kendaraan tersebut. Perubahan dibatalkan.")
-                                        try:
-                                            safe_dataframe(conflicts, index=False)
-                                        except Exception:
-                                            st.write(conflicts)
-                                        try:
-                                            audit_log("mobil", "overlap_block", target=row['id'], details=f"update {tgl_mulai_e}..{tgl_selesai_e} {kendaraan_e}")
-                                        except Exception:
-                                            pass
-                                    else:
-                                        changes = {
-                                            "nama_pengguna": nama_pengguna_e,
-                                            "divisi": divisi_e,
-                                            "tgl_mulai": tgl_mulai_e.isoformat(),
-                                            "tgl_selesai": tgl_selesai_e.isoformat(),
-                                            "tujuan": tujuan_e,
-                                            "kendaraan": kendaraan_e,
-                                            "driver": driver_e,
-                                            "status": status_e,
-                                            "finance_note": finance_note_e,
-                                            "updated_at": now_wib_iso(),
-                                        }
-                                        if _mobil_update_by_id(row['id'], changes):
-                                            try:
-                                                audit_log("mobil", "update", target=row['id'], details=f"status={status_e}; kendaraan={kendaraan_e}")
-                                            except Exception:
-                                                pass
-                                            try:
-                                                notify_event("mobil", "update", subject="Update Booking Mobil", body=f"{kendaraan_e} {tgl_mulai_e}..{tgl_selesai_e} status {status_e}")
-                                            except Exception:
-                                                pass
-                                            st.success("Perubahan disimpan.")
-                                            st.rerun()
-                            if del_btn:
-                                if _mobil_delete(row['id']):
-                                    try:
-                                        audit_log("mobil", "delete", target=row['id'], details=f"kendaraan={row.get('kendaraan','')}; tujuan={row.get('tujuan','')}")
-                                    except Exception:
-                                        pass
-                                    try:
-                                        notify_event("mobil", "delete", subject="Hapus Booking Mobil", body=f"{row.get('kendaraan','')} {row.get('tgl_mulai','')}..{row.get('tgl_selesai','')}")
-                                    except Exception:
-                                        pass
-                                    st.success("Jadwal dihapus.")
-                                    st.rerun()
-        else:
-            st.info("Hanya Finance/Superuser yang dapat input atau menghapus jadwal.")
+                submitted = st.form_submit_button("Simpan Jadwal Mobil")
+                if submitted:
+                    mid = gen_id("mobil")
+                    cur.execute("""
+                        INSERT INTO mobil (id, nama_pengguna, divisi, tgl_mulai, tgl_selesai, tujuan, kendaraan, driver, status, finance_note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        mid, nama_pengguna, divisi, tgl_mulai.isoformat(), tgl_selesai.isoformat(), tujuan, kendaraan, driver, status, finance_note
+                    ))
+                    conn.commit()
+                    try:
+                        audit_log("mobil", "create", target=mid, details=f"{kendaraan} {tgl_mulai}..{tgl_selesai} {tujuan}")
+                    except Exception:
+                        pass
+                    st.success("Jadwal mobil berhasil disimpan.")
+            # Edit/hapus jadwal
+            df_edit = pd.read_sql_query("SELECT * FROM mobil ORDER BY tgl_mulai ASC", conn)
+            st.markdown("#### Edit/Hapus Jadwal Mobil")
+            for idx, row in df_edit.iterrows():
+                with st.expander(f"{row['nama_pengguna']} | {row['tgl_mulai']} s/d {row['tgl_selesai']} | {row['kendaraan']} | Status: {row['status']}"):
+                    st.write(f"Tujuan: {row['tujuan']}, Driver: {row['driver']}, Catatan: {row['finance_note']}")
+                    if st.button("Hapus Jadwal", key=f"hapus_mobil_{row['id']}"):
+                        cur.execute("DELETE FROM mobil WHERE id=?", (row["id"],))
+                        conn.commit()
+                        try:
+                            audit_log("mobil", "delete", target=row['id'], details=f"kendaraan={row['kendaraan']}; tujuan={row['tujuan']}")
+                        except Exception:
+                            pass
+                        st.success("Jadwal dihapus.")
+                        st.experimental_rerun()
 
-    # --- Tab 2: Daftar Booking & Filter ---
+    # Tab 2: Daftar Booking & Filter (semua user)
     with tab2:
         st.markdown("### 📋 Daftar Booking Mobil & Filter")
-        _, df_all = _mobil_read_df()
-        if df_all.empty:
-            st.info("Belum ada data booking mobil.")
-        else:
-            filter_status = st.selectbox("Filter Status", ["Semua", "Menunggu Approve", "Disetujui", "Ditolak"], key="filter_status_mobil")
-            filter_kendaraan = st.text_input("Filter Kendaraan (opsional)", "", key="filter_kendaraan_mobil")
-            df_view = df_all.copy()
-            if filter_status != "Semua":
-                df_view = df_view[df_view['status'] == filter_status]
-            if filter_kendaraan:
-                df_view = df_view[df_view['kendaraan'].astype(str).str.contains(filter_kendaraan, case=False, na=False)]
-            try:
-                df_view = df_view.sort_values(by=['tgl_mulai','kendaraan'])
-            except Exception:
-                pass
-            safe_dataframe(df_view[["nama_pengguna","divisi","tgl_mulai","tgl_selesai","tujuan","kendaraan","driver","status"]], index=False)
+        df = pd.read_sql_query("SELECT id,nama_pengguna,divisi,tgl_mulai,tgl_selesai,tujuan,kendaraan,driver,status FROM mobil ORDER BY tgl_mulai ASC", conn)
+        filter_status = st.selectbox("Filter Status", ["Semua", "Menunggu Approve", "Disetujui", "Ditolak"], key="filter_status_mobil")
+        filter_kendaraan = st.text_input("Filter Kendaraan (opsional)", "", key="filter_kendaraan_mobil")
+        if filter_status != "Semua":
+            df = df[df["status"] == filter_status]
+        if filter_kendaraan:
+            df = df[df["kendaraan"].str.contains(filter_kendaraan, case=False, na=False)]
+        st.dataframe(df)
 
-    # --- Tab 3: Rekap Bulanan & Bentrok ---
+    # Tab 3: Rekap Bulanan & Bentrok
     with tab3:
         st.markdown("### 📅 Rekap Bulanan Mobil Kantor & Cek Bentrok")
-        _, df_all = _mobil_read_df()
-        if df_all.empty:
-            st.info("Belum ada data mobil.")
-        else:
-            this_month = date.today().strftime("%Y-%m")
-            df_month = df_all[df_all['tgl_mulai'].astype(str).str[:7] == this_month] if not df_all.empty else pd.DataFrame()
-            st.write(f"Total booking bulan ini: {len(df_month)}")
-            if not df_month.empty:
-                by_kendaraan = df_month['kendaraan'].value_counts().rename("jumlah_booking")
-                st.write("Top Kendaraan Dipakai:")
-                safe_dataframe(by_kendaraan.to_frame(), index=True)
-            # Overlap detection per kendaraan
-            st.markdown("#### 🚨 Cek Bentrok Jadwal Mobil Kantor")
+        df = pd.read_sql_query("SELECT * FROM mobil ORDER BY tgl_mulai ASC", conn)
+        this_month = date.today().strftime("%Y-%m")
+        df_month = df[df['tgl_mulai'].str[:7] == this_month] if not df.empty else pd.DataFrame()
+        st.write(f"Total booking bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            by_kendaraan = df_month['kendaraan'].value_counts()
+            st.write("Top Kendaraan Dipakai:")
+            st.dataframe(by_kendaraan)
+        # Cek bentrok jadwal mobil kantor (kendaraan sama, tanggal overlap)
+        st.markdown("#### 🚨 Cek Bentrok Jadwal Mobil Kantor")
+        if not df.empty:
+            df_sorted = df.sort_values(["kendaraan", "tgl_mulai"])
             overlaps = []
-            if not df_all.empty:
-                try:
-                    df_sorted = df_all.sort_values(["kendaraan", "tgl_mulai"])
-                except Exception:
-                    df_sorted = df_all.copy()
-                current_vehicle = None
+            for kendaraan, group in df_sorted.groupby("kendaraan"):
                 prev_end = None
-                for _, r in df_sorted.iterrows():
-                    veh = r.get('kendaraan')
-                    try:
-                        start = datetime.fromisoformat(r['tgl_mulai'] + "T00:00:00")
-                        end = datetime.fromisoformat(r['tgl_selesai'] + "T23:59:59")
-                    except Exception:
-                        continue
-                    if veh != current_vehicle:
-                        current_vehicle = veh
-                        prev_end = None
+                for idx, row in group.iterrows():
+                    start = pd.to_datetime(row["tgl_mulai"])
+                    end = pd.to_datetime(row["tgl_selesai"])
                     if prev_end and start <= prev_end:
-                        overlaps.append((veh, r['tgl_mulai'], r['tgl_selesai']))
+                        overlaps.append((kendaraan, row["tgl_mulai"], row["tgl_selesai"]))
                     prev_end = max(prev_end, end) if prev_end else end
             if overlaps:
-                st.warning(f"Terdapat overlap jadwal untuk kendaraan yang sama: {overlaps}")
+                st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
             else:
                 st.success("Tidak ada bentrok jadwal mobil kantor bulan ini.")
 
-
 def calendar_module():
+
     user = require_login()
     st.header("📅 Kalender Bersama (Auto Integrasi)")
-
-    # Helpers for calendar & public holidays
-    def _cal_headers():
-        return [
-            "id", "jenis", "judul", "nama_divisi", "tgl_mulai", "tgl_selesai",
-            "deskripsi", "file_id", "file_name", "file_link",
-            "is_holiday", "sumber", "ditetapkan_oleh", "tanggal_penetapan", "created_at", "updated_at", "submitted_by"
-        ]
-
-    def _cal_ws():
-        try:
-            return _get_ws(CALENDAR_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), CALENDAR_SHEET_NAME, _cal_headers())
-
-    def _cal_read_df():
-        ws = _cal_ws()
-        headers = _cal_headers()
-        try:
-            records = _cached_get_all_records(CALENDAR_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        # Normalisasi flag
-        df['is_holiday'] = pd.to_numeric(df.get('is_holiday'), errors='coerce').fillna(0).astype(int)
-        return ws, df
-
-    def _cal_append(row: dict):
-        ws = _cal_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-
-    def _pub_ws():
-        try:
-            return _get_ws(PUBLIC_HOLIDAYS_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), PUBLIC_HOLIDAYS_SHEET_NAME, ["tahun","tanggal","nama","keterangan","ditetapkan_oleh","tanggal_penetapan"])
-
-    def _pub_append(row: dict):
-        ws = _pub_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
+    conn = get_db()
+    cur = conn.cursor()
 
     tab1, tab2 = st.tabs(["➕ Tambah Libur Nasional", "📆 Kalender & Rekap"])
 
-    # Tab 1: Tambah Libur Nasional
+    # Tab 1: Tambah Libur Nasional (khusus Director/Superuser)
     with tab1:
         st.subheader("Tambah Libur Nasional (Director)")
-        if user.get("role") in ["director", "superuser"]:
+        if user["role"] in ["director", "superuser"]:
             with st.form("add_libur_nasional"):
                 judul = st.text_input("Judul Libur Nasional")
-                tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
-                tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+                tgl_mulai = st.date_input("Tgl Mulai")
+                tgl_selesai = st.date_input("Tgl Selesai")
                 sumber = st.text_input("Sumber / Dasar Penetapan (opsional)")
-                submit_libur = st.form_submit_button("Tambah Libur Nasional")
-                if submit_libur:
-                    if not judul:
-                        st.warning("Judul wajib diisi.")
-                    elif tgl_selesai < tgl_mulai:
-                        st.warning("Tanggal selesai harus >= tanggal mulai.")
-                    else:
-                        cid = gen_id("cal")
-                        now_iso = now_wib_iso()
-                        row = {
-                            "id": cid,
-                            "jenis": "Libur Nasional",
-                            "judul": judul,
-                            "nama_divisi": "-",
-                            "tgl_mulai": tgl_mulai.isoformat(),
-                            "tgl_selesai": tgl_selesai.isoformat(),
-                            "deskripsi": sumber,
-                            "file_id": "",
-                            "file_name": "",
-                            "file_link": "",
-                            "is_holiday": 1,
-                            "sumber": sumber,
-                            "ditetapkan_oleh": (get_current_user() or {}).get("full_name") or (get_current_user() or {}).get("email"),
-                            "tanggal_penetapan": now_iso,
-                            "created_at": now_iso,
-                            "updated_at": now_iso,
-                            "submitted_by": (get_current_user() or {}).get("email", ""),
-                        }
-                        _cal_append(row)
-                        # Normalized public holiday row (ambil hanya tanggal mulai sebagai representative)
-                        pub = {
-                            "tahun": tgl_mulai.year,
-                            "tanggal": tgl_mulai.isoformat(),
-                            "nama": judul,
-                            "keterangan": sumber or "",
-                            "ditetapkan_oleh": row["ditetapkan_oleh"],
-                            "tanggal_penetapan": now_iso,
-                        }
-                        _pub_append(pub)
-                        try:
-                            audit_log("calendar", "add_holiday", target=cid, details=f"{judul} {tgl_mulai}..{tgl_selesai}")
-                        except Exception:
-                            pass
-                        try:
-                            notify_event("calendar", "add_holiday", subject="Tambah Libur Nasional", body=f"{judul} {tgl_mulai}..{tgl_selesai}")
-                        except Exception:
-                            pass
-                        st.success("Libur Nasional ditambahkan.")
+                if st.form_submit_button("Tambah Libur Nasional"):
+                    cid = gen_id("cal")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("INSERT INTO calendar (id,jenis,judul,nama_divisi,tgl_mulai,tgl_selesai,deskripsi,file_blob,file_name,is_holiday,sumber,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (cid, "Libur Nasional", judul, "-", tgl_mulai.isoformat(), tgl_selesai.isoformat(), sumber, None, None, 1, sumber, user["full_name"], now))
+                    cur.execute("INSERT INTO public_holidays (tahun,tanggal,nama,keterangan,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?)",
+                        (tgl_mulai.year, tgl_mulai.isoformat(), judul, sumber or "", user["full_name"], now))
+                    conn.commit()
+                    try:
+                        audit_log("calendar", "add_holiday", target=cid, details=f"{judul} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    st.success("Libur Nasional ditambahkan.")
         else:
             st.info("Hanya Director yang bisa menambah Libur Nasional.")
 
     # Tab 2: Kalender Gabungan & Rekap
     with tab2:
-        # Ambil data modul lain dari Sheets
-        # Cuti (disetujui director)
-        try:
-            _, df_cuti = _cuti_read_df()  # assumes _cuti_read_df returns (ws, df) or df? existing impl returns ws? We adapt
-        except Exception:
-            df_cuti = pd.DataFrame()
-        if isinstance(df_cuti, tuple):  # safety if signature differs
-            df_cuti = df_cuti[1]
-        if df_cuti is None:
-            df_cuti = pd.DataFrame()
-        if not df_cuti.empty:
-            try:
-                df_cuti = df_cuti[pd.to_numeric(df_cuti.get('director_approved'), errors='coerce').fillna(0).astype(int) == 1][['nama','tgl_mulai','tgl_selesai']].rename(columns={'nama':'judul'})
-                df_cuti['jenis'] = 'Cuti'
-                df_cuti['nama_divisi'] = df_cuti['judul']
-            except Exception:
-                df_cuti = pd.DataFrame()
+        # --- AUTO INTEGRASI EVENT ---
+        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
+        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
+        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
+        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai, kendaraan FROM mobil WHERE status='Disetujui'", conn)
+        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", conn)
 
-        # Flex (approved director)
-        try:
-            _, df_flex_raw = _get_ws(FLEX_SHEET_NAME), None  # placeholder to avoid lint
-        except Exception:
-            pass
-        try:
-            ws_flex = _get_ws(FLEX_SHEET_NAME)
-            flex_records = _cached_get_all_records(FLEX_SHEET_NAME, [])
-            df_flex = pd.DataFrame(flex_records)
-        except Exception:
-            df_flex = pd.DataFrame()
-        if not df_flex.empty:
-            try:
-                df_flex = df_flex[pd.to_numeric(df_flex.get('approval_director'), errors='coerce').fillna(0).astype(int) == 1][['nama','tanggal']]
-                df_flex = df_flex.rename(columns={'nama':'judul','tanggal':'tgl_mulai'})
-                df_flex['tgl_selesai'] = df_flex['tgl_mulai']
-                df_flex['jenis'] = 'Flex Time'
-                df_flex['nama_divisi'] = df_flex['judul']
-            except Exception:
-                df_flex = pd.DataFrame()
+        # Gabungkan semua event
+        df_all = pd.concat([
+            df_cuti,
+            df_flex,
+            df_delegasi,
+            df_rapat,
+            df_mobil.drop(columns=["kendaraan"], errors="ignore"),
+            df_libur
+        ], ignore_index=True)
 
-        # Delegasi (semua tugas)
-        try:
-            ws_del = _get_ws(DELEGASI_SHEET_NAME)
-            del_records = _cached_get_all_records(DELEGASI_SHEET_NAME, [])
-            df_delegasi = pd.DataFrame(del_records)
-        except Exception:
-            df_delegasi = pd.DataFrame()
-        if not df_delegasi.empty:
-            try:
-                df_delegasi = df_delegasi[['judul','pic','tgl_mulai','tgl_selesai']]
-                df_delegasi = df_delegasi.rename(columns={'pic':'nama_divisi'})
-                df_delegasi['jenis'] = 'Delegasi'
-            except Exception:
-                df_delegasi = pd.DataFrame()
-
-        # Mobil (status Disetujui)
-        try:
-            ws_mobil = _get_ws(MOBIL_SHEET_NAME)
-            mobil_records = _cached_get_all_records(MOBIL_SHEET_NAME, [])
-            df_mobil = pd.DataFrame(mobil_records)
-        except Exception:
-            df_mobil = pd.DataFrame()
+        # Cek overlap mobil kantor (tidak boleh overlap untuk kendaraan yang sama)
         if not df_mobil.empty:
-            try:
-                df_mobil = df_mobil[df_mobil['status'].astype(str).str.lower() == 'disetujui']
-                df_mobil = df_mobil[['tujuan','kendaraan','tgl_mulai','tgl_selesai','kendaraan']].rename(columns={'tujuan':'judul','kendaraan':'nama_divisi'})
-                df_mobil['jenis'] = 'Mobil Kantor'
-            except Exception:
-                df_mobil = pd.DataFrame()
+            df_mobil_sorted = df_mobil.sort_values(["kendaraan", "tgl_mulai"])
+            overlaps = []
+            for kendaraan, group in df_mobil_sorted.groupby("kendaraan"):
+                prev_end = None
+                for idx, row in group.iterrows():
+                    start = pd.to_datetime(row["tgl_mulai"])
+                    end = pd.to_datetime(row["tgl_selesai"])
+                    if prev_end and start <= prev_end:
+                        overlaps.append((kendaraan, row["tgl_mulai"], row["tgl_selesai"]))
+                    prev_end = max(prev_end, end) if prev_end else end
+            if overlaps:
+                st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
 
-        # Libur (is_holiday=1)
-        try:
-            _, df_cal_all = _cal_read_df()
-            df_libur = df_cal_all[pd.to_numeric(df_cal_all.get('is_holiday'), errors='coerce').fillna(0).astype(int) == 1][['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai']]
-        except Exception:
-            df_libur = pd.DataFrame()
-
-        # Gabung
-        frames = [df for df in [df_cuti, df_flex, df_delegasi, df_mobil.drop(columns=['nama_divisi'], errors='ignore') if not df_mobil.empty else df_mobil, df_libur] if isinstance(df, pd.DataFrame) and not df.empty]
-        # Perhatikan df_mobil: sudah rename kendaraan->nama_divisi; kita tidak ingin drop kolom yang ada.
-        if not df_mobil.empty:
-            # df_mobil saat ini punya kolom nama_divisi dan mungkin kolom 'kendaraan' kedua (rename conflict); normalisasi:
-            if 'kendaraan' in df_mobil.columns and 'nama_divisi' in df_mobil.columns:
-                df_mobil = df_mobil.drop(columns=['kendaraan'], errors='ignore')
-        frames = [df_cuti, df_flex, df_delegasi, df_mobil, df_libur]
-        frames = [f for f in frames if f is not None and not f.empty]
-        if frames:
-            df_all = pd.concat(frames, ignore_index=True)
-        else:
-            df_all = pd.DataFrame(columns=['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai'])
-
-        # Overlap kendaraan (mobil) tambahan per referensi
-        if 'Mobil Kantor' in (df_all['jenis'].unique().tolist() if not df_all.empty else []):
-            try:
-                df_mobil_for_overlap = df_all[df_all['jenis']=='Mobil Kantor'].copy()
-                df_mobil_for_overlap['kendaraan'] = df_mobil_for_overlap['nama_divisi']
-                df_mobil_sorted = df_mobil_for_overlap.sort_values(['kendaraan','tgl_mulai'])
-                overlaps = []
-                prev_end_by_car = {}
-                for _, r in df_mobil_sorted.iterrows():
-                    veh = r.get('kendaraan')
-                    try:
-                        start = pd.to_datetime(r['tgl_mulai'])
-                        end = pd.to_datetime(r['tgl_selesai'])
-                    except Exception:
-                        continue
-                    if veh in prev_end_by_car and start <= prev_end_by_car[veh]:
-                        overlaps.append((veh, r['tgl_mulai'], r['tgl_selesai']))
-                    prev_end_by_car[veh] = max(prev_end_by_car[veh], end) if veh in prev_end_by_car else end
-                if overlaps:
-                    st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
-            except Exception:
-                pass
-
+        # -------------------------
+        # Filter UI
+        # -------------------------
         st.subheader("🔎 Filter Kalender")
         if not df_all.empty:
-            dff = df_all.copy()
-            dff['tgl_mulai_dt'] = pd.to_datetime(dff['tgl_mulai'], errors='coerce')
-            dff['tgl_selesai_dt'] = pd.to_datetime(dff['tgl_selesai'], errors='coerce')
-            min_date = dff['tgl_mulai_dt'].min()
-            max_date = dff['tgl_selesai_dt'].max()
+            # Siapkan kolom bantu untuk filter tanggal overlap
+            df_all = df_all.copy()
+            df_all["tgl_mulai_dt"] = pd.to_datetime(df_all["tgl_mulai"], errors="coerce")
+            df_all["tgl_selesai_dt"] = pd.to_datetime(df_all["tgl_selesai"], errors="coerce")
+
+            min_date = df_all["tgl_mulai_dt"].min()
+            max_date = df_all["tgl_selesai_dt"].max()
+            # Default rentang: bulan ini jika ada, fallback ke min/max
             today = date.today()
             month_start = today.replace(day=1)
             next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
             month_end = next_month - timedelta(days=1)
             default_start = month_start if pd.notna(min_date) else today
             default_end = month_end if pd.notna(max_date) else today
-            col_a, col_b = st.columns([2,2])
+
+            col_a, col_b = st.columns([2, 2])
             with col_a:
-                jenis_opts = sorted([x for x in dff['jenis'].dropna().unique().tolist()])
-                jenis_selected = st.multiselect("Jenis Event", jenis_opts, default=jenis_opts)
+                jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
+                jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options)
             with col_b:
                 date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end))
-            col_c, col_d = st.columns([2,2])
+
+            col_c, col_d = st.columns([2, 2])
             with col_c:
                 filter_div = st.text_input("Filter Divisi (nama_divisi)", "")
             with col_d:
                 filter_judul = st.text_input("Cari Judul", "")
-            # Apply filters
-            if jenis_selected:
-                dff = dff[dff['jenis'].isin(jenis_selected)]
+
+            # Terapkan filter
+            dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
             if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
                 start_d, end_d = date_range
                 if start_d and end_d:
-                    dff = dff[(dff['tgl_mulai_dt'] <= pd.to_datetime(end_d)) & (dff['tgl_selesai_dt'] >= pd.to_datetime(start_d))]
+                    # Event overlap jika mulai <= end_d dan selesai >= start_d
+                    dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
             if filter_div:
-                dff = dff[dff['nama_divisi'].astype(str).str.contains(filter_div, case=False, na=False)]
+                dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
             if filter_judul:
-                dff = dff[dff['judul'].astype(str).str.contains(filter_judul, case=False, na=False)]
+                dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
+
+            # Tampilkan hasil
             st.subheader("📆 Tampilkan Kalender (Gabungan) — Hasil Filter")
             if not dff.empty:
-                dff = dff.sort_values('tgl_mulai')
-                show_cols = [c for c in ['judul','jenis','nama_divisi','tgl_mulai','tgl_selesai'] if c in dff.columns]
-                safe_dataframe(dff[show_cols], index=False)
-                csv_bytes = dff[show_cols].to_csv(index=False).encode('utf-8')
+                dff = dff.sort_values("tgl_mulai")
+                show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
+                st.dataframe(dff[show_cols], use_container_width=True)
+                # Download CSV hasil filter
+                csv_bytes = dff[show_cols].to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Download CSV (Hasil Filter)", data=csv_bytes, file_name=f"kalender_gabungan_filtered_{today.isoformat()}.csv", mime="text/csv")
             else:
                 st.info("Tidak ada event sesuai filter.")
+
+            # Rekap Bulanan Kalender (berdasarkan hasil filter)
             st.markdown("#### 📅 Rekap Bulanan Kalender (Otomatis) — Berdasar Filter")
             this_month = date.today().strftime("%Y-%m")
             df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
             st.write(f"Total event bulan ini: {len(df_month)}")
             if not df_month.empty:
                 by_jenis = df_month['jenis'].value_counts()
-                safe_dataframe(by_jenis.to_frame(name='jumlah'), index=True)
+                st.write("Rekap per Jenis Event:")
+                st.dataframe(by_jenis)
         else:
             st.info("Belum ada event pada kalender.")
 
-
-def sop_module():
-    user = require_login()
-    st.header("📚 Kebijakan & SOP")
-
-    # Access guard: only Director & Superuser may access SOP module.
-    role = str(user.get("role", "")).strip().lower()
-    if role not in {"director", "superuser"}:
-        st.info("Modul SOP hanya dapat diakses oleh Director atau Superuser.")
-        return
-
-    # Helpers
-    def _sop_headers():
-        return [
-            "id", "judul", "tanggal_terbit", "tanggal_upload", "file_id", "file_name", "file_link",
-            "memo", "board_note", "director_approved", "uploaded_by", "created_at", "updated_at"
-        ]
-
-    def _sop_ws():
-        try:
-            return _get_ws(SOP_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), SOP_SHEET_NAME, _sop_headers())
-
-    def _sop_read_df():
-        ws = _sop_ws()
-        headers = _sop_headers()
-        try:
-            records = _cached_get_all_records(SOP_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
-        return ws, df
-
-    def _sop_append(row: dict):
-        ws = _sop_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-
-    def _sop_update_by_id(sid: str, updates: dict):
-        ws = _sop_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(sid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _upload_sop_file(file) -> tuple[str, str, str]:
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            fname = file.name
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
-            metadata = {"name": fname, "parents": [GDRIVE_FOLDER_ID]}
-            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name").execute()
-            fid = created.get('id','')
-            link = created.get('webViewLink','')
-            return fid, fname, link
-        except Exception as e:
-            st.error(f"Gagal upload file SOP: {e}")
-            return "", "", ""
-
-    # Introspeksi: gunakan tanggal_terbit jika ada data valid, fallback ke tanggal_upload
-    tab_upload, tab_daftar, tab_approve = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director"])
-
-    # --- Tab 1: Upload SOP ---
-    with tab_upload:
-        st.subheader("Upload SOP / Kebijakan")
-        _, df_sop = _sop_read_df()
-        headers = list(df_sop.columns)
-        has_tanggal_terbit = 'tanggal_terbit' in headers
-        has_tanggal_upload = 'tanggal_upload' in headers
-        has_director_approved = 'director_approved' in headers
-        with st.form("sop_add", clear_on_submit=True):
-            judul = st.text_input("Judul Kebijakan / SOP")
-            tgl_terbit = st.date_input("Tanggal Terbit", value=date.today()) if has_tanggal_terbit else None
-            f = st.file_uploader("Upload File SOP (PDF/DOC)")
-            submit = st.form_submit_button("💾 Simpan")
-            if submit:
-                if not judul or not f:
-                    st.warning("Judul dan file wajib diisi.")
-                else:
-                    sid = gen_id("sop")
-                    fid, fname, flink = _upload_sop_file(f)
-                    now_iso = now_wib_iso()
-                    row = {
-                        "id": sid,
-                        "judul": judul,
-                        "file_id": fid,
-                        "file_name": fname,
-                        "file_link": flink,
-                        "uploaded_by": (get_current_user() or {}).get("email"),
-                        "created_at": now_iso,
-                        "updated_at": now_iso,
-                    }
-                    if has_tanggal_terbit and tgl_terbit:
-                        row['tanggal_terbit'] = tgl_terbit.isoformat()
-                    elif has_tanggal_upload:
-                        row['tanggal_upload'] = now_iso
-                    if 'memo' in headers:
-                        row['memo'] = ""
-                    if 'board_note' in headers:
-                        row['board_note'] = ""
-                    if has_director_approved:
-                        row['director_approved'] = 0
-                    _sop_append(row)
-                    try:
-                        audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("sop", "upload", subject=f"SOP Baru: {judul}", body=f"Judul: {judul}\nUploader: {(get_current_user() or {}).get('email')}\nLink: {flink}")
-                    except Exception:
-                        pass
-                    st.success("SOP berhasil diupload. Menunggu approval Director.")
-
-    # --- Tab 2: Daftar & Rekap ---
-    with tab_daftar:
-        st.subheader("Daftar SOP")
-        _, df_sop = _sop_read_df()
-        if df_sop.empty:
-            st.info("Belum ada SOP.")
-        else:
-            # Pilih kolom tanggal utama
-            date_col = 'tanggal_terbit' if 'tanggal_terbit' in df_sop.columns and df_sop['tanggal_terbit'].astype(str).str.len().gt(0).any() else ('tanggal_upload' if 'tanggal_upload' in df_sop.columns else None)
-            col1, col2, col3 = st.columns([2,2,2])
-            with col1:
-                q = st.text_input("Cari Judul", "")
-            with col2:
-                status_opt = ["Semua", "Approved", "Belum"] if 'director_approved' in df_sop.columns else ["Semua"]
-                status_sel = st.selectbox("Status", status_opt)
-            with col3:
-                if date_col and not df_sop.empty:
-                    try:
-                        df_sop['_dc'] = pd.to_datetime(df_sop[date_col], errors='coerce')
-                        min_d = df_sop['_dc'].min().date() if pd.notna(df_sop['_dc'].min()) else date.today()
-                        max_d = df_sop['_dc'].max().date() if pd.notna(df_sop['_dc'].max()) else date.today()
-                        dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
-                    except Exception:
-                        dr = None
-                else:
-                    dr = None
-            dff = df_sop.copy()
-            if q:
-                dff = dff[dff['judul'].astype(str).str.contains(q, case=False, na=False)]
-            if status_sel != "Semua" and 'director_approved' in dff.columns:
-                dff = dff[dff['director_approved'] == (1 if status_sel == 'Approved' else 0)]
-            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and date_col and date_col in dff.columns:
-                try:
-                    s, e = dr
-                    dff['_dc'] = pd.to_datetime(dff[date_col], errors='coerce')
-                    dff = dff[(dff['_dc'] >= pd.to_datetime(s)) & (dff['_dc'] <= pd.to_datetime(e))]
-                except Exception:
-                    pass
-            if not dff.empty:
-                show = dff.copy()
-                if 'director_approved' in show.columns:
-                    show['Status'] = show['director_approved'].map({1: "✅ Approved", 0: "🕒 Proses"})
-                cols_show = ['judul']
-                if date_col: cols_show.append(date_col)
-                for c in ['file_name','Status']:
-                    if c in show.columns:
-                        cols_show.append(c)
-                safe_dataframe(show[cols_show], index=False)
-                try:
-                    st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode('utf-8'), file_name="daftar_sop.csv")
-                except Exception:
-                    pass
-                # Pilih file untuk buka link (Drive)
-                if 'file_name' in show.columns and 'file_link' in show.columns:
-                    opsi = {f"{r['judul']} — {r.get(date_col,'')} ({r.get('file_name') or '-'})": r['file_link'] for _, r in show.iterrows() if r.get('file_link')}
-                    if opsi:
-                        pilih = st.selectbox("Buka File SOP", [""] + list(opsi.keys()))
-                        if pilih:
-                            st.markdown(f"📄 <a href='{opsi[pilih]}' target='_blank'>Buka File</a>", unsafe_allow_html=True)
-            else:
-                st.info("Belum ada SOP sesuai filter.")
-
-            # Rekap Bulanan SOP
-            st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
-            this_month = date.today().strftime("%Y-%m")
-            if not dff.empty and date_col and date_col in dff.columns:
-                df_month = dff[dff[date_col].astype(str).str[:7] == this_month]
-            else:
-                df_month = pd.DataFrame()
-            st.write(f"Total SOP/Kebijakan bulan ini: {len(df_month)}")
-
-    # --- Tab 3: Approval Director ---
-    with tab_approve:
-        _, df_sop = _sop_read_df()
-        headers = list(df_sop.columns)
-        if user.get('role') not in ['director','superuser']:
-            st.info("Hanya Director/Superuser yang dapat meng-approve.")
-        elif 'director_approved' not in headers:
-            st.info("Kolom director_approved belum tersedia pada sheet SOP.")
-        else:
-            date_col = 'tanggal_terbit' if 'tanggal_terbit' in headers and df_sop['tanggal_terbit'].astype(str).str.len().gt(0).any() else ('tanggal_upload' if 'tanggal_upload' in headers else None)
-            pending = df_sop[df_sop['director_approved'] == 0].copy()
-            if date_col and not pending.empty:
-                try:
-                    pending = pending.sort_values(by=date_col, ascending=False)
-                except Exception:
-                    pass
-            if pending.empty:
-                st.success("Tidak ada item menunggu approval.")
-            else:
-                for _, r in pending.iterrows():
-                    title = f"{r['judul']}" + (f" | {r.get(date_col)}" if date_col and r.get(date_col) else "")
-                    with st.expander(title):
-                        st.write(f"File: {r.get('file_name') or '-'}")
-                        if r.get('file_link'):
-                            st.markdown(f"📄 <a href='{r['file_link']}' target='_blank'>Buka di Drive</a>", unsafe_allow_html=True)
-                        note_val = st.text_area("Catatan Director (opsional)", value=r.get('memo') or "", key=f"sop_note_{r['id']}")
-                        if st.button("✅ Approve", key=f"sop_appr_{r['id']}"):
-                            updates = {"director_approved": 1, "updated_at": now_wib_iso()}
-                            if 'memo' in headers:
-                                updates['memo'] = note_val
-                            if _sop_update_by_id(r['id'], updates):
-                                try:
-                                    audit_log("sop", "director_approval", target=r['id'], details=f"note={note_val}")
-                                except Exception:
-                                    pass
-                                try:
-                                    notify_event("sop", "director_approval", subject=f"SOP Disetujui: {r['judul']}", body=f"Judul: {r['judul']}\nCatatan: {note_val}")
-                                except Exception:
-                                    pass
-                                st.success("SOP approved.")
-                                st.rerun()
-
+ 
 
 def notulen_module():
     user = require_login()
     st.header("🗒️ Notulen Rapat Rutin")
+    conn = get_db()
+    cur = conn.cursor()
+    # Introspeksi awal kolom dan tanggal utama
+    cur.execute("PRAGMA table_info(notulen)")
+    nt_cols = [row[1] for row in cur.fetchall()]
+    nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
 
-    # Helpers
-    def _not_headers():
-        return [
-            "id", "judul", "kategori", "divisi", "tanggal_rapat", "tanggal_upload", "file_id", "file_name", "file_link",
-            "follow_up", "deadline", "uploaded_by", "director_note", "director_approved", "version", "created_at", "updated_at"
-        ]
-
-    def _not_ws():
-        try:
-            return _get_ws(NOTULEN_SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            return ensure_sheet_with_headers(get_spreadsheet(), NOTULEN_SHEET_NAME, _not_headers())
-
-    def _not_read_df():
-        ws = _not_ws()
-        headers = _not_headers()
-        try:
-            records = _cached_get_all_records(NOTULEN_SHEET_NAME, headers)
-        except Exception:
-            records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        for h in headers:
-            if h not in df.columns:
-                df[h] = ""
-        # Normalisasi
-        df['director_approved'] = pd.to_numeric(df.get('director_approved'), errors='coerce').fillna(0).astype(int)
-        return ws, df
-
-    def _not_append(row: dict):
-        ws = _not_ws()
-        headers = ws.row_values(1)
-        values = [row.get(h, "") for h in headers]
-        for i in range(3):
-            try:
-                ws.append_row(values)
-                _invalidate_data_cache()
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-
-    def _not_update_by_id(nid: str, updates: dict):
-        ws = _not_ws()
-        headers = ws.row_values(1)
-        try:
-            cell = ws.find(nid)
-        except Exception:
-            return False
-        if not cell:
-            return False
-        row_idx = cell.row
-        for k, v in updates.items():
-            if k not in headers:
-                continue
-            a1 = gspread.utils.rowcol_to_a1(row_idx, headers.index(k) + 1)
-            for i in range(3):
-                try:
-                    ws.update(a1, [[v]])
-                    break
-                except gspread.exceptions.APIError as e:
-                    if "429" in str(e):
-                        time.sleep(1.0 * (i + 1))
-                        continue
-                    raise
-        _invalidate_data_cache()
-        return True
-
-    def _upload_notulen_file(file) -> tuple[str, str, str]:
-        if not file:
-            return "", "", ""
-        try:
-            service = get_gdrive_service()
-            fname = file.name
-            parents = []
-            if GDRIVE_FOLDER_ID:
-                try:
-                    service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
-                    parents = [GDRIVE_FOLDER_ID]
-                except HttpError:
-                    st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan/akses ditolak. File akan diupload ke root Drive service account.")
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
-            metadata = {"name": fname}
-            if parents:
-                metadata["parents"] = parents
-            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name", supportsAllDrives=True).execute()
-            fid = created.get('id','')
-            link = created.get('webViewLink','')
-            return fid, fname, link
-        except Exception as e:
-            st.error(f"Gagal upload file notulen: {e}")
-            return "", "", ""
-
-    # Tanggal referensi: jika tanggal_rapat kosong, gunakan tanggal_upload
     tab_upload, tab_list, tab_rekap = st.tabs(["🆕 Upload Notulen", "📋 Daftar Notulen", "📅 Rekap Bulanan Notulen"])
 
     # --- Tab 1: Upload ---
     with tab_upload:
-        st.subheader("🆕 Upload Notulen (Staf upload, Director approve final)")
-        _, df_nt = _not_read_df()
-        headers = list(df_nt.columns)
-        has_tanggal_rapat = 'tanggal_rapat' in headers
-        has_follow_up = 'follow_up' in headers
-        has_deadline = 'deadline' in headers
-        has_director_note = 'director_note' in headers
-        has_director_approved = 'director_approved' in headers
+        st.subheader("🆕 Upload Notulen (staf upload, Director approve final)")
         with st.form("not_add", clear_on_submit=True):
             judul = st.text_input("Judul Rapat")
-            kategori = st.text_input("Kategori (opsional)") if 'kategori' in headers else None
-            divisi = st.text_input("Divisi / Departemen (opsional)") if 'divisi' in headers else None
-            tgl_rapat = st.date_input("Tanggal Rapat", value=date.today()) if has_tanggal_rapat else None
-            file_up = st.file_uploader("File Notulen (PDF/DOC/IMG)")
-            follow_up = st.text_area("Catatan Follow Up (opsional)") if has_follow_up else None
-            deadline = st.date_input("Deadline / Tindak Lanjut", value=date.today()) if has_deadline else None
-            submit_btn = st.form_submit_button("💾 Upload Notulen")
-            if submit_btn:
-                if not judul or not file_up:
+            if nt_date_col == "tanggal_rapat":
+                tgl = st.date_input("Tanggal Rapat", value=date.today())
+            else:
+                tgl = None
+                st.caption("Tanggal upload akan dicatat otomatis.")
+            f = st.file_uploader("File Notulen (PDF/DOC/IMG)")
+            follow_up = st.text_area("Catatan Follow Up (opsional)") if "follow_up" in nt_cols else None
+            deadline = st.date_input("Deadline / Tindak Lanjut", value=date.today()) if "deadline" in nt_cols else None
+            submit = st.form_submit_button("💾 Upload Notulen")
+            if submit:
+                if not judul or not f:
                     st.warning("Judul dan file wajib diisi.")
                 else:
                     nid = gen_id("not")
-                    fid, fname, flink = _upload_notulen_file(file_up)
-                    now_iso = now_wib_iso()
-                    row = {
-                        "id": nid,
-                        "judul": judul,
-                        "kategori": kategori or "" if 'kategori' in headers else "",
-                        "divisi": divisi or "" if 'divisi' in headers else "",
-                        "file_id": fid,
-                        "file_name": fname,
-                        "file_link": flink,
-                        "uploaded_by": (get_current_user() or {}).get("full_name") or (get_current_user() or {}).get("email"),
-                        "version": 1 if 'version' in headers else "",
-                        "created_at": now_iso,
-                        "updated_at": now_iso,
-                    }
-                    if has_tanggal_rapat and tgl_rapat:
-                        row["tanggal_rapat"] = tgl_rapat.isoformat()
-                    else:
-                        row["tanggal_upload"] = now_iso
-                    if has_follow_up:
-                        row["follow_up"] = follow_up or ""
-                    if has_deadline and deadline:
-                        row["deadline"] = deadline.isoformat()
-                    if has_director_note:
-                        row["director_note"] = ""
-                    if has_director_approved:
-                        row["director_approved"] = 0
-                    _not_append(row)
+                    blob, fname, _ = upload_file_and_store(f)
+                    cols = ["id", "judul", "file_blob", "file_name"]
+                    vals = [nid, judul, blob, fname]
+                    if nt_date_col == "tanggal_rapat":
+                        cols.append("tanggal_rapat"); vals.append(tgl.isoformat())
+                    elif nt_date_col == "tanggal_upload":
+                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                    if "follow_up" in nt_cols:
+                        cols.append("follow_up"); vals.append(follow_up or "")
+                    if "deadline" in nt_cols and deadline:
+                        cols.append("deadline"); vals.append(deadline.isoformat())
+                    if "uploaded_by" in nt_cols:
+                        cols.append("uploaded_by"); vals.append(user.get("full_name") or user.get("email"))
+                    if "director_note" in nt_cols:
+                        cols.append("director_note"); vals.append("")
+                    if "director_approved" in nt_cols:
+                        cols.append("director_approved"); vals.append(0)
+                    placeholders = ", ".join(["?" for _ in cols])
+                    cur.execute(f"INSERT INTO notulen ({', '.join(cols)}) VALUES ({placeholders})", vals)
+                    conn.commit()
                     try:
-                        audit_log("notulen", "upload", target=nid, details=f"{judul} {tgl_rapat or ''}; file={fname}")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event("notulen", "upload", subject=f"Notulen Baru: {judul}", body=f"Judul: {judul}\nTanggal: {tgl_rapat or now_iso}\nUploader: {(get_current_user() or {}).get('email')}\nLink: {flink}")
+                        audit_log("notulen", "upload", target=nid, details=f"{judul} {tgl or ''}; file={fname}")
                     except Exception:
                         pass
                     st.success("Notulen berhasil diupload. Menunggu approval Director.")
@@ -5489,1070 +2847,571 @@ def notulen_module():
     # --- Tab 2: Daftar ---
     with tab_list:
         st.subheader("📋 Daftar Notulen")
-        _, df_nt = _not_read_df()
-        if df_nt.empty:
-            st.info("Belum ada notulen.")
-        else:
-            # Tentukan kolom tanggal utama
-            date_col = "tanggal_rapat" if 'tanggal_rapat' in df_nt.columns and df_nt['tanggal_rapat'].astype(str).str.len().gt(0).any() else ("tanggal_upload" if 'tanggal_upload' in df_nt.columns else None)
-            # Filter UI (judul, status, tanggal, kategori, divisi, uploader)
-            c1, c2, c3 = st.columns([2,2,3])
-            with c1:
-                q = st.text_input("Cari Judul", "")
-                uploader_filter = st.text_input("Filter Uploader", "") if 'uploaded_by' in df_nt.columns else ""
-            with c2:
-                status_sel = st.selectbox("Status", ["Semua","Approved","Belum"]) if 'director_approved' in df_nt.columns else "Semua"
-                kategori_sel = st.selectbox("Kategori", ["Semua"] + sorted([k for k in df_nt.get('kategori', pd.Series(dtype=str)).dropna().unique() if str(k).strip()])) if 'kategori' in df_nt.columns else "Semua"
-            with c3:
-                divisi_sel = st.selectbox("Divisi", ["Semua"] + sorted([d for d in df_nt.get('divisi', pd.Series(dtype=str)).dropna().unique() if str(d).strip()])) if 'divisi' in df_nt.columns else "Semua"
-                if date_col and not df_nt.empty:
-                    try:
-                        df_nt['_dc'] = pd.to_datetime(df_nt[date_col], errors='coerce')
-                        min_d = df_nt['_dc'].min().date() if pd.notna(df_nt['_dc'].min()) else date.today()
-                        max_d = df_nt['_dc'].max().date() if pd.notna(df_nt['_dc'].max()) else date.today()
-                        dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
-                    except Exception:
-                        dr = None
-                else:
-                    dr = None
-            dff = df_nt.copy()
-            if q:
-                dff = dff[dff['judul'].astype(str).str.contains(q, case=False, na=False)]
-            if uploader_filter and 'uploaded_by' in dff.columns:
-                dff = dff[dff['uploaded_by'].astype(str).str.contains(uploader_filter, case=False, na=False)]
-            if status_sel != "Semua" and 'director_approved' in dff.columns:
-                dff = dff[dff['director_approved'] == (1 if status_sel == 'Approved' else 0)]
-            if kategori_sel != "Semua" and 'kategori' in dff.columns:
-                dff = dff[dff['kategori'].astype(str).str.lower() == kategori_sel.lower()]
-            if divisi_sel != "Semua" and 'divisi' in dff.columns:
-                dff = dff[dff['divisi'].astype(str).str.lower() == divisi_sel.lower()]
-            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and date_col and date_col in dff.columns:
-                try:
-                    s, e = dr
-                    dff['_dc'] = pd.to_datetime(dff[date_col], errors='coerce')
-                    dff = dff[(dff['_dc'] >= pd.to_datetime(s)) & (dff['_dc'] <= pd.to_datetime(e))]
-                except Exception:
-                    pass
-            if not dff.empty:
-                show = dff.copy()
-                if 'director_approved' in show.columns:
-                    show['Status'] = show['director_approved'].map({1: "✅ Approved", 0: "🕒 Proses"})
-                cols_show = ['judul']
-                for c in ['kategori','divisi']:
-                    if c in show.columns:
-                        cols_show.append(c)
-                if date_col:
-                    cols_show.append(date_col)
-                for c in ['uploaded_by','deadline','file_name','version','Status']:
-                    if c in show.columns:
-                        cols_show.append(c)
-                safe_dataframe(show[cols_show], index=False)
+        # Build SELECT dinamis
+        cur.execute("PRAGMA table_info(notulen)")
+        nt_cols = [row[1] for row in cur.fetchall()]
+        nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
+        select_cols = ["id", "judul"]
+        if nt_date_col: select_cols.append(nt_date_col)
+        for extra in ["uploaded_by", "deadline", "director_approved", "file_name"]:
+            if extra in nt_cols:
+                select_cols.append(extra)
+        order_clause = f" ORDER BY {nt_date_col} DESC" if nt_date_col else " ORDER BY id DESC"
+        df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM notulen" + order_clause, conn)
 
-                # Download pilihan (link Drive langsung)
-                if 'file_name' in show.columns and 'file_link' in show.columns:
-                    opsi = {f"{r['judul']} — {r.get(date_col,'')}" + (f" ({r['file_name']})" if r.get('file_name') else ""): r['file_link'] for _, r in show.iterrows() if r.get('file_link')}
-                    if opsi:
-                        pilih = st.selectbox("Pilih notulen (link Drive)", [""] + list(opsi.keys()))
-                        if pilih:
-                            st.markdown(f"➡️ <a href='{opsi[pilih]}' target='_blank'>Buka File</a>", unsafe_allow_html=True)
-
-                # Approval Director
-                if user.get('role') in ['director','superuser'] and 'director_approved' in df_nt.columns:
-                    st.markdown("#### ✅ Approval Director (Pending)")
-                    pending = df_nt[df_nt['director_approved'] == 0].copy()
-                    if date_col and not pending.empty:
-                        try:
-                            pending = pending.sort_values(by=date_col, ascending=False)
-                        except Exception:
-                            pass
-                    if pending.empty:
-                        st.info("Tidak ada notulen menunggu approval.")
-                    else:
-                        for _, r in pending.iterrows():
-                            title = f"{r['judul']}" + (f" | {r.get(date_col)}" if date_col and r.get(date_col) else "")
-                            with st.expander(title):
-                                st.write(f"File: {r.get('file_name') or '-'}")
-                                if r.get('file_link'):
-                                    st.markdown(f"📄 <a href='{r['file_link']}' target='_blank'>Buka di Drive</a>", unsafe_allow_html=True)
-                                note_val = st.text_area("Catatan Director (opsional)", value=r.get('director_note') or "", key=f"not_note_{r['id']}")
-                                if st.button("Approve Notulen", key=f"not_appr_{r['id']}"):
-                                    updates = {"director_approved": 1, "updated_at": now_wib_iso()}
-                                    if 'director_note' in df_nt.columns:
-                                        updates['director_note'] = note_val
-                                    if _not_update_by_id(r['id'], updates):
-                                        try:
-                                            audit_log("notulen", "director_approval", target=r['id'], details=f"note={note_val}")
-                                        except Exception:
-                                            pass
-                                        # Notify uploader
-                                        try:
-                                            uploader_email = r.get('uploaded_by') or ''
-                                            if uploader_email:
-                                                notify_event("notulen", "director_approval", subject=f"Notulen Disetujui: {r['judul']}", body=f"Notulen '{r['judul']}' telah disetujui. Catatan: {note_val}")
-                                        except Exception:
-                                            pass
-                                        st.success("Notulen approved.")
-                                        st.rerun()
-                                # Edit follow_up / deadline (sebelum approval)
-                                if 'follow_up' in df_nt.columns or 'deadline' in df_nt.columns:
-                                    with st.form(f"edit_fu_{r['id']}"):
-                                        if 'follow_up' in df_nt.columns:
-                                            new_fu = st.text_area("Update Follow Up", value=r.get('follow_up') or "")
-                                        else:
-                                            new_fu = None
-                                        if 'deadline' in df_nt.columns:
-                                            try:
-                                                current_deadline = None
-                                                if r.get('deadline'):
-                                                    current_deadline = date.fromisoformat(str(r.get('deadline'))[:10])
-                                            except Exception:
-                                                current_deadline = date.today()
-                                            new_deadline = st.date_input("Update Deadline", value=current_deadline or date.today())
-                                        else:
-                                            new_deadline = None
-                                        if st.form_submit_button("💾 Simpan Update Follow Up/Deadline"):
-                                            upd = {"updated_at": now_wib_iso()}
-                                            if new_fu is not None:
-                                                upd['follow_up'] = new_fu
-                                            if new_deadline is not None:
-                                                upd['deadline'] = new_deadline.isoformat()
-                                            if _not_update_by_id(r['id'], upd):
-                                                st.success("Follow up / deadline diperbarui.")
-                                                st.rerun()
-                                # Reupload (versi baru)
-                                if 'version' in df_nt.columns:
-                                    with st.form(f"reup_{r['id']}"):
-                                        new_file = st.file_uploader("Re-upload File Notulen (versi baru)", key=f"reup_file_{r['id']}")
-                                        if st.form_submit_button("⬆️ Reupload (Tambah Versi)") and new_file:
-                                            nf_id, nf_name, nf_link = _upload_notulen_file(new_file)
-                                            new_ver = 1
-                                            try:
-                                                cur_v = int(r.get('version') or 1)
-                                                new_ver = cur_v + 1
-                                            except Exception:
-                                                new_ver = 1
-                                            upd2 = {
-                                                'file_id': nf_id,
-                                                'file_name': nf_name,
-                                                'file_link': nf_link,
-                                                'version': new_ver,
-                                                'updated_at': now_wib_iso(),
-                                            }
-                                            if _not_update_by_id(r['id'], upd2):
-                                                try:
-                                                    audit_log("notulen", "reupload", target=r['id'], details=f"version={new_ver}; file={nf_name}")
-                                                except Exception:
-                                                    pass
-                                                st.success(f"Reupload sukses. Versi sekarang: v{new_ver}")
-                                                st.rerun()
+        # Filter UI
+        c1, c2, c3 = st.columns([2,2,3])
+        with c1:
+            q = st.text_input("Cari Judul", "")
+        with c2:
+            status_sel = st.selectbox("Status", ["Semua","Approved","Belum"]) if "director_approved" in df.columns else "Semua"
+        with c3:
+            if nt_date_col and not df.empty:
+                min_d = pd.to_datetime(df[nt_date_col]).min().date()
+                max_d = pd.to_datetime(df[nt_date_col]).max().date()
+                dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
             else:
-                st.info("Tidak ada notulen sesuai filter.")
+                dr = None
+
+        dff = df.copy()
+        if q:
+            dff = dff[dff["judul"].astype(str).str.contains(q, case=False, na=False)]
+        if status_sel != "Semua" and "director_approved" in dff.columns:
+            dff = dff[dff["director_approved"] == (1 if status_sel == "Approved" else 0)]
+        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and nt_date_col and nt_date_col in dff.columns:
+            s, e = dr
+            dff = dff[(pd.to_datetime(dff[nt_date_col]) >= pd.to_datetime(s)) & (pd.to_datetime(dff[nt_date_col]) <= pd.to_datetime(e))]
+
+        if not dff.empty:
+            show = dff.copy()
+            if "director_approved" in show.columns:
+                show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
+            cols_show = ["judul"]
+            if nt_date_col: cols_show.append(nt_date_col)
+            for c in ["uploaded_by", "deadline", "file_name", "Status"]:
+                if c in show.columns:
+                    cols_show.append(c)
+            st.dataframe(show[cols_show], use_container_width=True)
+
+            # Download file terpilih
+            if "id" in show.columns and "file_name" in show.columns:
+                opsi = {f"{r['judul']} — {r.get(nt_date_col, '')}" + (f" ({r['file_name']})" if r.get('file_name') else ""): r['id'] for _, r in show.iterrows()}
+                if opsi:
+                    pilih = st.selectbox("Pilih notulen untuk diunduh", [""] + list(opsi.keys()))
+                    if pilih:
+                        nid = opsi[pilih]
+                        row = pd.read_sql_query("SELECT file_blob, file_name FROM notulen WHERE id=?", conn, params=(nid,)).iloc[0]
+                        if row["file_blob"] is not None and row["file_name"]:
+                            show_file_download(row["file_blob"], row["file_name"])
+
+            # Approval Director inline
+            if user["role"] in ["director", "superuser"] and "director_approved" in nt_cols:
+                st.markdown("#### ✅ Approval Director (Pending)")
+                pend = pd.read_sql_query(
+                    f"SELECT id, judul" + (f", {nt_date_col}" if nt_date_col else "") + ", file_name, director_note FROM notulen WHERE director_approved=0" + (f" ORDER BY {nt_date_col} DESC" if nt_date_col else ""),
+                    conn
+                )
+                if pend.empty:
+                    st.info("Tidak ada notulen menunggu approval.")
+                else:
+                    for _, r in pend.iterrows():
+                        title = f"{r['judul']}" + (f" | {r[nt_date_col]}" if nt_date_col and r.get(nt_date_col) else "")
+                        with st.expander(title):
+                            st.write(f"File: {r.get('file_name') or '-'}")
+                            rr = pd.read_sql_query("SELECT file_blob, file_name FROM notulen WHERE id=?", conn, params=(r['id'],))
+                            if not rr.empty and rr.iloc[0]["file_blob"] is not None and rr.iloc[0]["file_name"]:
+                                show_file_download(rr.iloc[0]["file_blob"], rr.iloc[0]["file_name"])
+                            note = st.text_area("Catatan Director (opsional)", value=r.get("director_note") or "", key=f"nt_note_{r['id']}")
+                            if st.button("Approve Notulen", key=f"nt_approve_{r['id']}"):
+                                if "director_note" in nt_cols:
+                                    cur.execute("UPDATE notulen SET director_approved=1, director_note=? WHERE id=?", (note, r['id']))
+                                else:
+                                    cur.execute("UPDATE notulen SET director_approved=1 WHERE id=?", (r['id'],))
+                                conn.commit()
+                                try:
+                                    audit_log("notulen", "director_approval", target=r['id'], details=f"note={note}")
+                                except Exception:
+                                    pass
+                                st.success("Notulen approved.")
+                                st.rerun()
+        else:
+            st.info("Belum ada notulen.")
 
     # --- Tab 3: Rekap ---
     with tab_rekap:
         st.subheader("📅 Rekap Bulanan Notulen (Otomatis)")
-        _, df_nt = _not_read_df()
-        if df_nt.empty:
-            st.info("Belum ada data notulen.")
+        cur.execute("PRAGMA table_info(notulen)")
+        nt_cols = [row[1] for row in cur.fetchall()]
+        nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
+        select_cols = ["id", "judul"]
+        if nt_date_col: select_cols.append(nt_date_col)
+        df_all = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM notulen", conn)
+        this_month = date.today().strftime("%Y-%m")
+        if not df_all.empty and (nt_date_col and nt_date_col in df_all.columns):
+            df_month = df_all[df_all[nt_date_col].astype(str).str[:7] == this_month]
         else:
-            date_col = "tanggal_rapat" if 'tanggal_rapat' in df_nt.columns and df_nt['tanggal_rapat'].astype(str).str.len().gt(0).any() else ("tanggal_upload" if 'tanggal_upload' in df_nt.columns else None)
-            this_month = date.today().strftime("%Y-%m")
-            if date_col:
-                df_month = df_nt[df_nt[date_col].astype(str).str[:7] == this_month].copy()
+            df_month = pd.DataFrame()
+        st.write(f"Total notulen bulan ini: {len(df_month)}")
+        if not df_month.empty:
+            if nt_date_col:
+                st.dataframe(df_month[["judul", nt_date_col]], use_container_width=True)
             else:
-                df_month = pd.DataFrame()
-            st.write(f"Total notulen bulan ini: {len(df_month)}")
-            if not df_month.empty:
-                cols_show = ['judul']
-                for extra in ['kategori','divisi','version']:
-                    if extra in df_month.columns:
-                        cols_show.append(extra)
-                if date_col:
-                    cols_show.append(date_col)
-                safe_dataframe(df_month[cols_show], index=False)
-                # Ringkasan per kategori
-                if 'kategori' in df_month.columns:
-                    st.markdown("#### Ringkasan per Kategori")
-                    kc = df_month.groupby(df_month['kategori'].replace('', 'Tanpa Kategori')).size().reset_index(name='jumlah')
-                    safe_dataframe(kc, index=False)
-                if 'divisi' in df_month.columns:
-                    st.markdown("#### Ringkasan per Divisi")
-                    dv = df_month.groupby(df_month['divisi'].replace('', 'Tanpa Divisi')).size().reset_index(name='jumlah')
-                    safe_dataframe(dv, index=False)
-                try:
-                    st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month[cols_show].to_csv(index=False).encode('utf-8'), file_name=f"rekap_notulen_{this_month}.csv")
-                except Exception:
-                    pass
-
-
-def user_setting_module():
-    user = require_login()
-    st.header("⚙️ User Setting")
-    ws, df = _load_users_df()
-    email_col = 'email' if 'email' in df.columns else ('username' if 'username' in df.columns else None)
-    if not email_col:
-        st.error("Sheet users tidak memiliki kolom email/username.")
-        return
-
-    current_identifier = user.get('email')
-    row = df[df[email_col].astype(str).str.lower() == str(current_identifier).lower()]
-    if row.empty:
-        st.warning("Data user Anda tidak ditemukan di database.")
-
-    tab1, tab2 = st.tabs(["👤 Profil", "🔒 Ganti Password"])
-    with tab1:
-        st.subheader("Update Profil")
-        full_name = st.text_input("Nama Lengkap", value=user.get('full_name', ''))
-        if st.button("Simpan Profil"):
+                st.dataframe(df_month[["judul"]], use_container_width=True)
             try:
-                row_idx = _find_user_row(ws, current_identifier)
-                if row_idx:
-                    _users_update_row(ws, row_idx, {"full_name": full_name})
-                    set_current_user({**user, "full_name": full_name})
-                    audit_log("users", "update_profile", target=current_identifier, details=f"full_name -> {full_name}")
-                    st.success("Profil berhasil diperbarui.")
-                else:
-                    st.error("Gagal menemukan baris user di sheet.")
-            except Exception as e:
-                st.error(f"Gagal menyimpan profil: {e}")
-
-    with tab2:
-        st.subheader("Ganti Password")
-        old_pw = st.text_input("Password Lama", type="password")
-        new_pw = st.text_input("Password Baru", type="password")
-        new_pw2 = st.text_input("Ulangi Password Baru", type="password")
-        if st.button("Simpan Password"):
-            if not (old_pw and new_pw and new_pw2):
-                st.warning("Semua field password wajib diisi.")
-            elif new_pw != new_pw2:
-                st.error("Ulangi password baru tidak sama.")
-            else:
-                try:
-                    # verify
-                    hashed = row.iloc[0].get('password_hash') if not row.empty else None
-                    if not hashed or not verify_password(old_pw, hashed):
-                        st.error("Password lama salah.")
-                    else:
-                        row_idx = _find_user_row(ws, current_identifier)
-                        if not row_idx:
-                            st.error("Gagal menemukan baris user di sheet.")
-                        else:
-                            _users_update_row(ws, row_idx, {"password_hash": hash_password(new_pw)})
-                            audit_log("users", "change_password", target=current_identifier)
-                            st.success("Password berhasil diganti.")
-                except Exception as e:
-                    st.error(f"Gagal mengganti password: {e}")
-
-    # Director admin panel
-    st.markdown("---")
-    if str(user.get('role', '')).lower() in ["director", "superuser"]:
-        st.subheader("🛠️ Admin Pengguna (Director)")
-        df_show = df.copy()
-        cols_wanted = [c for c in [email_col, 'full_name', 'role', 'active', 'created_at'] if c in df_show.columns]
-        st.dataframe(df_show[cols_wanted], width='stretch')
-        st.markdown("### Edit User")
-        sel_user = st.selectbox("Pilih user", df[email_col].astype(str).tolist())
-        if sel_user:
-            target_row = df[df[email_col].astype(str) == sel_user]
-            cur_role = str(target_row.get('role', pd.Series(['user'])).iloc[0]) if not target_row.empty else 'user'
-            cur_active = int(pd.to_numeric(target_row.get('active', pd.Series([1])), errors='coerce').fillna(1).iloc[0]) if not target_row.empty else 1
-            new_role = st.selectbox("Role", ["user", "staff", "finance", "director", "superuser"], index=["user","staff","finance","director","superuser"].index(cur_role) if cur_role in ["user","staff","finance","director","superuser"] else 0)
-            new_active = st.checkbox("Aktif", value=bool(cur_active))
-            colA, colB, colC = st.columns(3)
-            with colA:
-                if st.button("Simpan Perubahan"):
-                    try:
-                        row_idx = _find_user_row(ws, sel_user)
-                        if not row_idx:
-                            st.error("User tidak ditemukan di sheet.")
-                        else:
-                            _users_update_row(ws, row_idx, {"role": new_role, "active": 1 if new_active else 0})
-                            audit_log("users", "admin_update", target=sel_user, details=f"role={new_role}; active={int(new_active)}")
-                            st.success("Perubahan disimpan.")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Gagal menyimpan: {e}")
-            with colB:
-                if st.button("Nonaktifkan"):
-                    try:
-                        row_idx = _find_user_row(ws, sel_user)
-                        if row_idx:
-                            _users_update_row(ws, row_idx, {"active": 0})
-                            audit_log("users", "admin_deactivate", target=sel_user)
-                            st.success("User dinonaktifkan.")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Gagal: {e}")
-            with colC:
-                if st.button("Hapus User", type="primary"):
-                    if sel_user.lower() == str(current_identifier).lower():
-                        st.error("Tidak dapat menghapus akun Anda sendiri.")
-                    else:
-                        try:
-                            row_idx = _find_user_row(ws, sel_user)
-                            if row_idx:
-                                _users_delete_row(ws, row_idx)
-                                audit_log("users", "admin_delete", target=sel_user)
-                                st.success("User dihapus.")
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Gagal menghapus: {e}")
-    else:
-        st.info("Hubungi Director jika perlu perubahan role atau manajemen akun lain.")
-
-
-def audit_trail_module():
-    st.header("🕵️ Audit Trail")
-    try:
-        ws = _get_ws(AUDIT_SHEET_NAME)
-        audit_headers = ["timestamp", "actor", "module", "action", "target", "details"]
-        try:
-            df = pd.DataFrame(ws.get_all_records(expected_headers=audit_headers))
-        except Exception:
-            df = pd.DataFrame(ws.get_all_records())
-        # Ensure columns
-        for h in audit_headers:
-            if h not in df.columns:
-                df[h] = ""
-        # Filters
-        st.markdown("### Filter")
-        use_date = st.checkbox("Filter berdasarkan tanggal")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            start_date = st.date_input("Dari tanggal", value=date.today()) if use_date else None
-        with c2:
-            end_date = st.date_input("Sampai tanggal", value=date.today()) if use_date else None
-        with c3:
-            actor = st.text_input("Aktor (email)")
-        c4, c5 = st.columns(2)
-        with c4:
-            module = st.selectbox("Module", options=["Semua"] + sorted([m for m in df["module"].astype(str).unique() if m]))
-        with c5:
-            action = st.selectbox("Action", options=["Semua"] + sorted([a for a in df["action"].astype(str).unique() if a]))
-        q = st.text_input("Cari (target / details)")
-
-        fdf = df.copy()
-        # Date filter expects ISO timestamps
-        if use_date and start_date:
-            fdf = fdf[pd.to_datetime(fdf["timestamp"], errors="coerce") >= pd.to_datetime(start_date)]
-        if use_date and end_date:
-            fdf = fdf[pd.to_datetime(fdf["timestamp"], errors="coerce") <= pd.to_datetime(end_date) + pd.Timedelta(days=1)]
-        if actor:
-            fdf = fdf[fdf["actor"].astype(str).str.contains(actor, case=False, na=False)]
-        if module and module != "Semua":
-            fdf = fdf[fdf["module"].astype(str) == module]
-        if action and action != "Semua":
-            fdf = fdf[fdf["action"].astype(str) == action]
-        if q:
-            mask = (
-                fdf["target"].astype(str).str.contains(q, case=False, na=False)
-                | fdf["details"].astype(str).str.contains(q, case=False, na=False)
-            )
-            fdf = fdf[mask]
-
-        # Sort latest first
-        try:
-            fdf = fdf.sort_values(by="timestamp", ascending=False)
-        except Exception:
-            pass
-
-        st.dataframe(fdf, width='stretch', hide_index=True)
-
-        # Export filtered
-        if not fdf.empty:
-            csv_data = fdf.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download CSV (filtered)", csv_data, file_name="audit_filtered.csv", mime="text/csv")
-    except Exception as e:
-        st.error(f"Gagal memuat audit trail: {e}")
-
-
-def superuser_panel():
-    user = require_login()
-    role = str(user.get("role", "")).lower()
-    if role != "superuser":
-        st.error("Hanya superuser yang dapat mengakses panel ini.")
-        return
-    st.header("🔑 Superuser Panel - Notifikasi Dinamis")
-    st.markdown(
-        """
-        Kelola pemetaan notifikasi berbasis (module, action) ke daftar peran (roles) yang akan menerima email.
-        Data disimpan di sheet `config` dengan kolom: module, action, roles, active, updated_at, updated_by.
-        Catatan:
-        - roles ditulis dipisahkan koma, contoh: ``finance,director``.
-        - hanya baris dengan active=1 (atau TRUE/yes) yang dipakai.
-        - superuser tetap otomatis ditambahkan saat pengiriman email.
-        - Mapping statis di kode menjadi fallback jika (module, action) belum ada di sini.
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Utility: refresh dynamic cache
-    def _clear_config_cache():
-        try:
-            load_config_notif_map.clear()  # type: ignore[attr-defined]
-        except Exception:
-            try:
-                st.cache_data.clear()
+                st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False).encode("utf-8"), file_name=f"rekap_notulen_{this_month}.csv")
             except Exception:
                 pass
 
-    # Fetch sheet (dengan penanganan 429 quota exceeded yang lebih informatif)
-    try:
-        ws = _get_ws(CONFIG_SHEET_NAME)
-        try:
-            records = ws.get_all_records()
-        except gspread.exceptions.APIError as ge:
-            if '429' in str(ge) or 'Quota exceeded' in str(ge):
-                st.warning("📊 Quota Google Sheets terlampaui (429). Silakan tunggu ±1 menit lalu klik tombol Refresh / reload halaman.")
-                st.stop()
-            else:
-                raise
-    except Exception as e:
-        # Fallback general error
-        if '429' in str(e) or 'Quota exceeded' in str(e):
-            st.warning("📊 Quota Google Sheets terlampaui (429). Silakan tunggu ±1 menit lalu coba lagi.")
-        else:
-            st.error(f"Gagal membaca sheet config: {e}")
+# -------------------------
+# User Setting Module
+# -------------------------
+def user_setting_module():
+    user = require_login()
+    st.header("⚙️ User Setting")
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Ambil data user terkini dari DB
+    cur.execute("SELECT id, email, full_name, role, status, last_login FROM users WHERE id = ?", (user["id"],))
+    me = cur.fetchone()
+    if not me:
+        st.error("User tidak ditemukan di database.")
         return
 
-    # Normalize display dataframe
-    df_cfg = pd.DataFrame(records)
-    base_cols = ["module", "action", "roles", "active", "updated_at", "updated_by"]
-    for c in base_cols:
-        if c not in df_cfg.columns:
-            df_cfg[c] = ""
-    if not df_cfg.empty:
-        df_cfg['active'] = df_cfg['active'].astype(str)
-
-    with st.expander("📋 Lihat Mapping Saat Ini", expanded=True):
-        if df_cfg.empty:
-            st.info("Belum ada data di config sheet.")
-        else:
-            st.dataframe(df_cfg[base_cols], width='stretch')
-            st.caption(f"Total entri: {len(df_cfg)}")
-
-    st.markdown("---")
-    with st.expander("➕ Tambah / Update Mapping", expanded=False):
-        # Derive existing modules and actions for convenience
-        existing_modules = sorted(set(str(m).strip().lower() for m in df_cfg.get('module', []) if m and not str(m).startswith('__')))
-        existing_actions = sorted(set(str(a).strip().lower() for a in df_cfg.get('action', []) if a))
-        default_modules = sorted({m for (m, _) in NOTIF_ROLE_MAP.keys()})
-        module_options = sorted(set(existing_modules) | set(default_modules)) + ["(Custom)"]
-        static_actions_by_module: dict[str, set[str]] = {}
-        for (m, a) in NOTIF_ROLE_MAP.keys():
-            static_actions_by_module.setdefault(m, set()).add(a)
-        dynamic_actions_by_module: dict[str, set[str]] = {}
-        if not df_cfg.empty:
-            for _, row in df_cfg.iterrows():
-                m = str(row.get('module','')).strip().lower()
-                a = str(row.get('action','')).strip().lower()
-                if m and a and not m.startswith('__'):
-                    dynamic_actions_by_module.setdefault(m, set()).add(a)
-        def _actions_for_module(mod: str) -> list[str]:
-            acts = set()
-            acts |= static_actions_by_module.get(mod, set())
-            acts |= dynamic_actions_by_module.get(mod, set())
-            return sorted(acts)
-        sel_mod = st.selectbox(
-            "Pilih Module",
-            module_options,
-            key="cfg_sel_mod",
-            help="Pilih module. Daftar action otomatis difilter sesuai module. Gunakan (Custom) untuk module baru."
+        # Kartu ringkas profil (rapi & ringkas)
+        email = me["email"] or "-"
+        nama = me["full_name"] or "-"
+        role = me["role"] or "-"
+        status = me["status"] or "-"
+        st.markdown(
+                f"""
+                <div style='background:#f8fafc;border:1px solid #e5efff;border-radius:12px;padding:12px 16px;margin-bottom:12px;'>
+                    <div style='display:flex;gap:24px;flex-wrap:wrap;'>
+                        <div style='min-width:260px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Email</div>
+                            <div style='font-weight:600;font-size:16px'>{email}</div>
+                        </div>
+                        <div style='min-width:220px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Nama</div>
+                            <div style='font-weight:600;font-size:16px'>{nama}</div>
+                        </div>
+                        <div style='min-width:160px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Role</div>
+                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{role}</div>
+                        </div>
+                        <div style='min-width:140px'>
+                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Status</div>
+                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{status}</div>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
         )
-        if 'cfg_last_mod' not in st.session_state or st.session_state.cfg_last_mod != sel_mod:
-            st.session_state.cfg_last_mod = sel_mod
-            if 'cfg_sel_act' in st.session_state:
-                del st.session_state['cfg_sel_act']
-        if sel_mod == "(Custom)":
-            mod_in = st.text_input("Module Baru", key="cfg_mod_custom", placeholder="misal: cash_advance").strip().lower()
-            all_actions_flat = sorted({a for s in static_actions_by_module.values() for a in s} | {a for s in dynamic_actions_by_module.values() for a in s})
-            filtered_actions = all_actions_flat
-        else:
-            mod_in = sel_mod.strip().lower()
-            filtered_actions = _actions_for_module(mod_in)
-        if not filtered_actions:
-            filtered_actions = []
-        filtered_actions_with_custom = filtered_actions + ["(Custom)"]
-        with st.form("cfg_add_update", clear_on_submit=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                sel_act = st.selectbox(
-                    "Pilih Action",
-                    filtered_actions_with_custom,
-                    key="cfg_sel_act",
-                    help="Action difilter oleh module. Pilih (Custom) untuk menambah action baru."
-                )
-                if sel_act == "(Custom)":
-                    act_in = st.text_input("Action Baru", key="cfg_act_custom", placeholder="misal: submitted").strip().lower()
+
+    tab_profile, tab_admin = st.tabs(["👤 Profil Saya", "🔐 Admin (Director)"])
+
+    # --- Tab 1: Profil Saya ---
+    with tab_profile:
+        st.subheader("Ubah Profil")
+        with st.form("change_name_form"):
+            new_name = st.text_input("Nama Lengkap", value=me["full_name"] or "")
+            save_name = st.form_submit_button("Simpan Nama")
+            if save_name:
+                if not new_name.strip():
+                    st.warning("Nama tidak boleh kosong.")
                 else:
-                    act_in = sel_act.strip().lower()
-            with c2:
-                roles_multi = st.multiselect("Pilih Roles", ALLOWED_ROLES, default=[r for r in ["finance"] if r in ALLOWED_ROLES])
-                active_in = st.checkbox("Active", value=True)
-            submitted = st.form_submit_button("Simpan / Update Mapping")
-            if submitted:
-                mod = mod_in.strip().lower()
-                act = act_in.strip().lower()
-                valid_roles = [r for r in roles_multi if r in ALLOWED_ROLES]
-                if not mod or not act or not valid_roles:
-                    st.warning("Module, Action, dan minimal satu Role valid wajib diisi.")
-                else:
-                    roles_clean = ",".join(sorted(set(valid_roles)))
-                    headers = ws.row_values(1)
+                    cur.execute("UPDATE users SET full_name=? WHERE id=?", (new_name.strip(), me["id"]))
+                    conn.commit()
+                    # Update session juga
+                    st.session_state["user"]["full_name"] = new_name.strip()
                     try:
-                        module_col = headers.index('module') + 1
-                        action_col = headers.index('action') + 1
-                    except ValueError:
-                        st.error("Kolom module/action tidak ditemukan di sheet config.")
-                        st.stop()
-                    target_row = None
-                    try:
-                        all_vals = ws.get_all_values()
-                        for ridx, row_vals in enumerate(all_vals[1:], start=2):
-                            try:
-                                if str(row_vals[module_col-1]).strip().lower() == mod and str(row_vals[action_col-1]).strip().lower() == act:
-                                    target_row = ridx
-                                    break
-                            except Exception:
-                                continue
+                        audit_log("user_setting", "update_profile", target=me["email"], details=f"Ubah nama menjadi '{new_name.strip()}'")
                     except Exception:
                         pass
-                    updated_at = now_wib_iso()
-                    updated_by = (get_current_user() or {}).get('email', 'system')
-                    row_payload = {
-                        'module': mod,
-                        'action': act,
-                        'roles': roles_clean,
-                        'active': '1' if active_in else '0',
-                        'updated_at': updated_at,
-                        'updated_by': updated_by
-                    }
-                    if target_row:
-                        for k, v in row_payload.items():
-                            if k in headers:
-                                a1 = gspread.utils.rowcol_to_a1(target_row, headers.index(k) + 1)
-                                for i in range(3):
-                                    try:
-                                        ws.update(a1, v)
-                                        break
-                                    except gspread.exceptions.APIError as e:
-                                        if '429' in str(e):
-                                            time.sleep(1 + i)
-                                            continue
-                                        raise
-                        st.success(f"Mapping diperbarui: {mod} / {act}")
-                        try:
-                            audit_log("config", "update", target=f"{mod}:{act}", details=roles_clean)
-                        except Exception:
-                            pass
-                    else:
-                        values = [row_payload.get(h, "") for h in headers]
-                        for i in range(3):
-                            try:
-                                ws.append_row(values)
-                                break
-                            except gspread.exceptions.APIError as e:
-                                if '429' in str(e):
-                                    time.sleep(1 + i)
-                                    continue
-                                raise
-                        st.success(f"Mapping ditambahkan: {mod} / {act}")
-                        try:
-                            audit_log("config", "add", target=f"{mod}:{act}", details=roles_clean)
-                        except Exception:
-                            pass
-                    _clear_config_cache()
-                    st.rerun()
+                    st.success("Nama berhasil diperbarui.")
 
-    st.markdown("---")
-    with st.expander("🗑️ Hapus Mapping", expanded=False):
-        if df_cfg.empty:
-            st.info("Tidak ada mapping untuk dihapus.")
-        else:
-            df_cfg['label'] = df_cfg.apply(lambda r: f"{r['module']} | {r['action']} -> {r['roles']} (active={r['active']})", axis=1)
-            choice = st.selectbox("Pilih mapping", df_cfg['label'])
-            if choice:
-                sel_row = df_cfg[df_cfg['label'] == choice].iloc[0]
-                if st.button("Hapus Mapping Terpilih", type="primary"):
-                    mod = str(sel_row.get('module'))
-                    act = str(sel_row.get('action'))
-                    all_vals = ws.get_all_values()
-                    headers = all_vals[0]
-                    module_idx = headers.index('module') if 'module' in headers else None
-                    action_idx = headers.index('action') if 'action' in headers else None
-                    del_row = None
-                    if module_idx is not None and action_idx is not None:
-                        for ridx, row_vals in enumerate(all_vals[1:], start=2):
-                            try:
-                                if str(row_vals[module_idx]).strip().lower() == mod and str(row_vals[action_idx]).strip().lower() == act:
-                                    del_row = ridx
-                                    break
-                            except Exception:
-                                continue
-                    if del_row:
-                        for i in range(3):
-                            try:
-                                ws.delete_rows(del_row)
-                                break
-                            except gspread.exceptions.APIError as e:
-                                if '429' in str(e):
-                                    time.sleep(1 + i)
-                                    continue
-                                raise
-                        st.success(f"Mapping dihapus: {mod} / {act}")
-                        try:
-                            audit_log("config", "delete", target=f"{mod}:{act}")
-                        except Exception:
-                            pass
-                        _clear_config_cache()
-                        st.rerun()
-                    else:
-                        st.warning("Gagal menemukan baris mapping untuk dihapus.")
-
-    st.markdown("---")
-    if st.button("🔄 Refresh Mapping Cache"):
-        _clear_config_cache()
-        st.success("Cache dynamic mapping dibersihkan.")
-
-    st.markdown("---")
-    with st.expander("⚙️ Pengaturan Tambahan", expanded=False):
-        # Superuser auto toggle
-        cur_auto = is_superuser_auto_enabled()
-        new_auto = st.checkbox(
-            "Sertakan superuser otomatis pada semua notifikasi",
-            value=cur_auto,
-            help="Jika dimatikan, superuser hanya menerima notifikasi jika termasuk dalam roles mapping."
-        )
-        if new_auto != cur_auto:
-            # Write/update settings row
-            try:
-                headers = ws.row_values(1)
-                # ensure settings headers contain superuser_auto column (optional)
-                if 'superuser_auto' not in headers:
-                    headers.append('superuser_auto')
-                    ws.update('A1', [headers])
-                all_vals = ws.get_all_values()
-                module_idx = headers.index('module') if 'module' in headers else None
-                found_row = None
-                if module_idx is not None:
-                    for ridx, row_vals in enumerate(all_vals[1:], start=2):
-                        if len(row_vals) > module_idx and str(row_vals[module_idx]).strip().lower() == '__settings__':
-                            found_row = ridx
-                            break
-                updated_at = now_wib_iso()
-                updater = (get_current_user() or {}).get('email', 'system')
-                settings_payload = {
-                    'module': '__settings__',
-                    'action': 'global',
-                    'roles': '',
-                    'active': '1',
-                    'updated_at': updated_at,
-                    'updated_by': updater,
-                    'superuser_auto': '1' if new_auto else '0'
-                }
-                # Align headers again (in case added)
-                headers = ws.row_values(1)
-                if found_row:
-                    # update columns
-                    for k, v in settings_payload.items():
-                        if k in headers:
-                            a1 = gspread.utils.rowcol_to_a1(found_row, headers.index(k) + 1)
-                            for i in range(3):
-                                try:
-                                    ws.update(a1, v)
-                                    break
-                                except gspread.exceptions.APIError as e:
-                                    if '429' in str(e):
-                                        time.sleep(1 + i)
-                                        continue
-                                    raise
+        st.markdown("---")
+        st.subheader("Ubah Password")
+        with st.form("change_password_form"):
+            old_pw = st.text_input("Password Lama", type="password")
+            new_pw = st.text_input("Password Baru", type="password")
+            new_pw2 = st.text_input("Ulangi Password Baru", type="password")
+            change_pw = st.form_submit_button("Ganti Password")
+            if change_pw:
+                # Validasi
+                if not old_pw or not new_pw or not new_pw2:
+                    st.warning("Semua field password wajib diisi.")
+                elif new_pw != new_pw2:
+                    st.warning("Konfirmasi password baru tidak cocok.")
+                elif len(new_pw) < 6:
+                    st.warning("Password baru minimal 6 karakter.")
                 else:
-                    row_vals = [settings_payload.get(h, '') for h in headers]
-                    for i in range(3):
+                    # Cek password lama
+                    cur.execute("SELECT password_hash FROM users WHERE id=?", (me["id"],))
+                    row = cur.fetchone()
+                    if not row or row["password_hash"] != hash_password(old_pw):
+                        st.error("Password lama tidak sesuai.")
+                    else:
+                        cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_pw), me["id"]))
+                        conn.commit()
                         try:
-                            ws.append_row(row_vals)
-                            break
-                        except gspread.exceptions.APIError as e:
-                            if '429' in str(e):
-                                time.sleep(1 + i)
-                                continue
-                            raise
-                try:
-                    audit_log('config', 'settings_update', target='__settings__', details=f"superuser_auto={int(new_auto)}")
-                except Exception:
-                    pass
-                # Clear caches
-                try:
-                    is_superuser_auto_enabled.clear()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                _clear_config_cache()
-                st.success("Pengaturan superuser_auto diperbarui.")
-            except Exception as e:
-                st.error(f"Gagal menyimpan pengaturan: {e}")
+                            audit_log("user_setting", "change_password", target=me["email"], details="Ganti password sendiri")
+                        except Exception:
+                            pass
+                        st.success("Password berhasil diganti.")
 
-    st.markdown("---")
-    with st.expander("🧪 Test Kirim Email Dummy", expanded=False):
-        with st.form("test_email_form"):
-            test_subject = st.text_input("Subject", value="[TEST] Notifikasi Dummy")
-            test_body = st.text_area("Body", value="Ini hanya email percobaan.")
-            # Pilih mapping yang ada
-            active_map = load_config_notif_map()
-            map_labels = [f"{m}:{a}" for (m, a) in sorted(active_map.keys())]
-            use_mapping = st.selectbox("Gunakan Mapping (opsional)", ["(Manual Roles)"] + map_labels)
-            manual_roles = []
-            if use_mapping == "(Manual Roles)":
-                manual_roles = st.multiselect("Manual Roles", ALLOWED_ROLES, default=["finance"])
-            send_btn = st.form_submit_button("Kirim Email Uji")
-            if send_btn:
-                try:
-                    if use_mapping != "(Manual Roles)":
-                        # parse mapping
-                        parts = use_mapping.split(":", 1)
-                        if len(parts) == 2:
-                            m_sel, a_sel = parts[0], parts[1]
-                            roles = active_map.get((m_sel, a_sel), [])
-                            if not roles:
-                                st.warning("Mapping tidak memiliki roles aktif.")
-                            else:
-                                notify_event(m_sel, a_sel, test_subject, test_body, roles=None)  # dynamic lookup
-                                # Cek secara manual siapa saja penerima (diagnostik)
-                                dyn_roles = load_config_notif_map().get((m_sel, a_sel), []) or []
-                                preview_roles = set(dyn_roles)
-                                if is_superuser_auto_enabled():
-                                    preview_roles.add("superuser")
-                                preview_emails = []
-                                for r in preview_roles:
+    # --- Tab 2: Admin (Director) ---
+    with tab_admin:
+        st.subheader("Admin User (Khusus Director/Superuser)")
+        if (st.session_state.get("user", {}).get("role") not in ["director", "superuser"]):
+            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
+        else:
+            # Cek kolom untuk sorting
+            cur.execute("PRAGMA table_info(users)")
+            user_cols = {r[1] for r in cur.fetchall()}
+            order_col = "created_at" if "created_at" in user_cols else "email"
+
+            # Daftar user ringkas & filter
+            with st.expander("Cari & Pilih User", expanded=True):
+                keyword = st.text_input("Cari user (email/nama)", value="")
+                if keyword:
+                    dfu = pd.read_sql_query(
+                        f"SELECT id,email,full_name,role,status,last_login FROM users WHERE email LIKE ? OR full_name LIKE ? ORDER BY {order_col} DESC",
+                        conn, params=(f"%{keyword}%", f"%{keyword}%")
+                    )
+                else:
+                    dfu = pd.read_sql_query(f"SELECT id,email,full_name,role,status,last_login FROM users ORDER BY {order_col} DESC", conn)
+                st.dataframe(dfu, use_container_width=True, hide_index=True)
+
+                # Pilih user target
+                options = [f"{r['id']} | {r['email']} | {r['full_name']} | {r['role']} | {r['status']}" for _, r in dfu.iterrows()] if not dfu.empty else []
+                selected = st.selectbox("Pilih user", ["-"] + options)
+                target_id = None
+                if selected and selected != "-":
+                    target_id = selected.split(" | ")[0]
+
+            if target_id:
+                cur.execute("SELECT id,email,full_name,role,status FROM users WHERE id=?", (target_id,))
+                target = cur.fetchone()
+                if not target:
+                    st.error("User target tidak ditemukan.")
+                else:
+                    st.markdown(f"**Target:** {target['email']} · {target['full_name']} · {target['role']} · {target['status']}")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("##### Reset Password User")
+                        with st.form("admin_reset_pw"):
+                            npw = st.text_input("Password Baru", type="password")
+                            npw2 = st.text_input("Ulangi Password Baru", type="password")
+                            do_reset = st.form_submit_button("Reset Password")
+                            if do_reset:
+                                if len(npw) < 6:
+                                    st.warning("Password minimal 6 karakter.")
+                                elif npw != npw2:
+                                    st.warning("Konfirmasi password tidak cocok.")
+                                else:
+                                    cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(npw), target["id"]))
+                                    conn.commit()
                                     try:
-                                        preview_emails.extend(_get_emails_by_role(r))
+                                        audit_log("user_setting", "reset_password", target=target["email"], details=f"Oleh {me['email']}")
                                     except Exception:
                                         pass
-                                preview_emails = sorted({e for e in preview_emails if e})
-                                if preview_emails:
-                                    st.success(f"Email test berdasarkan mapping dikirim ke {len(preview_emails)} penerima.")
-                                    with st.expander("Detail Penerima", expanded=False):
-                                        st.write(preview_emails)
+                                    st.success("Password user berhasil direset.")
+                    with col2:
+                        st.markdown("##### Hapus User")
+                        st.caption("Aksi permanen. Tidak dapat dibatalkan.")
+                        with st.form("admin_delete_user"):
+                            confirm_mail = st.text_input("Ketik email user untuk konfirmasi")
+                            confirm_yes = st.checkbox("Saya yakin ingin menghapus user ini")
+                            do_delete = st.form_submit_button("Hapus User", disabled=(target["id"] == me["id"]))
+                            if do_delete:
+                                if target["id"] == me["id"]:
+                                    st.error("Tidak dapat menghapus akun sendiri.")
+                                elif target["role"] == "superuser" and me["role"] != "superuser":
+                                    st.error("Hanya Superuser yang boleh menghapus Superuser.")
+                                elif confirm_mail.strip().lower() != (target["email"] or "").lower():
+                                    st.error("Konfirmasi email tidak cocok.")
+                                elif not confirm_yes:
+                                    st.error("Centang konfirmasi terlebih dahulu.")
                                 else:
-                                    st.error("Mapping valid tetapi tidak ditemukan email penerima (cek sheet users & kolom active).")
-                    else:
-                        valid_roles = [r for r in manual_roles if r in ALLOWED_ROLES]
-                        if not valid_roles:
-                            st.warning("Pilih minimal satu role valid untuk manual.")
-                        else:
-                            notify_event("test", "manual", test_subject, test_body, roles=valid_roles)
-                            diag_roles = set(valid_roles)
-                            if is_superuser_auto_enabled():
-                                diag_roles.add("superuser")
-                            diag_emails = []
-                            for r in diag_roles:
-                                try:
-                                    diag_emails.extend(_get_emails_by_role(r))
-                                except Exception:
-                                    pass
-                            diag_emails = sorted({e for e in diag_emails if e})
-                            if diag_emails:
-                                st.success(f"Email test manual dikirim ke {len(diag_emails)} penerima.")
-                                with st.expander("Detail Penerima", expanded=False):
-                                    st.write(diag_emails)
-                            else:
-                                st.error("Tidak ada email ditemukan untuk roles yang dipilih. Pastikan user, role, dan active benar.")
-                except Exception as e:
-                    st.error(f"Gagal mengirim email test: {e}")
+                                    cur.execute("DELETE FROM users WHERE id=?", (target["id"],))
+                                    conn.commit()
+                                    try:
+                                        audit_log("user_setting", "delete_user", target=target["email"], details=f"Oleh {me['email']}")
+                                    except Exception:
+                                        pass
+                                    st.success("User berhasil dihapus. Silakan refresh daftar di atas.")
 
-    # Panel Diagnostik Role -> Emails
-    st.markdown("---")
-    with st.expander("🩺 Diagnostik Role & Penerima", expanded=False):
-        st.caption("Gunakan panel ini untuk melihat email yang terdeteksi per role sesuai isi sheet users saat ini.")
-        roles_check = st.multiselect("Pilih roles untuk cek", ALLOWED_ROLES, default=["finance","director","superuser"])
-        if st.button("Cek Penerima", key="btn_diag_roles"):
-            rows = []
-            for r in roles_check:
-                try:
-                    emails = _get_emails_by_role(r)
-                except Exception:
-                    emails = []
-                rows.append({"role": r, "jumlah": len(emails), "emails": ", ".join(emails)})
-            if rows:
-                st.dataframe(pd.DataFrame(rows), width='stretch')
-            else:
-                st.info("Tidak ada data untuk roles dipilih.")
-
-
-def _cuti_read_df():
-    ws = _get_ws(CUTI_SHEET_NAME)
-    cuti_headers = [
-        "id", "nama", "tgl_mulai", "tgl_selesai", "durasi",
-        "kuota_tahunan", "cuti_terpakai", "sisa_kuota", "status",
-        "finance_note", "finance_approved", "director_note", "director_approved",
-        "alasan", "created_at"
-    ]
-    try:
-        df = pd.DataFrame(_cached_get_all_records(CUTI_SHEET_NAME, cuti_headers))
-    except Exception:
-        df = pd.DataFrame(ws.get_all_records())
-    # Ensure all expected columns exist
-    for h in cuti_headers:
-        if h not in df.columns:
-            df[h] = 0 if h in ("finance_approved", "director_approved", "durasi", "kuota_tahunan", "cuti_terpakai", "sisa_kuota") else ""
-    return ws, df
-
-
-def _cuti_append(row_dict: dict):
-    ws = _get_ws(CUTI_SHEET_NAME)
-    headers = ws.row_values(1)
-    values = [row_dict.get(h, "") for h in headers]
-    for i in range(3):
-        try:
-            ws.append_row(values)
-            _invalidate_data_cache()
-            break
-        except gspread.exceptions.APIError as e:
-            if "429" in str(e):
-                time.sleep(1.2 * (i + 1))
-                continue
-            raise
-
-
-def _cuti_update_by_id(cid: str, updates: dict):
-    ws = _get_ws(CUTI_SHEET_NAME)
-    headers = ws.row_values(1)
-    id_cell = ws.find(cid)
-    if not id_cell:
-        raise ValueError("ID tidak ditemukan")
-    row_idx = id_cell.row
-    # Update each cell individually (simpler, avoids API mismatch)
-    for k, v in updates.items():
-        if k not in headers:
-            continue
-        col_idx = headers.index(k) + 1
-        a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-        for i in range(3):
-            try:
-                ws.update(a1, [[v]])
-                break
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    time.sleep(1.0 * (i + 1))
-                    continue
-                raise
-    _invalidate_data_cache()
-
-
-def cuti_module():
-    """Module UI & logic for Cuti (leave requests) separated from main routing."""
+# -------------------------
+# Dashboard
+# -------------------------
+def dashboard():
     user = require_login()
-    st.header("🌴 Pengajuan & Approval Cuti")
+    st.title("🏠 Dashboard WIJNA")
+    conn = get_db()
+    cur = conn.cursor()
 
-    tab_ajukan, tab_finance, tab_director = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
-
-    # TAB 1: AJUKAN CUTI
-    with tab_ajukan:
-        st.markdown("### 📝 Ajukan Cuti")
-        nama = user.get("full_name") or user.get("email")
-        tgl_mulai = st.date_input("Tanggal Mulai", value=date.today(), key="cuti_tgl_mulai")
-        tgl_selesai = st.date_input("Tanggal Selesai", value=date.today(), key="cuti_tgl_selesai")
-        alasan = st.text_area("Alasan Cuti", key="cuti_alasan")
-        durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
-
-        # Ambil info kuota terakhir pengguna
+    # Notification Approval (count items needing approval)
+    q_pending = 0
+    services = [
+        ("inventory","finance_approved=0 OR director_approved=0"),
+        ("cash_advance","finance_approved=0 OR director_approved=0"),
+        ("pmr","finance_approved=0 OR director_approved=0"),
+        ("cuti","finance_approved=0 OR director_approved=0"),
+        ("surat_keluar","director_approved=0"),
+        ("mou","director_approved=0"),
+        ("sop","director_approved=0"),
+        ("notulen","director_approved=0"),
+    ]
+    notif_items = []
+    import sqlite3
+    for table, cond in services:
         try:
-            _, df_cuti_all = _cuti_read_df()
-        except Exception:
-            df_cuti_all = pd.DataFrame()
-        df_user = df_cuti_all[df_cuti_all.get("nama", pd.Series(dtype=str)).astype(str) == str(nama)] if not df_cuti_all.empty else pd.DataFrame()
-        if not df_user.empty:
-            last = df_user.sort_values(by="tgl_mulai", ascending=False).iloc[0]
-            kuota_tahunan = int(pd.to_numeric(last.get("kuota_tahunan", 12), errors="coerce") or 12)
-            cuti_terpakai = int(pd.to_numeric(last.get("cuti_terpakai", 0), errors="coerce") or 0)
+            cur.execute(f"SELECT COUNT(*) as c FROM {table} WHERE {cond}")
+            c = cur.fetchone()["c"]
+            if c > 0:
+                notif_items.append((table, c))
+                q_pending += c
+        except sqlite3.OperationalError as e:
+            st.error(f"Tabel '{table}' belum memiliki kolom yang diperlukan: {e}")
+            continue
+
+    # --- Stat Cards Section (Always Show at Top) ---
+    st.markdown("""
+<style>
+.stat-card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+    padding: 1.5rem;
+    transition: box-shadow 0.2s;
+    margin-bottom: 0.5rem;
+}
+.stat-card:hover {
+                box-shadow: 0 6px 18px rgba(0,0,0,0.13);
+        }
+        .stat-flex {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+        }
+        .stat-label {
+                font-size: 1rem;
+                color: #666;
+                font-weight: 500;
+                margin-bottom: 0.2rem;
+        }
+        .stat-value {
+                font-size: 2.2rem;
+                font-weight: bold;
+                margin-bottom: 0.1rem;
+        }
+        .stat-delta {
+                font-size: 1rem;
+                color: #888;
+        }
+        .stat-iconbox {
+                width: 48px; height: 48px;
+                border-radius: 12px;
+                display: flex; align-items: center; justify-content: center;
+        }
+        .stat-iconbox.orange { background: #fff7ed; }
+        .stat-iconbox.blue { background: #e6f0fa; }
+        .stat-iconbox.purple { background: #f3e8ff; }
+        .stat-icon.orange { color: #fb923c; }
+        .stat-icon.blue { color: #2563eb; }
+        .stat-icon.purple { color: #a21caf; }
+        .stat-value.orange { color: #fb923c; }
+        .stat-value.blue { color: #2563eb; }
+        .stat-value.purple { color: #a21caf; }
+        </style>
+        """, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">Approval Menunggu</div> 
+                    <div class=\"stat-value orange\">{q_pending}</div> 
+                    <div class=\"stat-delta\">Menunggu persetujuan</div> 
+                </div> 
+                <div class=\"stat-iconbox orange\"> 
+                    <svg class=\"stat-icon orange\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <circle cx=\"12\" cy=\"12\" r=\"10\"/>
+                                        <polyline points=\"12,6 12,12 16,14\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+        """, unsafe_allow_html=True)
+    cur.execute("SELECT COUNT(*) as c FROM surat_masuk WHERE status='Belum Dibahas'")
+    sm_unprocessed = cur.fetchone()["c"]
+    with col2:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">Surat Belum Dibahas</div> 
+                    <div class=\"stat-value blue\">{sm_unprocessed}</div> 
+                    <div class=\"stat-delta\">Belum diproses</div> 
+                </div> 
+                <div class=\"stat-iconbox blue\"> 
+                    <svg class=\"stat-icon blue\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"4\"/>
+                                        <path d=\"M9 9h6v6H9z\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+        """, unsafe_allow_html=True)
+    cur.execute("SELECT COUNT(*) as c FROM mou WHERE date(tgl_selesai) <= date('now','+7 day')")
+    mou_due7 = cur.fetchone()["c"]
+    with col3:
+        st.markdown(f"""
+        <div class=\"stat-card\"> 
+            <div class=\"stat-flex\"> 
+                <div> 
+                    <div class=\"stat-label\">MoU ≤ 7 hari jatuh tempo</div> 
+                    <div class=\"stat-value purple\">{mou_due7}</div> 
+                    <div class=\"stat-delta\">Segera ditindaklanjuti</div> 
+                </div> 
+                <div class=\"stat-iconbox purple\"> 
+                    <svg class=\"stat-icon purple\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\">
+                                        <path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/>
+                                        <polyline points=\"14,2 14,8 20,8\"/>
+                                        <line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/>
+                                        <line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <style>
+    .wijna-section-card {
+        background: #f8fafc;
+        border-radius: 14px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+        padding: 1.2rem 1.5rem 1.2rem 1.5rem;
+        margin-bottom: 1.2rem;
+    }
+    .wijna-section-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #2563eb;
+        margin-bottom: 0.5rem;
+    }
+    .wijna-section-desc {
+        color: #64748b;
+        font-size: 1rem;
+        margin-bottom: 0.7rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # --- GRID 2x2 RINGKASAN ---
+    grid1, grid2 = st.columns(2)
+    with grid1:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">🌴 Cuti & Flex — Ringkasan</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Rekap pengajuan cuti dan total durasi per pegawai.</div>', unsafe_allow_html=True)
+        df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) as total_pengajuan, SUM(durasi) as total_durasi FROM cuti GROUP BY nama", conn)
+        for col in df_cuti.columns:
+            if 'tanggal' in col or 'tgl' in col:
+                df_cuti[col] = df_cuti[col].apply(format_datetime_wib)
+        st.dataframe(df_cuti, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with grid2:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">🗂️ Delegasi Tugas — Aktif</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Daftar delegasi tugas yang sedang berjalan.</div>', unsafe_allow_html=True)
+        df_del = pd.read_sql_query("SELECT id,judul,pic,tgl_mulai,tgl_selesai,status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", conn)
+        for col in df_del.columns:
+            if 'tanggal' in col or 'tgl' in col:
+                df_del[col] = df_del[col].apply(format_datetime_wib)
+        st.dataframe(df_del, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    grid3, grid4 = st.columns(2)
+    with grid3:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">📅 Kalender Bersama (30 Hari)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Event & hari libur 30 hari ke depan (cuti, flex, delegasi, rapat, mobil kantor, libur nasional).</div>', unsafe_allow_html=True)
+        today = date.today()
+        end_30 = today + timedelta(days=30)
+        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
+        df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE director_approved=1", conn)
+        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
+        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
+        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'", conn)
+        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", conn)
+        df_all = pd.concat([
+            df_cuti, df_flex, df_delegasi, df_rapat, df_mobil, df_libur
+        ], ignore_index=True)
+        if not df_all.empty:
+            df_all['tgl_mulai'] = pd.to_datetime(df_all['tgl_mulai'])
+            df_all['tgl_selesai'] = pd.to_datetime(df_all['tgl_selesai'])
+            mask = (df_all['tgl_selesai'] >= pd.to_datetime(today)) & (df_all['tgl_mulai'] <= pd.to_datetime(end_30))
+            df_30 = df_all.loc[mask].copy()
+            df_30 = df_30.sort_values('tgl_mulai')
+            if not df_30.empty:
+                def label_color(jenis):
+                    color_map = {
+                        'Cuti': '#f59e42',
+                        'Flex Time': '#38bdf8',
+                        'Delegasi': '#a78bfa',
+                        'Rapat': '#f472b6',
+                        'Mobil Kantor': '#34d399',
+                        'Libur Nasional': '#ef4444',
+                    }
+                    return f"<span style='background:{color_map.get(jenis,'#ddd')};color:#fff;padding:2px 10px;border-radius:8px;font-size:0.95em'>{jenis}</span>"
+                st.markdown("<ul style='padding-left:1.2em'>", unsafe_allow_html=True)
+                for _, row in df_30.iterrows():
+                    jenis_lbl = label_color(row['jenis'])
+                    tgl = row['tgl_mulai'].strftime('%d-%m-%Y')
+                    tgl2 = row['tgl_selesai'].strftime('%d-%m-%Y')
+                    tgl_str = tgl if tgl == tgl2 else f"{tgl} s/d {tgl2}"
+                    st.markdown(f"<li><b>{row['judul']}</b> {jenis_lbl} <span style='color:#2563eb'>({tgl_str})</span></li>", unsafe_allow_html=True)
+                st.markdown("</ul>", unsafe_allow_html=True)
+            else:
+                st.info("Tidak ada event 30 hari ke depan.")
         else:
-            kuota_tahunan = 12
-            cuti_terpakai = 0
-        sisa_kuota = kuota_tahunan - cuti_terpakai
-        st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
-        st.write(f"Durasi cuti diajukan: {durasi} hari")
-        if durasi > 0 and sisa_kuota < durasi:
-            st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
-        if st.button("Ajukan Cuti", key="btn_ajukan_cuti"):
-            if not alasan or durasi <= 0:
-                st.warning("Lengkapi data dan pastikan tanggal benar.")
-            elif sisa_kuota < durasi:
-                st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
-            else:
-                cid = gen_id("cuti")
-                now = now_wib_iso()
-                try:
-                    _cuti_append({
-                        "id": cid,
-                        "nama": nama,
-                        "tgl_mulai": tgl_mulai.isoformat(),
-                        "tgl_selesai": tgl_selesai.isoformat(),
-                        "durasi": int(durasi),
-                        "kuota_tahunan": int(kuota_tahunan),
-                        "cuti_terpakai": int(cuti_terpakai),
-                        "sisa_kuota": int(sisa_kuota),
-                        "status": "Menunggu Review Finance",
-                        "finance_note": "",
-                        "finance_approved": 0,
-                        "director_note": "",
-                        "director_approved": 0,
-                        "alasan": alasan,
-                        "created_at": now
-                    })
-                except Exception as e:
-                    st.error(f"Gagal menyimpan pengajuan: {e}")
-                else:
-                    st.success("Pengajuan cuti berhasil diajukan.")
-                    try:
-                        audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
-                    except Exception:
-                        pass
-                    try:
-                        notify_event(
-                            "cuti", "submit", "[WIJNA] Pengajuan Cuti Baru",
-                            f"Pengajuan cuti baru menunggu review Finance.\n\nNama: {nama}\nPeriode: {tgl_mulai} s/d {tgl_selesai}\nDurasi: {durasi} hari\nAlasan: {alasan}"
-                        )
-                    except Exception:
-                        pass
-                    st.rerun()
+            st.info("Tidak ada event 30 hari ke depan.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # TAB 2: REVIEW FINANCE
-    with tab_finance:
-        st.markdown("### Review & Approval Finance")
-        if user.get("role") in ["finance", "superuser"]:
-            try:
-                _, df = _cuti_read_df()
-            except Exception:
-                df = pd.DataFrame()
-            if "finance_approved" in df.columns:
-                df["finance_approved"] = pd.to_numeric(df["finance_approved"], errors="coerce").fillna(0).astype(int)
-            pending = df[df.get("finance_approved", 0) == 0] if not df.empty else pd.DataFrame()
-            if pending.empty:
-                st.info("Tidak ada pengajuan menunggu review.")
-            for _, row in pending.sort_values(by="tgl_mulai", ascending=False).iterrows():
-                with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
-                    st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
-                    st.write(f"Alasan: {row.get('alasan', '')}")
-                    note = st.text_area("Catatan Finance", value=row.get("finance_note") or "", key=f"fin_note_{row.get('id')}")
-                    approve = st.checkbox("Approve", value=bool(int(row.get("finance_approved", 0))), key=f"fin_appr_{row.get('id')}")
-                    if st.button("Simpan Review", key=f"fin_save_{row.get('id')}"):
-                        status = "Menunggu Approval Director" if approve else "Ditolak Finance"
-                        try:
-                            _cuti_update_by_id(row.get('id'), {
-                                "finance_note": note,
-                                "finance_approved": int(bool(approve)),
-                                "status": status
-                            })
-                            st.success("Review Finance disimpan.")
-                            try:
-                                audit_log("cuti", "finance_review", target=row.get('id'), details=f"approve={bool(approve)}; status={status}")
-                            except Exception:
-                                pass
-                            if approve:
-                                try:
-                                    notify_event(
-                                        "cuti", "finance_review", "[WIJNA] Cuti Menunggu Approval Director",
-                                        f"Pengajuan cuti menunggu approval Director.\n\nNama: {row.get('nama')}\nPeriode: {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}\nDurasi: {row.get('durasi')} hari"
-                                    )
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            st.error(f"Gagal menyimpan: {e}")
-                        st.rerun()
-        else:
-            st.info("Hanya Finance/Superuser yang dapat review di sini.")
+    with grid4:
+        st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-title">📊 Rekap Bulanan (Ringkasan)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wijna-section-desc">Rekap otomatis tersedia di tabel <b>rekap_monthly_*</b> (trigger scheduler belum diimplementasikan).</div>', unsafe_allow_html=True)
+        df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance LIMIT 10", conn)
+        for col in df_ca_rekap.columns:
+            if 'tanggal' in col or 'tgl' in col or 'updated' in col:
+                df_ca_rekap[col] = df_ca_rekap[col].apply(format_datetime_wib)
+        st.write("Cash Advance Rekap (sample)")
+        st.dataframe(df_ca_rekap, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # TAB 3: APPROVAL DIRECTOR & REKAP
-    with tab_director:
-        st.markdown("### Approval Director & Rekap Cuti")
-        if user.get("role") in ["director", "superuser"]:
-            try:
-                _, df = _cuti_read_df()
-            except Exception:
-                df = pd.DataFrame()
-            if not df.empty:
-                df["finance_approved"] = pd.to_numeric(df.get("finance_approved", 0), errors="coerce").fillna(0).astype(int)
-                df["director_approved"] = pd.to_numeric(df.get("director_approved", 0), errors="coerce").fillna(0).astype(int)
-                for _, row in df[df["finance_approved"] == 1].sort_values(by="tgl_mulai", ascending=False).iterrows():
-                    with st.expander(f"{row.get('nama')} | {row.get('tgl_mulai')} s/d {row.get('tgl_selesai')}"):
-                        st.write(f"Durasi: {row.get('durasi')} hari, Sisa kuota: {row.get('sisa_kuota')} hari")
-                        st.write(f"Alasan: {row.get('alasan', '')}")
-                        note = st.text_area("Catatan Director", value=row.get("director_note") or "", key=f"dir_note_{row.get('id')}")
-                        approve = st.checkbox("Approve", value=bool(int(row.get("director_approved", 0))), key=f"dir_appr_{row.get('id')}")
-                        if st.button("Simpan Approval", key=f"dir_save_{row.get('id')}"):
-                            try:
-                                if approve:
-                                    dur = int(pd.to_numeric(row.get("durasi", 0), errors="coerce") or 0)
-                                    terpakai = int(pd.to_numeric(row.get("cuti_terpakai", 0), errors="coerce") or 0)
-                                    kuota = int(pd.to_numeric(row.get("kuota_tahunan", 12), errors="coerce") or 12)
-                                    baru_terpakai = terpakai + dur
-                                    sisa = kuota - baru_terpakai
-                                    _cuti_update_by_id(row.get('id'), {
-                                        "director_note": note,
-                                        "director_approved": 1,
-                                        "status": "Disetujui Director",
-                                        "cuti_terpakai": baru_terpakai,
-                                        "sisa_kuota": sisa
-                                    })
-                                else:
-                                    _cuti_update_by_id(row.get('id'), {
-                                        "director_note": note,
-                                        "director_approved": 0,
-                                        "status": "Ditolak Director"
-                                    })
-                                st.success("Approval Director disimpan.")
-                                try:
-                                    audit_log("cuti", "director_approval", target=row.get('id'), details=f"approve={bool(approve)}")
-                                except Exception:
-                                    pass
-                                try:
-                                    if 'submitted_by' in row.index:
-                                        sb = str(row.get('submitted_by',''))
-                                        if sb:
-                                            send_notification_email(
-                                                sb,
-                                                f"[WIJNA] Pengajuan Cuti {'Disetujui' if approve else 'Ditolak'}",
-                                                f"Pengajuan cuti Anda {'disetujui' if approve else 'ditolak'} oleh Director."
-                                            )
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                st.error(f"Gagal menyimpan: {e}")
-                            st.rerun()
-            else:
-                st.info("Belum ada data cuti.")
-        # Rekap semua pengajuan
-        st.markdown("#### Rekap Pengajuan Cuti")
-        try:
-            _, df_all = _cuti_read_df()
-            if not df_all.empty:
-                st.dataframe(df_all.sort_values(by="tgl_mulai", ascending=False), use_container_width=True, hide_index=True)
-            else:
-                st.info("Belum ada pengajuan.")
-        except Exception as e:
-            st.error(f"Gagal memuat data cuti: {e}")
+    st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
 
-
+# -------------------------
+# Main app flow
+# -------------------------
 def main():
-    ensure_core_sheets()
+    ensure_db()
     # --- Sidebar Logo ---
     user = get_current_user()
     if not user:
         # --- Full page login/register, no sidebar ---
         st.markdown("""
             <style>
-            fname = file.name
-            parents = []
-            if GDRIVE_FOLDER_ID:
-                try:
-                    service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
-                    parents = [GDRIVE_FOLDER_ID]
-                except HttpError:
-                    st.warning(f"Folder Google Drive dengan ID {GDRIVE_FOLDER_ID} tidak ditemukan atau belum dibagikan ke service account. File akan diupload ke root Drive service account.")
-            media = MediaIoBaseUpload(file, mimetype=file.type or 'application/octet-stream', resumable=True)
-            metadata = {"name": fname}
-            if parents:
-                metadata["parents"] = parents
-            created = service.files().create(body=metadata, media_body=media, fields="id, webViewLink, name", supportsAllDrives=True).execute()
+            [data-testid="stSidebar"], .stSidebar {display: none !important;}
+            .center-login {
+                max-width: 400px;
+                margin: 5% auto 0 auto;
                 background: #fff;
                 border-radius: 12px;
                 box-shadow: 0 2px 16px rgba(80,140,255,0.10);
@@ -6570,10 +3429,9 @@ def main():
             }
             </style>
         """, unsafe_allow_html=True)
-        # Centered header using 3 columns; place content in the middle column
-        col1, col2, col3 = st.columns(3)
-        with col2:
-            st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=500)
+        st.markdown('<div class="center-login">', unsafe_allow_html=True)
+        st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=160)
+        st.markdown("<h2>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
         tabs = st.tabs(["Login", "Register"])
         with tabs[0]:
             email = st.text_input("Email", key="login_email", placeholder="Masukkan email Anda")
@@ -6606,9 +3464,8 @@ def main():
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    # Gunakan helper agar tidak memicu StreamlitInvalidWidthError (hindari width=None eksplisit)
-    safe_image(logo_path)
-    st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Management System</h2>", unsafe_allow_html=True)
+    st.sidebar.image(logo_path, use_container_width=True)
+    st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
     menu = [
@@ -6649,8 +3506,8 @@ def main():
         unsafe_allow_html=True
     )
 
-    # Compact separator & heading
-    st.sidebar.markdown('<div class="sidebar-thin-sep"></div><div class="sidebar-section-title">Navigasi Modul</div>', unsafe_allow_html=True)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Navigasi Modul")
     nav_cols = st.sidebar.columns(2)
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
@@ -6685,10 +3542,109 @@ def main():
         mou_module()
     elif choice == "Cash Advance":
         cash_advance_module()
-    elif choice == "Cuti":
-        cuti_module()
     elif choice == "PMR":
         pmr_module()
+    elif choice == "Cuti":
+        user = require_login()
+        st.header("🌴 Pengajuan & Approval Cuti")
+        st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
+        conn = get_db()
+        cur = conn.cursor()
+        tab1, tab2, tab3 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
+        # Tab 1: Ajukan Cuti
+        with tab1:
+            st.markdown("### 📝 Ajukan Cuti")
+            nama = user["full_name"]
+            tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
+            tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
+            alasan = st.text_area("Alasan Cuti")
+            durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
+            cur.execute("SELECT kuota_tahunan, cuti_terpakai FROM cuti WHERE nama=? ORDER BY tgl_mulai DESC LIMIT 1", (nama,))
+            row = cur.fetchone()
+            kuota_tahunan = row["kuota_tahunan"] if row else 12
+            cuti_terpakai = row["cuti_terpakai"] if row else 0
+            sisa_kuota = kuota_tahunan - cuti_terpakai
+            st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
+            st.write(f"Durasi cuti diajukan: {durasi} hari")
+            if durasi > 0 and sisa_kuota < durasi:
+                st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
+            if st.button("Ajukan Cuti"):
+                if not alasan or durasi <= 0:
+                    st.warning("Lengkapi data dan pastikan tanggal benar.")
+                elif sisa_kuota < durasi:
+                    st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
+                else:
+                    cid = gen_id("cuti")
+                    now = datetime.utcnow().isoformat()
+                    cur.execute("""
+                        INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
+                    """, (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, "Menunggu Review Finance"))
+                    conn.commit()
+                    st.success("Pengajuan cuti berhasil diajukan.")
+                    # Audit trail
+                    try:
+                        audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
+                    except Exception:
+                        pass
+        # Tab 2: Review Finance
+        with tab2:
+            st.markdown("### Review & Approval Finance")
+            if user["role"] in ["finance", "superuser"]:
+                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=0 ORDER BY tgl_mulai DESC", conn)
+                for idx, row in df.iterrows():
+                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                        st.write(f"Alasan: {row['status']}")
+                        note = st.text_area("Catatan Finance", value=row["finance_note"] or "", key=f"fin_note_{row['id']}")
+                        approve = st.checkbox("Approve", value=bool(row["finance_approved"]), key=f"fin_appr_{row['id']}")
+                        if st.button("Simpan Review", key=f"fin_save_{row['id']}"):
+                            status = "Menunggu Approval Director" if approve else "Ditolak Finance"
+                            cur.execute("UPDATE cuti SET finance_note=?, finance_approved=?, status=? WHERE id=?", (note, int(approve), status, row["id"]))
+                            conn.commit()
+                            st.success("Review Finance disimpan.")
+                            # Audit trail
+                            try:
+                                audit_log("cuti", "finance_review", target=row["id"], details=f"approve={bool(approve)}; status={status}")
+                            except Exception:
+                                pass
+                            st.rerun()
+            else:
+                st.info("Hanya Finance/Superuser yang dapat review di sini.")
+        # Tab 3: Approval Director & Rekap
+        with tab3:
+            st.markdown("### Approval Director & Rekap Cuti")
+            if user["role"] in ["director", "superuser"]:
+                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 ORDER BY tgl_mulai DESC", conn)
+                for idx, row in df.iterrows():
+                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                        st.write(f"Alasan: {row['status']}")
+                        note = st.text_area("Catatan Director", value=row["director_note"] or "", key=f"dir_note_{row['id']}")
+                        approve = st.checkbox("Approve", value=bool(row["director_approved"]), key=f"dir_appr_{row['id']}")
+                        if st.button("Simpan Approval", key=f"dir_save_{row['id']}"):
+                            if approve:
+                                cur.execute("SELECT cuti_terpakai, durasi, kuota_tahunan FROM cuti WHERE id=?", (row["id"],))
+                                r = cur.fetchone()
+                                baru_terpakai = (r["cuti_terpakai"] or 0) + (r["durasi"] or 0)
+                                sisa = (r["kuota_tahunan"] or 12) - baru_terpakai
+                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=?, cuti_terpakai=?, sisa_kuota=? WHERE id=?",
+                                    (note, int(approve), "Disetujui Director", baru_terpakai, sisa, row["id"]))
+                            else:
+                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=? WHERE id=?",
+                                    (note, int(approve), "Ditolak Director", row["id"]))
+                            conn.commit()
+                            st.success("Approval Director disimpan.")
+                            # Audit trail
+                            try:
+                                audit_log("cuti", "director_approval", target=row["id"], details=f"approve={bool(approve)}")
+                            except Exception:
+                                pass
+                            st.rerun()
+            # Rekap semua pengajuan cuti
+            st.markdown("#### Rekap Pengajuan Cuti")
+            df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
+            st.dataframe(df, use_container_width=True, hide_index=True)
     elif choice == "Flex Time":
         flex_module()
     elif choice == "Delegasi":
@@ -6707,7 +3663,100 @@ def main():
         audit_trail_module()
     elif choice == "Superuser Panel":
         superuser_panel()
-
+def audit_trail_module():
+    user = require_login()
+    st.header("🕵️ Audit Trail / Log Aktivitas")
+    conn = get_db()
+    cur = conn.cursor()
+    # Filter
+    st.markdown("#### Filter Audit Trail")
+    # Cek kolom di file_log
+    cur.execute("PRAGMA table_info(file_log)")
+    cols = [row[1] for row in cur.fetchall()]
+    # Build user list
+    user_fields = []
+    if "uploaded_by" in cols:
+        user_fields.append("uploaded_by")
+    if "deleted_by" in cols:
+        user_fields.append("deleted_by")
+    user_fields.append("file_name")
+    user_union = " UNION ".join([f"SELECT DISTINCT {f} as user FROM file_log" for f in user_fields])
+    users = [r[0] for r in cur.execute(user_union).fetchall() if r[0]]
+    actions = ["All", "Upload", "Delete", "Login", "Other"]
+    selected_user = st.selectbox("User", ["All"] + users)
+    selected_action = st.selectbox("Action", actions)
+    date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=30))
+    date_max = st.date_input("Sampai tanggal", value=date.today())
+    # Query
+    query = "SELECT * FROM file_log WHERE 1=1"
+    params = []
+    if selected_user != "All":
+        user_cond = []
+        if "uploaded_by" in cols:
+            user_cond.append("uploaded_by=?")
+            params.append(selected_user)
+        if "deleted_by" in cols:
+            user_cond.append("deleted_by=?")
+            params.append(selected_user)
+        user_cond.append("file_name=?")
+        params.append(selected_user)
+        query += " AND (" + " OR ".join(user_cond) + ")"
+    if selected_action != "All":
+        if selected_action == "Upload" and "uploaded_by" in cols:
+            query += " AND uploaded_by IS NOT NULL AND uploaded_by != ''"
+        elif selected_action == "Delete" and "deleted_by" in cols:
+            query += " AND deleted_by IS NOT NULL AND deleted_by != ''"
+        elif selected_action == "Login":
+            query += " AND modul='auth'"
+        else:
+            query += " AND modul NOT IN ('auth')"
+    # Tentukan kolom tanggal utama untuk filter
+    date_cols = [c for c in ["tanggal_upload", "tanggal_hapus"] if c in cols]
+    date_col = None
+    if date_cols:
+        # Gunakan COALESCE jika dua-duanya ada
+        if len(date_cols) == 2:
+            date_expr = f"COALESCE({date_cols[0]}, {date_cols[1]}, '')"
+        else:
+            date_expr = date_cols[0]
+        date_col = date_expr
+    else:
+        # Fallback: cari kolom string lain (misal alasan, id, versi)
+        fallback = [c for c in ["alasan", "id", "versi"] if c in cols]
+        if fallback:
+            date_col = fallback[0]
+        else:
+            date_col = None
+    if date_col:
+        query += f" AND ({date_col} >= ? AND {date_col} <= ?)"
+        params += [date_min.isoformat(), (date_max + timedelta(days=1)).isoformat()]
+    df = pd.read_sql_query(query, conn, params=params)
+    # Tampilkan hasil
+    if not df.empty:
+        # Tambah kolom tanggal utama untuk sort/tampil
+        if set(["tanggal_upload","tanggal_hapus"]).issubset(set(df.columns)):
+            df["tanggal_utama"] = df["tanggal_upload"].fillna("")
+            df.loc[df["tanggal_utama"]=="", "tanggal_utama"] = df["tanggal_hapus"].fillna("")
+        elif "tanggal_upload" in df.columns:
+            df["tanggal_utama"] = df["tanggal_upload"]
+        elif "tanggal_hapus" in df.columns:
+            df["tanggal_utama"] = df["tanggal_hapus"]
+        else:
+            df["tanggal_utama"] = ""
+        # Sort terbaru dulu
+        try:
+            df = df.sort_values(by="tanggal_utama", ascending=False)
+        except Exception:
+            pass
+        st.dataframe(df, use_container_width=True)
+        # Download
+        try:
+            st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), file_name="audit_trail.csv")
+        except Exception:
+            pass
+    else:
+        st.info("Belum ada log yang tercatat untuk filter yang dipilih.")
+# jangan dihapus
 if __name__ == "__main__":
+    ensure_db()
     main()
-
