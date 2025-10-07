@@ -403,7 +403,7 @@ SALT = "office_ops_salt_v1"
 # (initially: users, file_log, sop, notulen) will use Firestore collections instead of SQLite tables.
 # Gradually extend MIGRATED_COLLECTIONS to cover remaining modules.
 import os as _os
-USE_FIREBASE: bool = _os.environ.get("USE_FIREBASE", "0") == "1"
+USE_FIREBASE: bool = True
 FIREBASE_CONFIG_PATH = _os.path.join(_os.path.dirname(__file__), "firebase_config.json")
 
 FIRESTORE_CLIENT = None
