@@ -1,3 +1,6 @@
+def main_app():
+    # TODO: Pindahkan logika utama aplikasi ke sini jika perlu.
+    pass
 
 import streamlit as st
 import pandas as pd
@@ -6285,7 +6288,7 @@ def main():
             st.warning(f"Inisialisasi sheet tertunda: {e}")
     # Lanjut ke aplikasi utama (misal dashboard / file management)
     try:
-        show_main_app()
+        main_app()
     except Exception as e:
         st.error(f"Terjadi kesalahan di aplikasi utama: {e}")
 
