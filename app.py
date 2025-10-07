@@ -3120,12 +3120,18 @@ def dashboard():
         st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-title">📊 Rekap Bulanan (Ringkasan)</div>', unsafe_allow_html=True)
         st.markdown('<div class="wijna-section-desc">Rekap otomatis tersedia di tabel <b>rekap_monthly_*</b> (trigger scheduler belum diimplementasikan).</div>', unsafe_allow_html=True)
-        df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance LIMIT 10", conn)
-        for col in df_ca_rekap.columns:
-            if 'tanggal' in col or 'tgl' in col or 'updated' in col:
-                df_ca_rekap[col] = df_ca_rekap[col].apply(format_datetime_wib)
-        st.write("Cash Advance Rekap (sample)")
-        st.dataframe(df_ca_rekap, use_container_width=True, hide_index=True)
+        try:
+            df_ca_rekap = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance LIMIT 10", conn)
+            for col in df_ca_rekap.columns:
+                if 'tanggal' in col or 'tgl' in col or 'updated' in col:
+                    df_ca_rekap[col] = df_ca_rekap[col].apply(format_datetime_wib)
+            if df_ca_rekap.empty:
+                st.info("Belum ada data rekap cash advance bulan ini.")
+            else:
+                st.write("Cash Advance Rekap (sample)")
+                st.dataframe(df_ca_rekap, use_container_width=True, hide_index=True)
+        except Exception:
+            st.warning("Tabel rekap_monthly_cashadvance belum tersedia. Rekap bulanan akan muncul setelah modul scheduler/rekap dijalankan.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="wijna-section-card">', unsafe_allow_html=True)
