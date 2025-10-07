@@ -233,7 +233,7 @@ def sop_module():
             if "director_approved" in show.columns:
                 show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
             cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
-            st.dataframe(show[cols_show], use_container_width=True)
+            st.dataframe(show[cols_show], width='stretch')
             # Download CSV
             st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode("utf-8"), file_name="daftar_sop.csv")
             # Download file per item (opsional pilih)
@@ -926,7 +926,7 @@ def superuser_panel():
         st.subheader("Semua user")
         conn2 = get_db()
         df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
-        st.dataframe(df2, use_container_width=True)
+        st.dataframe(df2, width='stretch')
         conn2.close()
     # (No form here, only one form with key 'admin_change' exists below)
 
@@ -1187,7 +1187,7 @@ def inventory_module():
                 st.info("Tidak ada data inventaris sesuai filter.")
             else:
                 show_df = filtered_df.drop(columns=["file_blob"], errors="ignore")
-                st.dataframe(show_df, use_container_width=True)
+                st.dataframe(show_df, width='stretch')
 
                 lampiran_list = [
                     f"{row['name']} - {row['file_name']}" for idx, row in filtered_df.iterrows()
@@ -1583,16 +1583,17 @@ def surat_keluar_module():
         if not df.empty:
             df = df.copy()
             df['indeks'] = [f"SK-{i+1:04d}" for i in range(len(df))]
-        # Kolom file final dapat diunduh
-        def file_final_link(row):
-            if row['final_blob'] and row['final_name']:
-                show_file_download(row['final_blob'], row['final_name'])
-        st.dataframe(df[["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"]], use_container_width=True, hide_index=True)
+        # Tabel utama
+        st.dataframe(df[["indeks","nomor","tanggal","ditujukan","perihal","pengirim","status","follow_up","final_name"]], width='stretch', hide_index=True)
+
+        # Download File Final
         st.markdown("#### Download File Final Surat Keluar")
-        for idx, row in df.iterrows():
-            if row['final_blob'] and row['final_name']:
-                st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
-                show_file_download(row['final_blob'], row['final_name'])
+        if not df.empty:
+            for idx, row in df.iterrows():
+                if row['final_blob'] and row['final_name']:
+                    st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                    show_file_download(row['final_blob'], row['final_name'])
+
         # Rekap Bulanan
         st.markdown("#### 📊 Rekap Bulanan Surat Keluar")
         this_month = date.today().strftime("%Y-%m")
@@ -1751,7 +1752,7 @@ def mou_module():
             st.subheader("📋 Daftar MoU")
             cols_order = ["ID","Nomor","Nama","Pihak","Jenis","Tgl Mulai","Tgl Selesai","File","Board Approved","Status Aktif"]
             disp = show_df[cols_order] if not show_df.empty else show_df
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width='stretch', hide_index=True)
 
         with right:
             st.subheader("⬇️ Download File")
@@ -2358,7 +2359,7 @@ def flex_module():
             df['status'] = df.apply(lambda r: '✅ Disetujui' if r['approval_director']==1 else ('❌ Ditolak' if r['approval_finance']==-1 or r['approval_director']==-1 else ('🕒 Proses')), axis=1)
             df['jam_mulai'] = df['jam_mulai'].str[:5]
             df['jam_selesai'] = df['jam_selesai'].str[:5]
-            st.dataframe(df[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], use_container_width=True)
+            st.dataframe(df[['nama','tanggal','jam_mulai','jam_selesai','alasan','catatan_finance','catatan_director','status']], width='stretch')
         # Rekap Bulanan
         st.markdown("#### Rekap Bulanan Flex Time (Otomatis)")
         this_month = date.today().strftime("%Y-%m")
@@ -2591,7 +2592,7 @@ def calendar_module():
             if not dff.empty:
                 dff = dff.sort_values("tgl_mulai")
                 show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
-                st.dataframe(dff[show_cols], use_container_width=True)
+                st.dataframe(dff[show_cols], width='stretch')
                 # Download CSV hasil filter
                 csv_bytes = dff[show_cols].to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Download CSV (Hasil Filter)", data=csv_bytes, file_name=f"kalender_gabungan_filtered_{today.isoformat()}.csv", mime="text/csv")
@@ -2716,7 +2717,7 @@ def notulen_module():
             for c in ["uploaded_by", "deadline", "file_name", "Status"]:
                 if c in show.columns:
                     cols_show.append(c)
-            st.dataframe(show[cols_show], use_container_width=True)
+            st.dataframe(show[cols_show], width='stretch')
 
             # Download file terpilih
             if "id" in show.columns and "file_name" in show.columns:
@@ -2779,9 +2780,9 @@ def notulen_module():
         st.write(f"Total notulen bulan ini: {len(df_month)}")
         if not df_month.empty:
             if nt_date_col:
-                st.dataframe(df_month[["judul", nt_date_col]], use_container_width=True)
+                st.dataframe(df_month[["judul", nt_date_col]], width='stretch')
             else:
-                st.dataframe(df_month[["judul"]], use_container_width=True)
+                st.dataframe(df_month[["judul"]], width='stretch')
             try:
                 st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False).encode("utf-8"), file_name=f"rekap_notulen_{this_month}.csv")
             except Exception:
@@ -2907,7 +2908,7 @@ def user_setting_module():
                     )
                 else:
                     dfu = pd.read_sql_query(f"SELECT id,email,full_name,role,status,last_login FROM users ORDER BY {order_col} DESC", conn)
-                st.dataframe(dfu, use_container_width=True, hide_index=True)
+                st.dataframe(dfu, width='stretch', hide_index=True)
 
                 # Pilih user target
                 options = [f"{r['id']} | {r['email']} | {r['full_name']} | {r['role']} | {r['status']}" for _, r in dfu.iterrows()] if not dfu.empty else []
@@ -3306,7 +3307,7 @@ def main():
 
     # --- Sidebar/menu for logged in user ---
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    st.sidebar.image(logo_path, use_container_width=True)
+    st.sidebar.image(logo_path)
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
     auth_sidebar()
 
@@ -3354,7 +3355,7 @@ def main():
     for idx, (key, label) in enumerate(menu):
         col = nav_cols[idx % 2]
         with col:
-            btn = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            btn = st.button(label, key=f"nav_{key}", help=key)
             if btn:
                 st.session_state["page"] = key
                 st.rerun()
@@ -3362,7 +3363,7 @@ def main():
     # --- Logout button at the very bottom ---
     if user:
         st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
-        if st.sidebar.button("Logout", key="sidebar_logout", use_container_width=True):
+    if st.sidebar.button("Logout", key="sidebar_logout"):
             logout()
             st.rerun()
 
@@ -3486,7 +3487,7 @@ def main():
             # Rekap semua pengajuan cuti
             st.markdown("#### Rekap Pengajuan Cuti")
             df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
     elif choice == "Flex Time":
         flex_module()
     elif choice == "Delegasi":
@@ -3590,7 +3591,7 @@ def audit_trail_module():
             df = df.sort_values(by="tanggal_utama", ascending=False)
         except Exception:
             pass
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
         # Download
         try:
             st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), file_name="audit_trail.csv")
