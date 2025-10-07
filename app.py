@@ -5896,12 +5896,23 @@ def superuser_panel():
             except Exception:
                 pass
 
-    # Fetch sheet
+    # Fetch sheet (dengan penanganan 429 quota exceeded yang lebih informatif)
     try:
         ws = _get_ws(CONFIG_SHEET_NAME)
-        records = ws.get_all_records()
+        try:
+            records = ws.get_all_records()
+        except gspread.exceptions.APIError as ge:
+            if '429' in str(ge) or 'Quota exceeded' in str(ge):
+                st.warning("📊 Quota Google Sheets terlampaui (429). Silakan tunggu ±1 menit lalu klik tombol Refresh / reload halaman.")
+                st.stop()
+            else:
+                raise
     except Exception as e:
-        st.error(f"Gagal membaca sheet config: {e}")
+        # Fallback general error
+        if '429' in str(e) or 'Quota exceeded' in str(e):
+            st.warning("📊 Quota Google Sheets terlampaui (429). Silakan tunggu ±1 menit lalu coba lagi.")
+        else:
+            st.error(f"Gagal membaca sheet config: {e}")
         return
 
     # Normalize display dataframe
