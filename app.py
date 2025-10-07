@@ -3,6 +3,7 @@ import os
 import sqlite3
 from sqlite3 import Connection
 from datetime import datetime, date, timedelta
+import io
 import base64
 import pandas as pd
 import uuid
@@ -1553,10 +1554,30 @@ def surat_keluar_module():
             # Perbaiki export Excel
             import io
             excel_buffer = io.BytesIO()
-            df_month.to_excel(excel_buffer, index=False, engine='openpyxl')
-            excel_buffer.seek(0)
-            st.download_button("⬇️ Download Rekap Bulanan (Excel)", excel_buffer, file_name=f"rekap_suratkeluar_{this_month}.xlsx")
-            st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_suratkeluar_{this_month}.csv")
+            wrote_excel = False
+            # Try openpyxl first, fall back to xlsxwriter, then fallback CSV only
+            for engine_name in ["openpyxl", "xlsxwriter"]:
+                if wrote_excel:
+                    break
+                try:
+                    df_month.to_excel(excel_buffer, index=False, engine=engine_name)
+                    excel_buffer.seek(0)
+                    st.download_button(
+                        "⬇️ Download Rekap Bulanan (Excel)",
+                        excel_buffer,
+                        file_name=f"rekap_suratkeluar_{this_month}.xlsx"
+                    )
+                    wrote_excel = True
+                except Exception:
+                    excel_buffer = io.BytesIO()  # reset buffer for next attempt
+                    continue
+            if not wrote_excel:
+                st.info("Library openpyxl/xlsxwriter tidak tersedia. Gunakan download CSV.")
+            st.download_button(
+                "⬇️ Download Rekap Bulanan (CSV)",
+                df_month.to_csv(index=False),
+                file_name=f"rekap_suratkeluar_{this_month}.csv"
+            )
 
 def mou_module():
     user = require_login()
@@ -2132,7 +2153,25 @@ def delegasi_module():
         this_month = date.today().strftime("%Y-%m")
         df_month = df[df['tgl_mulai'].str[:7] == this_month] if not df.empty else pd.DataFrame()
         if not df_month.empty:
-            st.download_button("Download Rekap Bulanan (Excel)", df_month.to_excel(index=False, engine='openpyxl'), file_name=f"rekap_delegasi_{this_month}.xlsx")
+            # Robust Excel export with fallback engines (openpyxl -> xlsxwriter) else CSV only
+            try:
+                bio = io.BytesIO()
+                success = False
+                for eng in ["openpyxl", "xlsxwriter"]:
+                    if success:
+                        break
+                    try:
+                        df_month.to_excel(bio, index=False, engine=eng)
+                        bio.seek(0)
+                        st.download_button("Download Rekap Bulanan (Excel)", bio, file_name=f"rekap_delegasi_{this_month}.xlsx")
+                        success = True
+                    except Exception:
+                        bio = io.BytesIO()
+                        continue
+                if not success:
+                    st.info("Engine Excel (openpyxl/xlsxwriter) tidak tersedia. Gunakan CSV.")
+            except Exception:
+                st.warning("Gagal membuat file Excel. Gunakan CSV.")
             st.download_button("Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_delegasi_{this_month}.csv")
             by_pic = df_month['pic'].value_counts().head(5)
             st.write("Top 5 PIC:")
