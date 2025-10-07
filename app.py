@@ -905,11 +905,7 @@ def show_login_page():
                         pass
 
 def show_main_app():
-    """Menampilkan aplikasi utama setelah user berhasil login."""
-    st.sidebar.success(f"Login sebagai: **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
-        
-        # Kirim notifikasi ke seluruh SUPERUSER saat LOGOUT
         email_subject = "Notifikasi: User Logout"
         email_body = f"User '{st.session_state.username}' telah LOGOUT dari aplikasi Anda."
         try:
@@ -924,10 +920,8 @@ def show_main_app():
 def get_current_user():
     return st.session_state.get("user")
 
-
 def set_current_user(user_obj):
     st.session_state.user = user_obj
-
 
 def logout():
     user = get_current_user()
@@ -946,9 +940,7 @@ def logout():
     st.session_state.logged_in = False
     st.session_state.username = ""
 
-
 from auth import login_user, register_user  # type: ignore
-
 
 def auth_sidebar():
     user = get_current_user()
@@ -975,7 +967,6 @@ def auth_sidebar():
                         unsafe_allow_html=True,
                 )
 
-
 def _get_emails_by_role(role: str) -> list[str]:
     try:
         ws = get_spreadsheet().worksheet(USERS_SHEET_NAME)
@@ -993,7 +984,6 @@ def _get_emails_by_role(role: str) -> list[str]:
         )
     except Exception:
         return []
-
 
 def _notify_role(role: str, subject: str, body: str):
     """Kirim email ke semua user dengan role tersebut (async + bulk)."""
@@ -4348,7 +4338,7 @@ def kalender_pemakaian_mobil_kantor():
                 driver = st.text_input("Driver")
                 status = st.selectbox("Status", ["Menunggu Approve", "Disetujui", "Ditolak"])
                 finance_note = st.text_area("Catatan")
-                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil")
+                submitted_btn = st.form_submit_button("Simpan Jadwal Mobil", key="submit_jadwal_mobil")
 
                 if submitted_btn:
                     if not (nama_pengguna and kendaraan and tujuan):
