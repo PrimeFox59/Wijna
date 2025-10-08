@@ -731,9 +731,9 @@ def register_user(email, full_name, password):
     now = datetime.utcnow().isoformat()
     try:
         cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (email, full_name, "staff", pw, "pending", now))
+                    (email, full_name, "staff", pw, "active", now))
         conn.commit()
-        return True, "Registered — menunggu approval superuser."
+        return True, "Registered — akun langsung aktif."
     except sqlite3.IntegrityError:
         return False, "Email sudah terdaftar."
 
@@ -1488,6 +1488,7 @@ def surat_keluar_module():
     # --- Tab 1: Input Draft oleh Staf ---
     with tab1:
         st.markdown("### Input Draft Surat Keluar (Staf)")
+        draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True, key="draft_type_sk")
         with st.form("sk_add", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
@@ -1496,7 +1497,6 @@ def surat_keluar_module():
             with col2:
                 ditujukan = st.text_input("Ditujukan Kepada")
                 perihal = st.text_input("Perihal")
-            draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True)
             draft_blob, draft_name, draft_url = None, None, None
             if draft_type == "Upload File":
                 draft = st.file_uploader("Upload Draft Surat (PDF/DOC)")
