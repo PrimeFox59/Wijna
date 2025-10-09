@@ -8,12 +8,21 @@ import base64
 import pandas as pd
 import uuid
 import json
+from typing import Optional, Tuple, Dict
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+    _GDRIVE_AVAILABLE = True
+except Exception:
+    _GDRIVE_AVAILABLE = False
 
 # NOTE: Skema tabel akan dibuat di fungsi ensure_db() / inisialisasi terpusat.
 # Blok CREATE TABLE yang sebelumnya ada di bagian atas telah dipindahkan agar tidak
 # menyebabkan NameError (variabel cur belum didefinisikan) dan agar lebih terstruktur.
 
 DB_PATH = "office_ops.db"
+GDRIVE_DEFAULT_FOLDER_ID = os.environ.get("DUNYIM_GDRIVE_FOLDER_ID", "")
 SALT = "office_ops_salt_v1"
 
 # --- Password hashing utility ---
@@ -600,6 +609,56 @@ def ensure_db():
             cur.execute("ALTER TABLE file_log ADD COLUMN tanggal_upload TEXT")
         if "action" not in fl_cols:
             cur.execute("ALTER TABLE file_log ADD COLUMN action TEXT")
+        # --- Dunyim Security tables (idempotent) ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT,
+                drive_file_id TEXT,
+                status TEXT,
+                message TEXT,
+                backup_time TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS record_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note TEXT,
+                created_by TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_email TEXT,
+                action TEXT,
+                details TEXT,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Seed default settings
+        try:
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('auto_restore_enabled','true')")
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('scheduled_backup_enabled','false')")
+            if GDRIVE_DEFAULT_FOLDER_ID:
+                cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('gdrive_folder_id', ?)", (GDRIVE_DEFAULT_FOLDER_ID,))
+        except Exception:
+            pass
         conn.commit()
     except Exception:
         pass
@@ -756,6 +815,13 @@ def login_user(email, password):
         st.session_state["user"] = {"id": row["id"], "email": row["email"], "role": row["role"], "full_name": row["full_name"]}
         cur.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
         audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
+        try:
+            # store login audit into audit_logs table (Dunyim)
+            c2 = conn.cursor()
+            c2.execute("INSERT INTO audit_logs (user_email, action, details) VALUES (?,?,?)", (email, 'LOGIN', 'Login sukses'))
+            conn.commit()
+        except Exception:
+            pass
         conn.commit()
         return True, "Login sukses."
     else:
@@ -769,6 +835,15 @@ def logout():
     if "user" in st.session_state and st.session_state["user"]:
         actor_email = st.session_state["user"].get("email") or st.session_state["user"].get("full_name")
     audit_log("auth", "logout", target=actor_email or "-", details="Logout", actor=actor_email)
+    # Best-effort backup on logout
+    try:
+        if _drive_available():
+            folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+            if folder_id:
+                service = _build_drive()
+                _backup_db_now(service, folder_id)
+    except Exception:
+        pass
     for k in ("user",):
         if k in st.session_state:
             del st.session_state[k]
@@ -1008,6 +1083,334 @@ def show_file_download(blob, filename):
 # -------------------------
 # Modules Implementation (concise)
 # -------------------------
+# --- Dunyim helpers ---
+def _setting_get(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+def _setting_set(key: str, value: str) -> None:
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        conn.commit()
+    except Exception:
+        pass
+
+def _drive_available() -> bool:
+    return bool(_GDRIVE_AVAILABLE)
+
+def _build_drive():
+    if not _GDRIVE_AVAILABLE:
+        raise RuntimeError("Google API packages not installed.")
+    try:
+        creds_info = st.secrets["service_account"]
+    except Exception:
+        raise RuntimeError("Secrets service_account tidak tersedia.")
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = service_account.Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
+    return build("drive","v3", credentials=creds)
+
+def _drive_list(service, folder_id: str):
+    res = []
+    token = None
+    q = f"'{folder_id}' in parents and trashed=false"
+    while True:
+        resp = service.files().list(q=q, spaces="drive", fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)", pageToken=token, supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=200).execute()
+        res.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return res
+
+def _drive_upload_or_replace(service, folder_id: str, name: str, data: bytes, mimetype: str = "application/octet-stream") -> Optional[str]:
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=True)
+    try:
+        q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
+        resp = service.files().list(q=q, spaces='drive', fields='files(id)', supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        existing = resp.get('files', [])
+        if existing:
+            fid = existing[0]['id']
+            service.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+            return fid
+        else:
+            meta = {"name": name, "parents": [folder_id]}
+            created = service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True).execute()
+            return created.get('id')
+    except Exception:
+        return None
+
+def _drive_download(service, fid: str) -> bytes:
+    req = service.files().get_media(fileId=fid)
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    buf.seek(0)
+    return buf.read()
+
+def _drive_delete(service, fid: str) -> None:
+    service.files().delete(fileId=fid, supportsAllDrives=True).execute()
+
+def _bytes_fmt(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "-"
+    units = ["B","KB","MB","GB","TB"]
+    size = float(n)
+    for u in units:
+        if size < 1024 or u == units[-1]:
+            return (f"{int(size)} {u}" if u == "B" else f"{size:.2f} {u}")
+        size /= 1024
+
+def _folder_usage_quick(service, folder_id: str) -> Dict:
+    total = 0
+    unknown = 0
+    files = _drive_list(service, folder_id)
+    for f in files:
+        sz = f.get('size')
+        if sz is not None:
+            try:
+                total += int(sz)
+            except Exception:
+                unknown += 1
+        else:
+            unknown += 1
+    return {"total_bytes": total, "file_count": len(files), "unknown_size_count": unknown}
+
+def _backup_db_now(service, folder_id: str) -> Tuple[bool, str]:
+    if not os.path.exists(DB_PATH):
+        return False, f"DB '{DB_PATH}' tidak ditemukan"
+    base_name = _setting_get('auto_backup_filename', 'auto_backup.sqlite') or 'auto_backup.sqlite'
+    try:
+        db_size = os.path.getsize(DB_PATH)
+    except Exception:
+        db_size = 0
+    cap = int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024)
+    usage = _folder_usage_quick(service, folder_id)
+    used = int(usage.get('total_bytes', 0))
+    # allow overwrite if same name exists
+    try:
+        q = f"name='{base_name}' and '{folder_id}' in parents and trashed=false"
+        resp = service.files().list(q=q, spaces='drive', fields='files(id,size)', supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        existing = resp.get('files', [])
+    except Exception:
+        existing = []
+    if not existing:
+        if used >= cap:
+            return False, "Kapasitas penuh."
+        if used + db_size > cap:
+            return False, "Ukuran backup melebihi kapasitas."
+    try:
+        with open(DB_PATH,'rb') as f:
+            data = f.read()
+        fid = _drive_upload_or_replace(service, folder_id, base_name, data, mimetype='application/x-sqlite3')
+        conn = get_db(); cur = conn.cursor()
+        if fid:
+            cur.execute("INSERT INTO backup_log (file_name, drive_file_id, status, message) VALUES (?,?,?,?)", (base_name, fid, 'SUCCESS', 'auto'))
+            conn.commit()
+            return True, f"Backup sukses (ID: {fid})"
+        else:
+            cur.execute("INSERT INTO backup_log (file_name, drive_file_id, status, message) VALUES (?,?,?,?)", (base_name, None, 'FAILED', 'upload gagal'))
+            conn.commit()
+            return False, "Upload gagal"
+    except Exception as e:
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("INSERT INTO backup_log (file_name, drive_file_id, status, message) VALUES (?,?,?,?)", (base_name, None, 'FAILED', str(e)))
+            conn.commit()
+        except Exception:
+            pass
+        return False, f"Error: {e}"
+
+def dunyim_security_module():
+    user = require_login()
+    st.header("🛡️ Dunyim Security System")
+    if not _drive_available():
+        st.error("Paket Google API belum terpasang. Tambahkan 'google-api-python-client' dan 'google-auth' di requirements.")
+        return
+    folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+    with st.expander("⚙️ Pengaturan", expanded=not bool(folder_id)):
+        fld = st.text_input("Folder ID Google Drive", value=folder_id)
+        cap = st.number_input("Kapasitas (bytes)", min_value=0, value=int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024))
+        if st.button("Simpan Pengaturan"):
+            if fld:
+                _setting_set('gdrive_folder_id', fld)
+            _setting_set('project_capacity_bytes', str(cap))
+            st.success("Pengaturan disimpan.")
+            st.experimental_rerun()
+    if not folder_id:
+        st.info("Masukkan Folder ID terlebih dahulu.")
+        return
+    try:
+        service = _build_drive()
+    except Exception as e:
+        st.error(str(e)); return
+    tabs = st.tabs(["List","Upload","Download","Delete","Sync DB","Audit Log","Record","Drive Usage"])
+    # List
+    with tabs[0]:
+        try:
+            files = _drive_list(service, folder_id)
+        except Exception as e:
+            st.error(f"Gagal list: {e}"); files=[]
+        if not files:
+            st.info("Folder kosong.")
+        else:
+            df = pd.DataFrame(files)
+            if 'size' in df.columns:
+                df['size'] = df['size'].fillna(0).astype(int).apply(_bytes_fmt)
+            st.dataframe(df[['name','id','mimeType','modifiedTime'] + (['size'] if 'size' in df.columns else [])], use_container_width=True, hide_index=True)
+        if st.button("🚀 Backup DB Sekarang"):
+            ok, msg = _backup_db_now(service, folder_id)
+            st.success(msg) if ok else st.error(msg)
+    # Upload
+    with tabs[1]:
+        f = st.file_uploader("Pilih file untuk upload")
+        if f and st.button("Upload"):
+            data = f.read()
+            usage = _folder_usage_quick(service, folder_id)
+            cap = int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024)
+            if usage['total_bytes'] + len(data) > cap:
+                st.error("Melebihi kapasitas.")
+            else:
+                fid = _drive_upload_or_replace(service, folder_id, f.name, data, mimetype=f.type or 'application/octet-stream')
+                st.success(f"Uploaded (ID: {fid})") if fid else st.error("Gagal upload")
+    # Download
+    with tabs[2]:
+        files = _drive_list(service, folder_id)
+        if not files:
+            st.info("Folder kosong.")
+        else:
+            mp = {x['name']: x['id'] for x in files}
+            sel = st.selectbox("File", list(mp.keys()))
+            if st.button("Download"):
+                try:
+                    data = _drive_download(service, mp[sel])
+                    st.download_button("Klik untuk download", data=data, file_name=sel)
+                except Exception as e:
+                    st.error(f"Gagal download: {e}")
+    # Delete
+    with tabs[3]:
+        files = _drive_list(service, folder_id)
+        if not files:
+            st.info("Folder kosong.")
+        else:
+            mp = {x['name']: x['id'] for x in files}
+            sel = st.selectbox("Pilih file", list(mp.keys()))
+            if st.button("Hapus"):
+                try:
+                    _drive_delete(service, mp[sel])
+                    st.success("Terhapus."); st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Gagal hapus: {e}")
+    # Sync DB
+    with tabs[4]:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### ⬆️ Upload & Replace DB Lokal")
+            up = st.file_uploader("File .sqlite/.db", type=["sqlite","db"])
+            if up and st.button("Replace DB"):
+                data = up.read()
+                if not data.startswith(b"SQLite format 3\x00"):
+                    st.error("File bukan SQLite valid.")
+                else:
+                    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                    if os.path.exists(DB_PATH):
+                        try:
+                            with open(DB_PATH,'rb') as a, open(f"local_backup_before_replace_{ts}.sqlite",'wb') as b:
+                                b.write(a.read())
+                            st.info("Backup lokal lama tersimpan.")
+                        except Exception as e:
+                            st.warning(f"Backup lokal gagal: {e}")
+                    with open(DB_PATH,'wb') as f2:
+                        f2.write(data)
+                    st.success("DB lokal diganti.")
+        with col2:
+            st.markdown("### ⬇️ Restore dari Drive")
+            files = _drive_list(service, folder_id)
+            dbs = [f for f in files if f.get('name','').endswith(('.sqlite','.db'))]
+            if not dbs:
+                st.info("Tidak ada file DB di Drive.")
+            else:
+                try:
+                    dbs.sort(key=lambda x: x.get('modifiedTime',''), reverse=True)
+                except Exception:
+                    pass
+                mp = {x['name']: x['id'] for x in dbs}
+                sel = st.selectbox("Pilih file DB", list(mp.keys()))
+                if st.button("Restore DB Lokal"):
+                    try:
+                        data = _drive_download(service, mp[sel])
+                        if not data.startswith(b"SQLite format 3\x00"):
+                            st.error("Bukan SQLite valid.")
+                        else:
+                            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                            if os.path.exists(DB_PATH):
+                                try:
+                                    with open(DB_PATH,'rb') as a, open(f"local_backup_before_restore_{ts}.sqlite",'wb') as b:
+                                        b.write(a.read())
+                                    st.info("Backup lokal lama tersimpan.")
+                                except Exception as e:
+                                    st.warning(f"Backup lokal gagal: {e}")
+                            with open(DB_PATH,'wb') as f2:
+                                f2.write(data)
+                            st.success("DB berhasil direstore. Reload halaman.")
+                    except Exception as e:
+                        st.error(f"Gagal restore: {e}")
+    # Audit Log
+    with tabs[5]:
+        try:
+            conn = get_db(); df = pd.read_sql_query("SELECT * FROM backup_log ORDER BY id DESC LIMIT 20", conn)
+        except Exception:
+            df = pd.DataFrame()
+        st.subheader("Riwayat Backup")
+        if df.empty:
+            st.info("Belum ada log backup.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    # Record
+    with tabs[6]:
+        st.subheader("Catatan Manual")
+        with st.form("note_form"):
+            t = st.text_input("Catatan baru")
+            s = st.form_submit_button("Simpan")
+            if s and t.strip():
+                try:
+                    conn = get_db(); cur = conn.cursor()
+                    cur.execute("INSERT INTO record_notes (note, created_by) VALUES (?,?)", (t.strip(), user['email']))
+                    conn.commit(); st.success("Tersimpan."); st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Gagal menyimpan: {e}")
+        try:
+            conn = get_db(); notes = pd.read_sql_query("SELECT * FROM record_notes ORDER BY id DESC LIMIT 50", conn)
+        except Exception:
+            notes = pd.DataFrame()
+        if notes.empty:
+            st.info("Belum ada catatan.")
+        else:
+            st.dataframe(notes[['id','note','created_by','created_at']], use_container_width=True, hide_index=True)
+    # Drive Usage
+    with tabs[7]:
+        st.subheader("Penggunaan Drive")
+        try:
+            usage = _folder_usage_quick(service, folder_id)
+        except Exception as e:
+            st.error(f"Gagal menghitung penggunaan: {e}")
+            usage = {"total_bytes":0,"file_count":0,"unknown_size_count":0}
+        cap = int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024)
+        used = int(usage.get('total_bytes',0))
+        st.metric("Used", _bytes_fmt(used))
+        st.metric("Capacity", _bytes_fmt(cap))
+        pct = (used/cap*100.0) if cap>0 else 0.0
+        st.progress(min(pct/100.0, 1.0))
 def inventory_module():
     # Prepare monthly rekap at the top
     user = require_login()
@@ -3328,7 +3731,8 @@ def main():
         ("Notulen", "🗒️ Notulen"),
         ("User Setting", "⚙️ User Setting"),
         ("Audit Trail", "🕵️ Audit Trail"),
-        ("Superuser Panel", "🔑 Superuser Panel")
+        ("Superuser Panel", "🔑 Superuser Panel"),
+        ("Dunyim Security", "🛡️ Dunyim Security")
     ]
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
@@ -3506,6 +3910,9 @@ def main():
         audit_trail_module()
     elif choice == "Superuser Panel":
         superuser_panel()
+    elif choice == "Dunyim Security":
+        dunyim_security_module()
+
 def audit_trail_module():
     user = require_login()
     st.header("🕵️ Audit Trail / Log Aktivitas")
@@ -3597,9 +4004,6 @@ def audit_trail_module():
             st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), file_name="audit_trail.csv")
         except Exception:
             pass
-    else:
-        st.info("Belum ada log yang tercatat untuk filter yang dipilih.")
-# jangan dihapus
 if __name__ == "__main__":
     ensure_db()
     main()
