@@ -4163,7 +4163,6 @@ def main():
             }
             </style>
         """, unsafe_allow_html=True)
-        st.markdown('<div class="center-login">', unsafe_allow_html=True)
         st.image(os.path.join(os.path.dirname(__file__), "logo.png"), width=160)
         st.markdown("<h2>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
         tabs = st.tabs(["Login", "Register"])
