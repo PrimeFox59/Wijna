@@ -890,10 +890,27 @@ def require_login():
 
 def require_role(roles):
     user = require_login()
+    # Superuser override: can access everything
+    if user.get("role") == "superuser":
+        return user
+    # Normalize roles input (allow string or list)
+    if isinstance(roles, str):
+        roles = [roles]
     if user["role"] not in roles:
         st.error(f"Akses ditolak. Diperlukan role: {roles}")
         st.stop()
     return user
+
+def has_role(roles) -> bool:
+    """Convenience checker: returns True if current user is superuser or in roles."""
+    u = get_current_user()
+    if not u:
+        return False
+    if u.get("role") == "superuser":
+        return True
+    if isinstance(roles, str):
+        roles = [roles]
+    return u.get("role") in (roles or [])
 
 # -------------------------
 # UI Components: Authentication
