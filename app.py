@@ -8,7 +8,9 @@ import base64
 import pandas as pd
 import uuid
 import json
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
+import smtplib
+from email.mime.text import MIMEText
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -651,10 +653,26 @@ def ensure_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT,
+                entity_id TEXT,
+                kind TEXT,
+                tag TEXT,
+                recipients TEXT,
+                sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         # Seed default settings
         try:
             cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('auto_restore_enabled','true')")
             cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('scheduled_backup_enabled','false')")
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('enable_email_notifications','false')")
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('pmr_notify_enabled','true')")
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('delegasi_notify_enabled','true')")
             if GDRIVE_DEFAULT_FOLDER_ID:
                 cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('gdrive_folder_id', ?)", (GDRIVE_DEFAULT_FOLDER_ID,))
         except Exception:
@@ -1179,6 +1197,192 @@ def _bytes_fmt(n: int) -> str:
         if size < 1024 or u == units[-1]:
             return (f"{int(size)} {u}" if u == "B" else f"{size:.2f} {u}")
         size /= 1024
+
+# --- Email helpers (Dunyim) ---
+def _email_enabled() -> bool:
+    try:
+        if _setting_get('enable_email_notifications', 'false') != 'true':
+            return False
+        creds = st.secrets.get('email_credentials')
+        if not creds:
+            return False
+        if not creds.get('username') or not creds.get('app_password'):
+            return False
+        return True
+    except Exception:
+        return False
+
+def _smtp_settings() -> Tuple[Optional[str], Optional[str]]:
+    try:
+        creds = st.secrets.get('email_credentials')
+        return creds.get('username'), creds.get('app_password')
+    except Exception:
+        return None, None
+
+def _send_email(recipients: List[str], subject: str, body: str) -> bool:
+    if not recipients:
+        return False
+    try:
+        username, app_password = _smtp_settings()
+        if not username or not app_password:
+            return False
+        msg = MIMEText(body, _charset='utf-8')
+        msg['Subject'] = subject
+        msg['From'] = username
+        msg['To'] = ", ".join(recipients)
+        import smtplib
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(username, app_password)
+            server.sendmail(username, recipients, msg.as_string())
+        return True
+    except Exception:
+        return False
+
+def _notif_already_sent(entity_type: str, entity_id: str, kind: str, tag: str) -> bool:
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT 1 FROM email_notifications WHERE entity_type=? AND entity_id=? AND kind=? AND tag=? LIMIT 1",
+                    (entity_type, entity_id, kind, tag))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+def _mark_notif_sent(entity_type: str, entity_id: str, kind: str, tag: str, recipients: List[str]) -> None:
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("INSERT INTO email_notifications (entity_type, entity_id, kind, tag, recipients) VALUES (?,?,?,?,?)",
+                    (entity_type, entity_id, kind, tag, ",".join(recipients)))
+        conn.commit()
+    except Exception:
+        pass
+
+def _get_director_emails() -> List[str]:
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE status='active' AND role IN ('director','superuser')")
+        rows = cur.fetchall()
+        return [r['email'] if isinstance(r, dict) else (r[0] if r else None) for r in rows if (r and (r['email'] if isinstance(r, dict) else r[0]))]
+    except Exception:
+        return []
+
+def _get_user_email_by_name(full_name: str) -> Optional[str]:
+    if not full_name:
+        return None
+    try:
+        conn = get_db(); cur = conn.cursor()
+        # case-insensitive match on full_name
+        cur.execute("SELECT email FROM users WHERE lower(full_name)=lower(?) LIMIT 1", (full_name.strip(),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row['email'] if isinstance(row, dict) else row[0]
+    except Exception:
+        return None
+
+def run_automations_for_dashboard() -> None:
+    """Lightweight email automations for Dashboard entry.
+    - PMR lateness (> day 5): email to staff without PMR this month (cc Directors)
+    - Delegasi reminders: ≤3 days to deadline (PIC), overdue (PIC + Directors)
+    """
+    try:
+        if not _email_enabled():
+            return
+        today = date.today()
+        this_month = today.strftime('%Y-%m')
+        directors = _get_director_emails()
+        conn = get_db(); cur = conn.cursor()
+
+        # 1) PMR lateness
+        if int(today.day) > 5 and (_setting_get('pmr_notify_enabled', 'true') == 'true'):
+            try:
+                # Active users to check (exclude superuser)
+                cur.execute("SELECT id, full_name, email, role FROM users WHERE status='active' AND role <> 'superuser'")
+                users_all = cur.fetchall() or []
+                # Submitted PMR names this month
+                pmr_df = pd.read_sql_query("SELECT DISTINCT nama FROM pmr WHERE substr(bulan,1,7)=?", conn._conn if hasattr(conn,'_conn') else conn, params=(this_month,))
+                submitted = set([] if pmr_df is None or pmr_df.empty else [str(x).strip().lower() for x in pmr_df['nama'].tolist()])
+                for u in users_all:
+                    uname = (u['full_name'] if isinstance(u, dict) else u[1])
+                    uid = (u['id'] if isinstance(u, dict) else u[0])
+                    umail = (u['email'] if isinstance(u, dict) else u[2])
+                    if not uname:
+                        continue
+                    if uname.strip().lower() in submitted:
+                        continue
+                    tag = f"pmr-{this_month}"
+                    if _notif_already_sent('pmr_missing', str(uid), 'late', tag):
+                        continue
+                    recips = []
+                    if umail: recips.append(umail)
+                    for d in directors:
+                        if d and d not in recips: recips.append(d)
+                    if not recips:
+                        continue
+                    subj = f"[WIJNA] PMR {this_month} belum diunggah"
+                    body = (
+                        f"Halo {uname},\n\n"
+                        f"Sistem mendeteksi hingga tanggal {today.day:02d} bahwa PMR untuk bulan {this_month} belum diunggah.\n"
+                        f"Mohon segera upload PMR melalui modul PMR di aplikasi WIJNA.\n\n"
+                        f"Terima kasih.\n"
+                    )
+                    if _send_email(recips, subj, body):
+                        _mark_notif_sent('pmr_missing', str(uid), 'late', tag, recips)
+            except Exception:
+                pass
+
+        # 2) Delegasi reminders
+        if _setting_get('delegasi_notify_enabled', 'true') == 'true':
+            try:
+                df = pd.read_sql_query("SELECT id, judul, pic, tgl_selesai, status FROM delegasi", conn._conn if hasattr(conn,'_conn') else conn)
+            except Exception:
+                df = pd.DataFrame(columns=['id','judul','pic','tgl_selesai','status'])
+            if not df.empty:
+                for _, r in df.iterrows():
+                    status = str(r.get('status','') or '').strip().lower()
+                    if status in ('selesai','done'):
+                        continue
+                    try:
+                        due = pd.to_datetime(r['tgl_selesai']).date()
+                    except Exception:
+                        continue
+                    days_left = (due - today).days
+                    pic_name = str(r.get('pic','') or '').strip()
+                    pic_email = _get_user_email_by_name(pic_name) if pic_name else None
+                    if days_left < 0:
+                        # Overdue
+                        tag = f"delegasi-{r['id']}-overdue"
+                        if not _notif_already_sent('delegasi', str(r['id']), 'overdue', tag):
+                            recips = []
+                            if pic_email: recips.append(pic_email)
+                            for d in directors:
+                                if d and d not in recips: recips.append(d)
+                            if recips:
+                                subj = f"[WIJNA] Delegasi lewat tenggat: {r['judul']}"
+                                body = (
+                                    f"Tugas '{r['judul']}' (PIC: {pic_name}) telah lewat tenggat (due {due.isoformat()}).\n"
+                                    f"Mohon segera ditindaklanjuti dan update status di modul Delegasi.\n"
+                                )
+                                if _send_email(recips, subj, body):
+                                    _mark_notif_sent('delegasi', str(r['id']), 'overdue', tag, recips)
+                    elif 0 <= days_left <= 3:
+                        # Reminder window
+                        tag = f"delegasi-{r['id']}-rem-{days_left}"
+                        if not _notif_already_sent('delegasi', str(r['id']), 'reminder', tag):
+                            recips = [pic_email] if pic_email else []
+                            if recips:
+                                subj = f"[WIJNA] Reminder {days_left} hari — {r['judul']}"
+                                body = (
+                                    f"Halo {pic_name},\n\n"
+                                    f"Tugas '{r['judul']}' akan jatuh tempo pada {due.isoformat()} (sisa {days_left} hari).\n"
+                                    f"Mohon pastikan progres dan update status di modul Delegasi.\n"
+                                )
+                                if _send_email(recips, subj, body):
+                                    _mark_notif_sent('delegasi', str(r['id']), 'reminder', tag, recips)
+    except Exception:
+        # Never break dashboard rendering due to notifier
+        pass
 
 def _folder_usage_quick(service, folder_id: str) -> Dict:
     total = 0
@@ -3562,6 +3766,31 @@ def user_setting_module():
                                         pass
                                     st.success("User berhasil dihapus. Silakan refresh daftar di atas.")
 
+            # Director-only email notification settings
+            st.markdown("---")
+            st.subheader("Email Notifikasi (Dunyim) — Hanya Director")
+            if me["role"] != "director":
+                st.info("Pengaturan email hanya untuk Director.")
+            else:
+                enabled_global = (_setting_get('enable_email_notifications','false') == 'true')
+                enabled_pmr = (_setting_get('pmr_notify_enabled','true') == 'true')
+                enabled_delegasi = (_setting_get('delegasi_notify_enabled','true') == 'true')
+                colA, colB = st.columns(2)
+                with colA:
+                    ng = st.toggle("Aktifkan notifikasi email", value=enabled_global)
+                with colB:
+                    st.caption("Kredensial di secrets: [email_credentials] username/app_password")
+                colC, colD = st.columns(2)
+                with colC:
+                    np = st.toggle("PMR: Tegur otomatis jika terlambat (> tgl 5)", value=enabled_pmr)
+                with colD:
+                    nd = st.toggle("Delegasi: Pengingat ≤3 hari & Lewat tenggat", value=enabled_delegasi)
+                if st.button("Simpan Pengaturan Email", key="save_email_notif"):
+                    _setting_set('enable_email_notifications', 'true' if ng else 'false')
+                    _setting_set('pmr_notify_enabled', 'true' if np else 'false')
+                    _setting_set('delegasi_notify_enabled', 'true' if nd else 'false')
+                    st.success("Pengaturan disimpan.")
+
 # -------------------------
 # Dashboard
 # -------------------------
@@ -3572,6 +3801,12 @@ def dashboard():
     cur = conn.cursor()
     # Raw connection (hindari warning pandas karena wrapper _AuditConnection)
     raw_conn = conn._conn if hasattr(conn, '_conn') else conn
+
+    # Run lightweight automations (email notifications) once per session render
+    try:
+        run_automations_for_dashboard()
+    except Exception:
+        pass
 
 
     # --------------------------------------------------
