@@ -3652,58 +3652,76 @@ def user_setting_module():
         st.error("User tidak ditemukan di database.")
         return
 
-        # Kartu ringkas profil (rapi & ringkas)
-        email = me["email"] or "-"
-        nama = me["full_name"] or "-"
-        role = me["role"] or "-"
-        status = me["status"] or "-"
-        st.markdown(
-                f"""
-                <div style='background:#f8fafc;border:1px solid #e5efff;border-radius:12px;padding:12px 16px;margin-bottom:12px;'>
-                    <div style='display:flex;gap:24px;flex-wrap:wrap;'>
-                        <div style='min-width:260px'>
-                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Email</div>
-                            <div style='font-weight:600;font-size:16px'>{email}</div>
-                        </div>
-                        <div style='min-width:220px'>
-                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Nama</div>
-                            <div style='font-weight:600;font-size:16px'>{nama}</div>
-                        </div>
-                        <div style='min-width:160px'>
-                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Role</div>
-                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{role}</div>
-                        </div>
-                        <div style='min-width:140px'>
-                            <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Status</div>
-                            <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{status}</div>
-                        </div>
+    # Kartu ringkas profil (rapi & ringkas)
+    email = me["email"] or "-"
+    nama = me["full_name"] or "-"
+    role = me["role"] or "-"
+    status = me["status"] or "-"
+    st.markdown(
+            f"""
+            <div style='background:#f8fafc;border:1px solid #e5efff;border-radius:12px;padding:12px 16px;margin-bottom:12px;'>
+                <div style='display:flex;gap:24px;flex-wrap:wrap;'>
+                    <div style='min-width:260px'>
+                        <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Email</div>
+                        <div style='font-weight:600;font-size:16px'>{email}</div>
+                    </div>
+                    <div style='min-width:220px'>
+                        <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Nama</div>
+                        <div style='font-weight:600;font-size:16px'>{nama}</div>
+                    </div>
+                    <div style='min-width:160px'>
+                        <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Role</div>
+                        <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{role}</div>
+                    </div>
+                    <div style='min-width:140px'>
+                        <div style='color:#64748b;font-size:12px;margin-bottom:4px'>Status</div>
+                        <div style='font-weight:600;font-size:16px;text-transform:capitalize'>{status}</div>
                     </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-        )
+            </div>
+            """,
+            unsafe_allow_html=True,
+    )
 
     tab_profile, tab_admin = st.tabs(["👤 Profil Saya", "🔐 Admin (Director)"])
 
     # --- Tab 1: Profil Saya ---
     with tab_profile:
-        st.subheader("Ubah Profil")
-        with st.form("change_name_form"):
-            new_name = st.text_input("Nama Lengkap", value=me["full_name"] or "")
-            save_name = st.form_submit_button("Simpan Nama")
-            if save_name:
-                if not new_name.strip():
+        st.subheader("Ubah Identitas (Email & Nama)")
+        with st.form("change_identity_form"):
+            new_email = st.text_input("Email", value=me["email"] or "").strip()
+            new_name = st.text_input("Nama Lengkap", value=me["full_name"] or "").strip()
+            save_identity = st.form_submit_button("Simpan Profil")
+            if save_identity:
+                # Validasi sederhana
+                if not new_email or "@" not in new_email:
+                    st.warning("Masukkan email yang valid.")
+                elif not new_name:
                     st.warning("Nama tidak boleh kosong.")
                 else:
-                    cur.execute("UPDATE users SET full_name=? WHERE id=?", (new_name.strip(), me["id"]))
-                    conn.commit()
-                    # Update session juga
-                    st.session_state["user"]["full_name"] = new_name.strip()
                     try:
-                        audit_log("user_setting", "update_profile", target=me["email"], details=f"Ubah nama menjadi '{new_name.strip()}'")
-                    except Exception:
+                        # Cek duplikasi email bila berubah
+                        if (new_email.lower() != (me["email"] or "").lower()):
+                            cur.execute("SELECT 1 FROM users WHERE lower(email)=lower(?) AND id<>?", (new_email, me["id"]))
+                            if cur.fetchone():
+                                st.error("Email sudah digunakan oleh akun lain.")
+                                raise RuntimeError("email_in_use")
+                        # Lakukan update
+                        cur.execute("UPDATE users SET email=?, full_name=? WHERE id=?", (new_email, new_name, me["id"]))
+                        conn.commit()
+                        # Update session
+                        st.session_state["user"]["email"] = new_email
+                        st.session_state["user"]["full_name"] = new_name
+                        try:
+                            old_email = me["email"]
+                            old_name = me["full_name"]
+                            details = f"email: {old_email} → {new_email}; nama: {old_name} → {new_name}"
+                            audit_log("user_setting", "update_identity", target=old_email or new_email, details=details)
+                        except Exception:
+                            pass
+                        st.success("Identitas berhasil diperbarui.")
+                    except RuntimeError:
                         pass
-                    st.success("Nama berhasil diperbarui.")
 
         st.markdown("---")
         st.subheader("Ubah Password")
@@ -4116,8 +4134,6 @@ def dashboard():
             st.dataframe(df_hist, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # footer hint (optional)
-    st.caption("UI dirapikan: layout 2 baris ringkas, tabel dipadatkan. Versi dashboard baru.")
 
 # -------------------------
 # Main app flow
