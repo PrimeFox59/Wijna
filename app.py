@@ -226,6 +226,7 @@ def sop_module():
                     conn.commit()
                     try:
                         audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
+                        notify_review_request("sop", title=judul, entity_id=sid, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("SOP berhasil diupload. Menunggu approval Director.")
@@ -1361,6 +1362,69 @@ def _get_user_email_by_name(full_name: str) -> Optional[str]:
     except Exception:
         return None
 
+# --- Notification helpers for review/approval ---
+def _get_finance_emails() -> List[str]:
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        rows = cur.execute("SELECT email FROM users WHERE lower(role)='finance' AND status='active'").fetchall()
+        emails = []
+        for r in rows:
+            if isinstance(r, dict):
+                e = r.get('email')
+            else:
+                e = r[0] if r else None
+            if e and '@' in e:
+                emails.append(e)
+        return sorted(set(emails))
+    except Exception:
+        return []
+
+def notify_review_request(entity_type: str, title: str, entity_id: Optional[str] = None,
+                          recipients_roles: Tuple[str, ...] = ("finance", "director"),
+                          recipients_extra: Optional[List[str]] = None) -> None:
+    """Send an immediate email notification about a new review/approval request.
+    - entity_type: short module key, e.g., 'cash_advance', 'cuti', 'pmr', 'sop', 'notulen', 'surat_masuk', 'surat_keluar', 'inventory'
+    - title: brief display title (e.g., judul/perihal/nama pengaju)
+    - entity_id: optional id for dedup tagging
+    - recipients_roles: which roles to notify ('finance', 'director')
+    - recipients_extra: extra email addresses
+    """
+    try:
+        if not _email_enabled():
+            return
+        # Build recipient list by roles
+        recips: List[str] = []
+        roles = [r.strip().lower() for r in (recipients_roles or ())]
+        if "finance" in roles:
+            recips.extend(_get_finance_emails())
+        if "director" in roles:
+            recips.extend(_get_director_emails())
+        if recipients_extra:
+            recips.extend([e for e in recipients_extra if e and '@' in e])
+        # Deduplicate
+        recips = sorted({e.lower() for e in recips})
+        if not recips:
+            return
+        # De-duplication tag
+        tag = f"{entity_type}:{entity_id or title}"
+        if _notif_already_sent(entity_type, entity_id or '-', 'review-request', tag):
+            return
+        # Compose email
+        subj = f"[WIJNA] Permintaan review: {entity_type.replace('_',' ').title()} — {title}"
+        ts = format_datetime_wib(now_wib_iso())
+        body = (
+            f"Permintaan review/approval baru untuk modul: {entity_type}.\n"
+            f"Judul/Perihal: {title}\n"
+            f"Waktu: {ts}\n\n"
+            f"Silakan buka aplikasi WIJNA untuk meninjau dan mengambil tindakan."
+        )
+        if _send_email(recips, subj, body):
+            _mark_notif_sent(entity_type, entity_id or '-', 'review-request', tag, recips)
+    except Exception:
+        # best effort only
+        pass
+
 def run_automations_for_dashboard() -> None:
     """Lightweight email automations for Dashboard entry.
     - PMR lateness (> day 5): email to staff without PMR this month (cc Directors)
@@ -2106,6 +2170,7 @@ def inventory_module():
                             conn.commit()
                             try:
                                 audit_log("inventory", "loan_request", target=row['id'], details=f"keperluan={keperluan}; kembali={tgl_kembali}")
+                                notify_review_request("inventory", title=f"Pinjam {row['name']} oleh {user['full_name']}", entity_id=row['id'], recipients_roles=("finance","director"))
                             except Exception:
                                 pass
                             st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
@@ -2198,6 +2263,7 @@ def surat_masuk_module():
                     conn.commit()
                     try:
                         audit_log("surat_masuk", "create", target=sid, details=f"{nomor} - {perihal} ({pengirim})")
+                        notify_review_request("surat_masuk", title=f"{nomor} — {perihal}", entity_id=sid, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("Surat masuk berhasil dicatat.")
@@ -2399,6 +2465,7 @@ def surat_keluar_module():
                     try:
                         det = f"draft_file={draft_name}" if draft_name else f"draft_url={draft_url}"
                         audit_log("surat_keluar", "create", target=sid, details=f"{nomor}-{perihal}; {det}")
+                        notify_review_request("surat_keluar", title=f"Draft {nomor} — {perihal}", entity_id=sid, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("✅ Surat keluar (draft) tersimpan.")
@@ -2729,6 +2796,10 @@ def cash_advance_module():
                     audit_log("cash_advance", "create", target=cid, details=f"divisi={nama_program}; total={total}")
                 except Exception:
                     pass
+                try:
+                    notify_review_request("cash_advance", title=f"{nama_program} — {format_rp(total)}", entity_id=cid, recipients_roles=("finance","director"))
+                except Exception:
+                    pass
                 st.success("Cash advance diajukan.")
                 st.session_state['ca_nominals'] = [0.0]*10
 
@@ -2898,6 +2969,10 @@ def pmr_module():
                         audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={n1}; file2={n2 or '-'}")
                     except Exception:
                         pass
+                    try:
+                        notify_review_request("pmr", title=f"{nama} — {bulan}", entity_id=pid, recipients_roles=("finance","director"))
+                    except Exception:
+                        pass
                     st.success("Laporan bulanan berhasil diupload.")
 
     with tab_finance:
@@ -3021,6 +3096,10 @@ def delegasi_module():
                     conn.commit()
                     try:
                         audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_review_request("delegasi", title=f"{judul} → {pic}", entity_id=did, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("Tugas berhasil dibuat.")
@@ -3544,6 +3623,10 @@ def notulen_module():
                     conn.commit()
                     try:
                         audit_log("notulen", "upload", target=nid, details=f"{judul} {tgl or ''}; file={fname}")
+                    except Exception:
+                        pass
+                    try:
+                        notify_review_request("notulen", title=judul, entity_id=nid, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("Notulen berhasil diupload. Menunggu approval Director.")
@@ -4423,6 +4506,10 @@ def main():
                         (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, new_cuti_terpakai, new_sisa, "Menunggu Review Finance"),
                     )
                     conn.commit()
+                    try:
+                        notify_review_request("cuti", title=f"{nama} — {durasi} hari", entity_id=cid, recipients_roles=("finance","director"))
+                    except Exception:
+                        pass
                     st.success("Pengajuan cuti berhasil diajukan.")
                     # Audit trail
                     try:
