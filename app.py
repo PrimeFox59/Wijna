@@ -4138,12 +4138,9 @@ def user_setting_module():
                                         pass
                                     st.success("User berhasil dihapus. Silakan refresh daftar di atas.")
 
-            # Email notification settings (Director & Superuser)
+            # Email notification settings (Director & Superuser) in expanders
             st.markdown("---")
-            st.subheader("Email Notifikasi (Dunyim) — Director/Superuser")
-            if not has_min_role("director"):
-                st.info("Pengaturan email hanya untuk Director/Superuser.")
-            else:
+            with st.expander("Email Notifikasi (Dunyim) — Director/Superuser", expanded=False):
                 enabled_global = (_setting_get('enable_email_notifications','false') == 'true')
                 enabled_pmr = (_setting_get('pmr_notify_enabled','true') == 'true')
                 enabled_delegasi = (_setting_get('delegasi_notify_enabled','true') == 'true')
@@ -4170,8 +4167,7 @@ def user_setting_module():
                     _setting_set('delegasi_deadline_autoshift', 'true' if na else 'false')
                     st.success("Pengaturan disimpan.")
 
-                # Test email notification block
-                st.markdown("#### 🔔 Kirim Email Uji Coba")
+            with st.expander("🔔 Kirim Email Uji Coba", expanded=False):
                 st.caption("Gunakan ini untuk menguji apakah konfigurasi SMTP dan pengiriman email berjalan.")
                 with st.form("test_email_form"):
                     default_to = me["email"] or ""
@@ -4180,11 +4176,9 @@ def user_setting_module():
                     body = st.text_area("Isi Pesan", value="Ini adalah email uji dari WIJNA Manajemen System.")
                     submit_test = st.form_submit_button("Kirim Email Tes")
                     if submit_test:
-                        # Basic validations
                         if not test_to or "@" not in test_to:
                             st.warning("Masukkan alamat email tujuan yang valid.")
                         else:
-                            # Attempt sending
                             ok = False
                             try:
                                 ok = _send_email([test_to], subject.strip(), body)
@@ -4193,11 +4187,50 @@ def user_setting_module():
                             if ok:
                                 st.success(f"Email uji berhasil dikirim ke {test_to}.")
                             else:
-                                # Provide hints if failed
                                 st.error("Gagal mengirim email uji. Periksa kembali kredensial di secrets dan koneksi internet.")
                                 usern, apppw = _smtp_settings()
                                 if not usern or not apppw:
                                     st.info("Hint: Pastikan secrets.email_credentials.username dan app_password terisi.")
+
+            # Aksi User Management moved inside Admin tab
+            st.markdown("---")
+            st.subheader("Aksi User Management")
+            conn3 = get_db()
+            cur3 = conn3.cursor()
+            cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC")
+            user_rows = cur3.fetchall()
+            conn3.close()
+            user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
+            user_id_map = {f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}": row['id'] for row in user_rows}
+            with st.form("admin_change"):
+                selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
+                uid = user_id_map[selected_user] if selected_user else ""
+                newrole = st.selectbox("Pilih role baru", ["staff","board","finance","director","superuser"])
+                newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
+                action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"])
+                submit = st.form_submit_button("Apply")
+                if submit:
+                    conn3 = get_db()
+                    cur3 = conn3.cursor()
+                    if not uid:
+                        st.error("Masukkan user id.")
+                    else:
+                        if action == "Update User":
+                            if newpw:
+                                cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
+                            else:
+                                cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
+                            conn3.commit()
+                            st.success("User updated.")
+                        elif action == "Approve":
+                            cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,))
+                            conn3.commit()
+                            st.success("User diapprove.")
+                        elif action == "Reject":
+                            cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,))
+                            conn3.commit()
+                            st.info("User di-set inactive.")
+                    conn3.close()
     
     with tab1:
         st.subheader("User baru menunggu approval")
@@ -4260,46 +4293,7 @@ def user_setting_module():
             st.info("Tidak ada user pending.")
         conn1.close()
     
-    # Only one form, outside the tabs
-    st.markdown("---")
-    st.subheader("Aksi User Management")
-    # Fetch all users for dropdown
-    conn3 = get_db()
-    cur3 = conn3.cursor()
-    cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC")
-    user_rows = cur3.fetchall()
-    conn3.close()
-    user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
-    user_id_map = {f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}": row['id'] for row in user_rows}
-    with st.form("admin_change"):
-        selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
-        uid = user_id_map[selected_user] if selected_user else ""
-        newrole = st.selectbox("Pilih role baru", ["staff","finance","director","superuser"])
-        newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
-        action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"])
-        submit = st.form_submit_button("Apply")
-        if submit:
-            conn3 = get_db()
-            cur3 = conn3.cursor()
-            if not uid:
-                st.error("Masukkan user id.")
-            else:
-                if action == "Update User":
-                    if newpw:
-                        cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
-                    else:
-                        cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
-                    conn3.commit()
-                    st.success("User updated.")
-                elif action == "Approve":
-                    cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,))
-                    conn3.commit()
-                    st.success("User diapprove.")
-                elif action == "Reject":
-                    cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,))
-                    conn3.commit()
-                    st.info("User di-set inactive.")
-            conn3.close()
+    # (Aksi User Management dipindahkan ke dalam tab Admin)
 
     with tab2:
         st.subheader("Semua user")
