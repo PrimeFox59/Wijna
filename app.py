@@ -784,12 +784,12 @@ def generate_cashadvance_monthly_rekap():
         pass
     
 def audit_log(modul: str, action: str, target=None, details=None, actor=None):
-    """Write an audit log entry to file_log.
-    - modul: name of module (e.g., 'auth', 'cuti', 'delegasi')
+    """Write a simplified activity record into audit_logs.
+    - modul: logical module name (e.g., 'auth', 'cuti', 'delegasi')
     - action: verb (e.g., 'login', 'logout', 'create', 'update', 'delete', 'approve', 'review')
-    - target: entity id/name being acted on
-    - details: optional human-readable info
-    - actor: email/name of actor; defaults to current user's email if available
+    - target: optional entity id/name
+    - details: optional additional information
+    - actor: user email/name; if None, inferred from session
     """
     try:
         # prevent recursive logging
@@ -802,28 +802,23 @@ def audit_log(modul: str, action: str, target=None, details=None, actor=None):
         if not actor:
             u = st.session_state.get("user")
             actor = (u.get("email") or u.get("full_name")) if u else "-"
-        # Check available columns
-        cur.execute("PRAGMA table_info(file_log)")
-        cols = {row[1] for row in cur.fetchall()}
-        # Build insert dynamically
-        data = {
-            "id": gen_id("log"),
-            "modul": modul,
-            "file_name": target or "",
-            "versi": 1,
-            "uploaded_by": actor,
-            "tanggal_upload": now,
-            "alasan": (details or ""),
-            "action": action,
-        }
-        insert_cols = [c for c in ["id","modul","file_name","versi",
-                                    "uploaded_by" if "uploaded_by" in cols else None,
-                                    "tanggal_upload" if "tanggal_upload" in cols else None,
-                                    "alasan",
-                                    "action" if "action" in cols else None] if c]
-        placeholders = ", ".join(["?" for _ in insert_cols])
-        cur.execute(f"INSERT INTO file_log ({', '.join(insert_cols)}) VALUES ({placeholders})",
-                    [data[c] for c in insert_cols])
+        # Compose detail text
+        parts = []
+        if modul:
+            parts.append(f"[{modul}]")
+        if target:
+            parts.append(str(target))
+        if details:
+            parts.append(str(details))
+        detail_text = " ".join([p for p in parts if p]).strip() or "-"
+        # Insert into simplified audit table
+        cur.execute(
+            """
+            INSERT INTO audit_logs (user_email, action, details, timestamp)
+            VALUES (?, ?, ?, ?)
+            """,
+            (actor or "-", action or "-", detail_text, now),
+        )
         conn.commit()
     except Exception:
         pass
@@ -4871,92 +4866,56 @@ def audit_trail_module():
     st.header("🕵️ Audit Trail / Log Aktivitas")
     conn = get_db()
     cur = conn.cursor()
-    # Filter
-    st.markdown("#### Filter Audit Trail")
-    # Cek kolom di file_log
-    cur.execute("PRAGMA table_info(file_log)")
-    cols = [row[1] for row in cur.fetchall()]
-    # Build user list
-    user_fields = []
-    if "uploaded_by" in cols:
-        user_fields.append("uploaded_by")
-    if "deleted_by" in cols:
-        user_fields.append("deleted_by")
-    user_fields.append("file_name")
-    user_union = " UNION ".join([f"SELECT DISTINCT {f} as user FROM file_log" for f in user_fields])
-    users = [r[0] for r in cur.execute(user_union).fetchall() if r[0]]
-    actions = ["All", "Upload", "Delete", "Login", "Other"]
-    selected_user = st.selectbox("User", ["All"] + users)
-    selected_action = st.selectbox("Action", actions)
-    date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=30))
-    date_max = st.date_input("Sampai tanggal", value=date.today())
-    # Query
-    query = "SELECT * FROM file_log WHERE 1=1"
-    params = []
-    if selected_user != "All":
-        user_cond = []
-        if "uploaded_by" in cols:
-            user_cond.append("uploaded_by=?")
-            params.append(selected_user)
-        if "deleted_by" in cols:
-            user_cond.append("deleted_by=?")
-            params.append(selected_user)
-        user_cond.append("file_name=?")
-        params.append(selected_user)
-        query += " AND (" + " OR ".join(user_cond) + ")"
-    if selected_action != "All":
-        if selected_action == "Upload" and "uploaded_by" in cols:
-            query += " AND uploaded_by IS NOT NULL AND uploaded_by != ''"
-        elif selected_action == "Delete" and "deleted_by" in cols:
-            query += " AND deleted_by IS NOT NULL AND deleted_by != ''"
-        elif selected_action == "Login":
-            query += " AND modul='auth'"
-        else:
-            query += " AND modul NOT IN ('auth')"
-    # Tentukan kolom tanggal utama untuk filter
-    date_cols = [c for c in ["tanggal_upload", "tanggal_hapus"] if c in cols]
-    date_col = None
-    if date_cols:
-        # Gunakan COALESCE jika dua-duanya ada
-        if len(date_cols) == 2:
-            date_expr = f"COALESCE({date_cols[0]}, {date_cols[1]}, '')"
-        else:
-            date_expr = date_cols[0]
-        date_col = date_expr
-    else:
-        # Fallback: cari kolom string lain (misal alasan, id, versi)
-        fallback = [c for c in ["alasan", "id", "versi"] if c in cols]
-        if fallback:
-            date_col = fallback[0]
-        else:
-            date_col = None
-    if date_col:
-        query += f" AND ({date_col} >= ? AND {date_col} <= ?)"
-        params += [date_min.isoformat(), (date_max + timedelta(days=1)).isoformat()]
-    df = pd.read_sql_query(query, conn, params=params)
-    # Tampilkan hasil
+    # Simple filters for Activity view (audit_logs)
+    st.markdown("#### Activity")
+    c1, c2 = st.columns(2)
+    with c1:
+        date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=7))
+    with c2:
+        date_max = st.date_input("Sampai tanggal", value=date.today())
+    q = st.text_input("Cari (Nama/Action/Detail)", "")
+
+    # Load from audit_logs with basic range filter
+    try:
+        params: List = []
+        query = "SELECT user_email as nama_user, timestamp as tanggal, action, details FROM audit_logs WHERE 1=1"
+        if date_min:
+            query += " AND date(timestamp) >= date(?)"
+            params.append(date_min.isoformat())
+        if date_max:
+            query += " AND date(timestamp) <= date(?)"
+            params.append(date_max.isoformat())
+        query += " ORDER BY timestamp DESC"
+        df = pd.read_sql_query(query, conn, params=params)
+    except Exception:
+        df = pd.DataFrame(columns=["nama_user","tanggal","action","details"])
+
+    # Quick search filter
+    if q and not df.empty:
+        ql = q.lower()
+        def _has(x):
+            try:
+                return ql in str(x).lower()
+            except Exception:
+                return False
+        mask = df.apply(lambda r: _has(r.get("nama_user")) or _has(r.get("action")) or _has(r.get("details")), axis=1)
+        df = df[mask]
+
+    # Present concise columns with nicer headers
     if not df.empty:
-        # Tambah kolom tanggal utama untuk sort/tampil
-        if set(["tanggal_upload","tanggal_hapus"]).issubset(set(df.columns)):
-            df["tanggal_utama"] = df["tanggal_upload"].fillna("")
-            df.loc[df["tanggal_utama"]=="", "tanggal_utama"] = df["tanggal_hapus"].fillna("")
-        elif "tanggal_upload" in df.columns:
-            df["tanggal_utama"] = df["tanggal_upload"]
-        elif "tanggal_hapus" in df.columns:
-            df["tanggal_utama"] = df["tanggal_hapus"]
-        else:
-            df["tanggal_utama"] = ""
-        # Sort terbaru dulu
+        df_present = df.rename(columns={
+            "nama_user": "Nama User",
+            "tanggal": "Date",
+            "action": "Action",
+            "details": "Detail",
+        })[["Nama User","Date","Action","Detail"]]
+        st.dataframe(df_present, use_container_width=True)
         try:
-            df = df.sort_values(by="tanggal_utama", ascending=False)
+            st.download_button("Download CSV", df_present.to_csv(index=False).encode("utf-8"), file_name="audit_activity.csv")
         except Exception:
             pass
-        st.dataframe(df, width='stretch')
-        # Download
-        try:
-            st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), file_name="audit_trail.csv")
-        except Exception:
-            pass
+    else:
+        st.info("Belum ada aktivitas.")
 if __name__ == "__main__":
     ensure_db()
     main()
