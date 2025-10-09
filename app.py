@@ -1246,7 +1246,7 @@ def dunyim_security_module():
                 _setting_set('gdrive_folder_id', fld)
             _setting_set('project_capacity_bytes', str(cap))
             st.success("Pengaturan disimpan.")
-            st.experimental_rerun()
+            st.rerun()
     if not folder_id:
         st.info("Masukkan Folder ID terlebih dahulu.")
         return
@@ -1308,7 +1308,7 @@ def dunyim_security_module():
             if st.button("Hapus"):
                 try:
                     _drive_delete(service, mp[sel])
-                    st.success("Terhapus."); st.experimental_rerun()
+                    st.success("Terhapus."); st.rerun()
                 except Exception as e:
                     st.error(f"Gagal hapus: {e}")
     # Sync DB
@@ -1386,7 +1386,7 @@ def dunyim_security_module():
                 try:
                     conn = get_db(); cur = conn.cursor()
                     cur.execute("INSERT INTO record_notes (note, created_by) VALUES (?,?)", (t.strip(), user['email']))
-                    conn.commit(); st.success("Tersimpan."); st.experimental_rerun()
+                    conn.commit(); st.success("Tersimpan."); st.rerun()
                 except Exception as e:
                     st.error(f"Gagal menyimpan: {e}")
         try:
@@ -2726,7 +2726,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status review finance diperbarui.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # --- Tab 3: Approval Director ---
     with tabs[2]:
@@ -2750,7 +2750,7 @@ def flex_module():
                         except Exception:
                             pass
                         st.success("Status approval director diperbarui.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # --- Tab 4: Daftar Flex ---
     with tabs[3]:
@@ -2825,7 +2825,7 @@ def kalender_pemakaian_mobil_kantor():
                         except Exception:
                             pass
                         st.success("Jadwal dihapus.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # Tab 2: Daftar Booking & Filter (semua user)
     with tab2:
