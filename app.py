@@ -4643,12 +4643,11 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
-    # CSS agar tombol navigasi seragam & full-width di sidebar
+    # CSS agar tombol navigasi seragam dan rapi
     st.sidebar.markdown(
         """
         <style>
-        /* Sidebar-only button styling */
-        section[data-testid="stSidebar"] .stButton > button {
+        .wijna-nav-btn > button {
             width: 100% !important;
             min-height: 42px !important;
             font-size: 1.05rem !important;
@@ -4662,16 +4661,19 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Navigasi Modul")
-    # Tampilkan tombol navigasi satu kolom (full-width), seragam
-    for key, label in menu:
-        if st.sidebar.button(label, key=f"nav_{key}", help=key):
-            st.session_state["page"] = key
-            st.rerun()
+    nav_cols = st.sidebar.columns(2)
+    for idx, (key, label) in enumerate(menu):
+        col = nav_cols[idx % 2]
+        with col:
+            btn = st.button(label, key=f"nav_{key}", help=key, use_container_width=True)
+            if btn:
+                st.session_state["page"] = key
+                st.rerun()
 
-    # --- Logout button: dipisahkan dari grid, full-width mengikuti sidebar ---
+    # --- Logout button at the very bottom ---
     if user:
         st.sidebar.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
-        if st.sidebar.button("Logout", key="sidebar_logout"):
+        if st.sidebar.button("Logout", key="sidebar_logout", use_container_width=True):
             logout()
             st.rerun()
 
