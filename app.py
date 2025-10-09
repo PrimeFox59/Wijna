@@ -1445,6 +1445,94 @@ def notify_review_request(entity_type: str, title: str, entity_id: Optional[str]
         # best effort only
         pass
 
+# --- Helpers: Public Holiday utilities & working days ---
+def _get_all_active_emails() -> List[str]:
+    """Return all active user emails (deduped, lowercase)."""
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE status='active' AND email IS NOT NULL AND email<>''")
+        rows = cur.fetchall() or []
+        emails: List[str] = []
+        for r in rows:
+            e = r['email'] if isinstance(r, dict) else (r[0] if r else None)
+            if e and '@' in e:
+                emails.append(str(e).strip().lower())
+        return sorted(set(emails))
+    except Exception:
+        return []
+
+def _list_public_holidays_between(d1: date, d2: date) -> List[date]:
+    """List all public holiday dates between inclusive d1..d2 using calendar.is_holiday=1 ranges.
+    Falls back to public_holidays single-day entries if available.
+    """
+    if d2 < d1:
+        d1, d2 = d2, d1
+    out: List[date] = []
+    try:
+        conn = get_db(); cur = conn.cursor()
+        # Ranged holidays from calendar table
+        try:
+            q = "SELECT tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1 AND NOT (date(tgl_selesai) < date(?) OR date(tgl_mulai) > date(?))"
+            rows = cur.execute(q, (d1.isoformat(), d2.isoformat())).fetchall() or []
+            for r in rows:
+                try:
+                    s = pd.to_datetime(r['tgl_mulai'] if isinstance(r, dict) else r[0]).date()
+                    e = pd.to_datetime(r['tgl_selesai'] if isinstance(r, dict) else r[1]).date()
+                except Exception:
+                    continue
+                if e < s:
+                    s, e = e, s
+                cur_d = s
+                while cur_d <= e:
+                    out.append(cur_d)
+                    cur_d += timedelta(days=1)
+        except Exception:
+            pass
+        # Single-day fallback from public_holidays
+        try:
+            q2 = "SELECT tanggal FROM public_holidays WHERE date(tanggal) BETWEEN date(?) AND date(?)"
+            rows2 = cur.execute(q2, (d1.isoformat(), d2.isoformat())).fetchall() or []
+            for r in rows2:
+                try:
+                    out.append(pd.to_datetime(r['tanggal'] if isinstance(r, dict) else r[0]).date())
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    except Exception:
+        return out
+    # Dedup
+    return sorted(set(out))
+
+def _is_public_holiday(d: date) -> bool:
+    try:
+        holidays = _list_public_holidays_between(d, d)
+        return len(holidays) > 0
+    except Exception:
+        return False
+
+def _next_working_day(d: date) -> date:
+    """Return the next date >= d that is not a public holiday (weekends still allowed unless managed as holiday)."""
+    cur = d
+    for _ in range(366):
+        if not _is_public_holiday(cur):
+            return cur
+        cur = cur + timedelta(days=1)
+    return d
+
+def _count_days_excluding_holidays(d1: date, d2: date) -> int:
+    """Inclusive day count excluding any days that are public holidays."""
+    if d2 < d1:
+        d1, d2 = d2, d1
+    holidays = set(_list_public_holidays_between(d1, d2))
+    count = 0
+    cur = d1
+    while cur <= d2:
+        if cur not in holidays:
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
 def run_automations_for_dashboard() -> None:
     """Lightweight email automations for Dashboard entry.
     - PMR lateness (> day 5): email to staff without PMR this month (cc Directors)
