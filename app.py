@@ -3080,11 +3080,35 @@ def delegasi_module():
         with st.form("del_add"):
             judul = st.text_input("Judul Tugas")
             deskripsi = st.text_area("Deskripsi")
-            pic = st.text_input("Penanggung Jawab (PIC)")
+            # PIC dropdown from active users
+            try:
+                cur.execute("SELECT id, full_name, email, role, status FROM users WHERE status='active' ORDER BY COALESCE(NULLIF(full_name,''), email)")
+                _users = cur.fetchall() or []
+            except Exception:
+                _users = []
+            pic_value = None
+            if _users:
+                def _fmt_user(u):
+                    try:
+                        fn = u["full_name"] if isinstance(u, dict) else u[1]
+                        em = u["email"] if isinstance(u, dict) else u[2]
+                    except Exception:
+                        # Fallback indexes for sqlite3.Row
+                        fn = u[1] if len(u) > 1 else None
+                        em = u[2] if len(u) > 2 else None
+                    return f"{fn} ({em})" if fn else (em or "-")
+                selected_user = st.selectbox("Penanggung Jawab (PIC)", options=_users, format_func=_fmt_user, key="del_pic_select")
+                try:
+                    pic_value = (selected_user["full_name"] if isinstance(selected_user, dict) else selected_user[1]) or (selected_user["email"] if isinstance(selected_user, dict) else selected_user[2])
+                except Exception:
+                    pic_value = None
+            else:
+                st.info("Daftar user aktif kosong, masukkan PIC secara manual.")
+                pic_value = st.text_input("Penanggung Jawab (PIC)")
             tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
             tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
             if st.form_submit_button("Buat Tugas"):
-                if not (judul and deskripsi and pic):
+                if not (judul and deskripsi and pic_value):
                     st.warning("Semua field wajib diisi.")
                 elif tgl_selesai < tgl_mulai:
                     st.warning("Tanggal selesai tidak boleh sebelum mulai.")
@@ -3092,14 +3116,14 @@ def delegasi_module():
                     did = gen_id("del")
                     now = now_wib_iso()
                     cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
-                        (did, judul, deskripsi, pic, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
+                        (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
                     conn.commit()
                     try:
-                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic} {tgl_mulai}..{tgl_selesai}")
+                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic_value} {tgl_mulai}..{tgl_selesai}")
                     except Exception:
                         pass
                     try:
-                        notify_review_request("delegasi", title=f"{judul} → {pic}", entity_id=did, recipients_roles=("director",))
+                        notify_review_request("delegasi", title=f"{judul} → {pic_value}", entity_id=did, recipients_roles=("director",))
                     except Exception:
                         pass
                     st.success("Tugas berhasil dibuat.")
@@ -3107,7 +3131,18 @@ def delegasi_module():
     # Tab 2: Update Status & Upload Bukti (PIC)
     with tab2:
         st.markdown("### 📝 PIC Update Status & Upload Bukti")
-        tugas_pic = pd.read_sql_query("SELECT * FROM delegasi WHERE pic=? ORDER BY tgl_selesai ASC", conn, params=(user["full_name"],))
+        # Match tasks where PIC equals current user's full_name or email (fallback)
+        _u_name = user.get("full_name") if isinstance(user, dict) else None
+        _u_mail = user.get("email") if isinstance(user, dict) else None
+        if _u_name and _u_mail:
+            _sql = "SELECT * FROM delegasi WHERE pic IN (?, ?) ORDER BY tgl_selesai ASC"
+            tugas_pic = pd.read_sql_query(_sql, conn, params=(_u_name, _u_mail))
+        elif _u_name or _u_mail:
+            _val = _u_name or _u_mail
+            _sql = "SELECT * FROM delegasi WHERE pic=? ORDER BY tgl_selesai ASC"
+            tugas_pic = pd.read_sql_query(_sql, conn, params=(_val,))
+        else:
+            tugas_pic = pd.read_sql_query("SELECT * FROM delegasi ORDER BY tgl_selesai ASC", conn)
         filter_status = st.selectbox("Filter Status", ["Semua", "Belum Selesai", "Proses", "Selesai"], key="filter_status_pic")
         if filter_status != "Semua":
             tugas_pic = tugas_pic[tugas_pic["status"] == filter_status]
