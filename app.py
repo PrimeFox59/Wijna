@@ -4487,11 +4487,14 @@ def dashboard():
             except Exception: return pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
         df_cuti = safe_df("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1")
         df_flex = safe_df("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1")
-        df_delegasi = safe_df("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi")
+        # Sertakan status untuk delegasi agar bisa diwarnai selesai/overdue/dll
+        df_delegasi = safe_df("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai, status FROM delegasi")
+        # Tambahkan MoU untuk pewarnaan jatuh tempo
+        df_mou = safe_df("SELECT nama as judul, 'MoU' as jenis, divisi as nama_divisi, tgl_mulai, tgl_selesai FROM mou")
         df_rapat = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'")
         df_mobil = safe_df("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'")
         df_libur = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1")
-        df_all = pd.concat([df_cuti, df_flex, df_delegasi, df_rapat, df_mobil, df_libur], ignore_index=True)
+        df_all = pd.concat([df_cuti, df_flex, df_delegasi, df_mou, df_rapat, df_mobil, df_libur], ignore_index=True)
         if df_all.empty:
             st.markdown("<div class='empty-hint'>Tidak ada event.</div>", unsafe_allow_html=True)
         else:
@@ -4502,13 +4505,79 @@ def dashboard():
             if df_30.empty:
                 st.markdown("<div class='empty-hint'>Tidak ada event periode ini.</div>", unsafe_allow_html=True)
             else:
-                color_map = {'Cuti':'#f59e42','Flex Time':'#38bdf8','Delegasi':'#a78bfa','Rapat':'#f472b6','Mobil Kantor':'#34d399','Libur Nasional':'#ef4444'}
+                # Legend sesuai permintaan
+                st.markdown(
+                    """
+                    <div style='font-size:.72rem;margin-bottom:.35rem;display:flex;flex-wrap:wrap;gap:.5rem 1rem;'>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:2px;margin-right:6px'></span>Merah: overdue/kritikal</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#facc15;border-radius:2px;margin-right:6px'></span>Kuning: ≤7 hari ke due</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#fb923c;border-radius:2px;margin-right:6px'></span>Oranye: ≤3 hari (peringatan)</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;margin-right:6px'></span>Biru: Cuti</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#a855f7;border-radius:2px;margin-right:6px'></span>Ungu: Flex</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px;margin-right:6px'></span>Hijau: Tugas selesai</span>
+                        <span><span style='display:inline-block;width:10px;height:10px;background:#111827;border-radius:2px;margin-right:6px'></span>Abu/Hitam: Mobil kantor</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                def _badge_color(row) -> str:
+                    j = (row.get('jenis') or '').strip()
+                    # Default gray for unspecified
+                    default = '#64748b'
+                    today_dt = pd.to_datetime(date.today())
+                    # Delegasi: selesai -> hijau; overdue -> merah; <=3 hari -> oranye; <=7 hari -> kuning
+                    if j == 'Delegasi':
+                        status = str(row.get('status') or '').strip().lower()
+                        if status in ('selesai','done','completed','finish','finished'):
+                            return '#22c55e'  # hijau
+                        try:
+                            end = pd.to_datetime(row.get('tgl_selesai'))
+                            if pd.isna(end):
+                                return default
+                            if end.date() < today_dt.date():
+                                return '#ef4444'  # merah overdue
+                            days = (end.date() - today_dt.date()).days
+                            if days <= 3:
+                                return '#fb923c'  # oranye ≤3
+                            if days <= 7:
+                                return '#facc15'  # kuning ≤7
+                        except Exception:
+                            return default
+                        return default
+                    # MoU: overdue -> merah; ≤7 hari -> kuning
+                    if j == 'MoU':
+                        try:
+                            end = pd.to_datetime(row.get('tgl_selesai'))
+                            if pd.isna(end):
+                                return default
+                            if end.date() < today_dt.date():
+                                return '#ef4444'
+                            days = (end.date() - today_dt.date()).days
+                            if days <= 7:
+                                return '#facc15'
+                        except Exception:
+                            return default
+                        return default
+                    # Cuti: biru
+                    if j == 'Cuti':
+                        return '#3b82f6'
+                    # Flex: ungu
+                    if j == 'Flex Time':
+                        return '#a855f7'
+                    # Mobil kantor: abu-abu/hitam
+                    if j == 'Mobil Kantor':
+                        return '#111827'
+                    # Rapat/Libur dan lainnya
+                    return default
+
                 st.markdown("<ul style='padding-left:1.05em;margin:0;'>", unsafe_allow_html=True)
                 for _, r in df_30.iterrows():
                     t1 = r['tgl_mulai'].strftime('%d-%m')
                     t2 = r['tgl_selesai'].strftime('%d-%m')
                     rng = t1 if t1==t2 else f"{t1}-{t2}"
-                    badge = f"<span style='background:{color_map.get(r['jenis'],'#64748b')};color:#fff;padding:2px 8px;border-radius:6px;font-size:.63rem'>{r['jenis']}</span>"
+                    badge_color = _badge_color(r)
+                    badge = f"<span style='background:{badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:.63rem'>{r['jenis']}</span>"
                     st.markdown(f"<li style='margin-bottom:2px;font-size:.72rem'><b>{r['judul']}</b> {badge} <span style='color:#2563eb'>({rng})</span></li>", unsafe_allow_html=True)
                 st.markdown("</ul>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
