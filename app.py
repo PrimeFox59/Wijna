@@ -4542,14 +4542,24 @@ def audit_trail_module():
     # Load from audit_logs with basic range filter
     try:
         params: List = []
-        query = "SELECT user_email as nama_user, timestamp as tanggal, action, details FROM audit_logs WHERE 1=1"
+        # Join to users to show Full Name before email in Nama User column
+        query = (
+            "SELECT "
+            "CASE WHEN u.full_name IS NOT NULL AND TRIM(u.full_name) <> '' "
+            "THEN u.full_name || ' (' || a.user_email || ')' "
+            "ELSE a.user_email END AS nama_user, "
+            "a.timestamp AS tanggal, a.action, a.details "
+            "FROM audit_logs a "
+            "LEFT JOIN users u ON lower(u.email) = lower(a.user_email) "
+            "WHERE 1=1"
+        )
         if date_min:
-            query += " AND date(timestamp) >= date(?)"
+            query += " AND date(a.timestamp) >= date(?)"
             params.append(date_min.isoformat())
         if date_max:
-            query += " AND date(timestamp) <= date(?)"
+            query += " AND date(a.timestamp) <= date(?)"
             params.append(date_max.isoformat())
-        query += " ORDER BY timestamp DESC"
+        query += " ORDER BY a.timestamp DESC"
         df = pd.read_sql_query(query, conn, params=params)
     except Exception:
         df = pd.DataFrame(columns=["nama_user","tanggal","action","details"])
