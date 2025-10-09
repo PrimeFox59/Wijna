@@ -2118,7 +2118,7 @@ def inventory_module():
 def surat_masuk_module():
     st.header("📥 Surat Masuk")
     user = get_current_user()
-    allowed_roles = ["staf", "finance", "director", "superuser"]
+    allowed_roles = ["staff", "finance", "director", "superuser"]
     if not user or user["role"] not in allowed_roles:
         st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
         return
@@ -3756,7 +3756,8 @@ def user_setting_module():
     # --- Tab 2: Admin (Director) ---
     with tab_admin:
         st.subheader("Admin User (Khusus Director/Superuser)")
-        if (st.session_state.get("user", {}).get("role") not in ["director", "superuser"]):
+        # Gunakan role hierarchy helper: superuser otomatis lolos
+        if not has_min_role("director"):
             st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
         else:
             # Cek kolom untuk sorting
@@ -3835,11 +3836,11 @@ def user_setting_module():
                                         pass
                                     st.success("User berhasil dihapus. Silakan refresh daftar di atas.")
 
-            # Director-only email notification settings
+            # Email notification settings (Director & Superuser)
             st.markdown("---")
-            st.subheader("Email Notifikasi (Dunyim) — Hanya Director")
-            if me["role"] != "director":
-                st.info("Pengaturan email hanya untuk Director.")
+            st.subheader("Email Notifikasi (Dunyim) — Director/Superuser")
+            if not has_min_role("director"):
+                st.info("Pengaturan email hanya untuk Director/Superuser.")
             else:
                 enabled_global = (_setting_get('enable_email_notifications','false') == 'true')
                 enabled_pmr = (_setting_get('pmr_notify_enabled','true') == 'true')
