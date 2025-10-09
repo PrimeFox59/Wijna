@@ -230,6 +230,10 @@ def sop_module():
                     except Exception:
                         pass
                     st.success("SOP berhasil diupload. Menunggu approval Director.")
+                _sop_title = st.text_input("Judul SOP/Kebijakan", key="sop_title_stub")
+                _sop_submit = st.form_submit_button("Simpan (stub)")
+                if _sop_submit:
+                    st.info("Form SOP sedang disederhanakan; gunakan modul SOP pada versi lengkap untuk upload.")
 
     # --- Tab 2: Daftar & Rekap ---
     with tab_daftar:
@@ -591,6 +595,22 @@ def ensure_db():
             tanggal_update TEXT
         )
         """)
+        # Ensure workflow columns for Delegasi exist
+        try:
+            cur.execute("PRAGMA table_info(delegasi)")
+            _del_cols = {row[1] for row in cur.fetchall()}
+            if "created_by" not in _del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN created_by TEXT")
+            if "review_status" not in _del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN review_status TEXT")
+            if "review_note" not in _del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN review_note TEXT")
+            if "review_time" not in _del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN review_time TEXT")
+            if "reviewed_by" not in _del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN reviewed_by TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS mobil (
             id TEXT PRIMARY KEY,
@@ -3088,20 +3108,23 @@ def delegasi_module():
                 _users = []
             pic_value = None
             if _users:
-                def _fmt_user(u):
+                # Build safe (label, value) options to avoid serializing Row objects
+                _opts = []
+                for u in _users:
                     try:
                         fn = u["full_name"] if isinstance(u, dict) else u[1]
                         em = u["email"] if isinstance(u, dict) else u[2]
                     except Exception:
-                        # Fallback indexes for sqlite3.Row
                         fn = u[1] if len(u) > 1 else None
                         em = u[2] if len(u) > 2 else None
-                    return f"{fn} ({em})" if fn else (em or "-")
-                selected_user = st.selectbox("Penanggung Jawab (PIC)", options=_users, format_func=_fmt_user, key="del_pic_select")
-                try:
-                    pic_value = (selected_user["full_name"] if isinstance(selected_user, dict) else selected_user[1]) or (selected_user["email"] if isinstance(selected_user, dict) else selected_user[2])
-                except Exception:
-                    pic_value = None
+                    label = f"{fn} ({em})" if fn else (em or "-")
+                    value = fn or em or ""
+                    if value:
+                        _opts.append((label, value))
+                labels = [o[0] for o in _opts]
+                selected_label = st.selectbox("Penanggung Jawab (PIC)", options=labels, key="del_pic_select")
+                # Map back to value
+                pic_value = dict(_opts).get(selected_label)
             else:
                 st.info("Daftar user aktif kosong, masukkan PIC secara manual.")
                 pic_value = st.text_input("Penanggung Jawab (PIC)")
@@ -3115,8 +3138,18 @@ def delegasi_module():
                 else:
                     did = gen_id("del")
                     now = now_wib_iso()
-                    cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
-                        (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
+                    created_by = user.get('email') or user.get('full_name')
+                    try:
+                        cur.execute("PRAGMA table_info(delegasi)")
+                        _del_cols = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        _del_cols = set()
+                    if {"created_by","review_status"}.issubset(_del_cols):
+                        cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now, created_by, "Pending"))
+                    else:
+                        cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
+                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
                     conn.commit()
                     try:
                         audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic_value} {tgl_mulai}..{tgl_selesai}")
@@ -3171,6 +3204,64 @@ def delegasi_module():
                         except Exception:
                             pass
                         st.success("Status tugas diperbarui.")
+
+                # Approval/Reject by Pemberi Tugas (creator)
+                # fetch creator lazily
+                try:
+                    _created_by = row['created_by'] if 'created_by' in row.index else None
+                except Exception:
+                    _created_by = None
+                if not _created_by:
+                    r2 = cur.execute("SELECT created_by FROM delegasi WHERE id=?", (row['id'],)).fetchone()
+                    _created_by = r2[0] if r2 and len(r2) > 0 else None
+                if _created_by and (user.get('email') == _created_by or user.get('full_name') == _created_by):
+                    st.markdown("---")
+                    st.write("Approval oleh Pemberi Tugas")
+                    note = st.text_area("Catatan (wajib saat reject)", key=f"rev_note_{row['id']}")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        approve_btn = st.button("Approve", key=f"approve_{row['id']}")
+                    with col2:
+                        reject_btn = st.button("Reject", key=f"reject_{row['id']}")
+                    if approve_btn or reject_btn:
+                        now = now_wib_iso()
+                        reviewer = user.get('email') or user.get('full_name')
+                        new_stat = "Approved" if approve_btn else "Rejected"
+                        if new_stat == "Rejected" and not (note and note.strip()):
+                            st.error("Catatan wajib saat reject.")
+                        else:
+                            try:
+                                cur.execute("PRAGMA table_info(delegasi)")
+                                _del_cols = {row[1] for row in cur.fetchall()}
+                            except Exception:
+                                _del_cols = set()
+                            if {"review_status","review_note","review_time","reviewed_by"}.issubset(_del_cols):
+                                cur.execute("UPDATE delegasi SET review_status=?, review_note=?, review_time=?, reviewed_by=? WHERE id=?",
+                                            (new_stat, note or '', now, reviewer, row['id']))
+                            else:
+                                cur.execute("UPDATE delegasi SET status=?, tanggal_update=? WHERE id=?",
+                                            (row['status'], now, row['id']))
+                            conn.commit()
+                            try:
+                                audit_log('delegasi','review', target=row['id'], details=f"{new_stat}; note={note or ''}", actor=reviewer)
+                            except Exception:
+                                pass
+                            st.success(f"Tugas di-{new_stat.lower()} oleh pemberi tugas.")
+                            if new_stat == "Rejected":
+                                # Notify PIC to rework/upload again
+                                try:
+                                    pic_name = row['pic']
+                                    recips = []
+                                    if pic_name and '@' in str(pic_name):
+                                        recips = [pic_name]
+                                    else:
+                                        em = _get_user_email_by_name(str(pic_name))
+                                        if em:
+                                            recips = [em]
+                                    if recips:
+                                        _send_email(recips, f"[WIJNA] Delegasi ditolak: {row['judul']}", f"Delegasi '{row['judul']}' ditolak.\nCatatan: {note or '-'}\nSilakan perbaiki dan upload bukti kembali.")
+                                except Exception:
+                                    pass
 
     # Tab 3: Monitoring Director
     with tab3:
