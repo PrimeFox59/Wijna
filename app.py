@@ -1731,28 +1731,29 @@ def attempt_auto_restore_if_seed(service, folder_id: str) -> Tuple[bool, str]:
 
 def dunyim_security_module():
     user = require_login()
-    require_role([ "superuser"])
     st.header("🛡️ Dunyim Security System")
     if not _drive_available():
         st.error("Paket Google API belum terpasang. Tambahkan 'google-api-python-client' dan 'google-auth' di requirements.")
         return
     folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
-    with st.expander("⚙️ Pengaturan", expanded=not bool(folder_id)):
-        fld = st.text_input("Folder ID Google Drive", value=folder_id)
-        cap = st.number_input("Kapasitas (bytes)", min_value=0, value=int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024))
-        colA, colB = st.columns(2)
-        with colA:
-            sched_enabled = st.checkbox("Aktifkan Scheduled Backup", value=(_setting_get('scheduled_backup_enabled','false')=='true'))
-        with colB:
-            sched_name = st.text_input("Nama file jadwal (overwrite)", value=_setting_get('scheduled_backup_filename','scheduled_backup.sqlite') or 'scheduled_backup.sqlite')
-        if st.button("Simpan Pengaturan"):
-            if fld:
-                _setting_set('gdrive_folder_id', fld)
-            _setting_set('project_capacity_bytes', str(cap))
-            _setting_set('scheduled_backup_enabled', 'true' if sched_enabled else 'false')
-            _setting_set('scheduled_backup_filename', sched_name.strip() or 'scheduled_backup.sqlite')
-            st.success("Pengaturan disimpan.")
-            st.rerun()
+    # Settings only visible to superuser
+    if (user or {}).get("role") == "superuser":
+        with st.expander("⚙️ Pengaturan", expanded=not bool(folder_id)):
+            fld = st.text_input("Folder ID Google Drive", value=folder_id)
+            cap = st.number_input("Kapasitas (bytes)", min_value=0, value=int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024))
+            colA, colB = st.columns(2)
+            with colA:
+                sched_enabled = st.checkbox("Aktifkan Scheduled Backup", value=(_setting_get('scheduled_backup_enabled','false')=='true'))
+            with colB:
+                sched_name = st.text_input("Nama file jadwal (overwrite)", value=_setting_get('scheduled_backup_filename','scheduled_backup.sqlite') or 'scheduled_backup.sqlite')
+            if st.button("Simpan Pengaturan"):
+                if fld:
+                    _setting_set('gdrive_folder_id', fld)
+                _setting_set('project_capacity_bytes', str(cap))
+                _setting_set('scheduled_backup_enabled', 'true' if sched_enabled else 'false')
+                _setting_set('scheduled_backup_filename', sched_name.strip() or 'scheduled_backup.sqlite')
+                st.success("Pengaturan disimpan.")
+                st.rerun()
     if not folder_id:
         st.info("Masukkan Folder ID terlebih dahulu.")
         return
