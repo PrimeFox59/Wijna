@@ -987,7 +987,6 @@ def require_min_role(min_role: str):
 # UI Components: Authentication
 # -------------------------
 def auth_sidebar():
-    st.sidebar.title("Authentication")
     user = get_current_user()
     if user:
         # Ambil info user lebih lengkap dari DB
@@ -1000,7 +999,6 @@ def auth_sidebar():
                 <b>Email:</b> {email}<br>
                 <b>Role:</b> {role}<br>
                 <b>Status:</b> {status}<br>
-                <b>Last Login:</b> {last_login}
                 </div>
             """.format(
                 full_name=u["full_name"],
