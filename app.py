@@ -4573,9 +4573,9 @@ def dashboard():
 
                 st.markdown("<ul style='padding-left:1.05em;margin:0;'>", unsafe_allow_html=True)
                 for _, r in df_30.iterrows():
-                    t1 = r['tgl_mulai'].strftime('%d-%m')
-                    t2 = r['tgl_selesai'].strftime('%d-%m')
-                    rng = t1 if t1==t2 else f"{t1}-{t2}"
+                    t1 = r['tgl_mulai'].strftime('%d - %m - %Y')
+                    t2 = r['tgl_selesai'].strftime('%d - %m - %Y')
+                    rng = t1 if t1==t2 else f"{t1} / {t2}"
                     badge_color = _badge_color(r)
                     badge = f"<span style='background:{badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:.63rem'>{r['jenis']}</span>"
                     st.markdown(f"<li style='margin-bottom:2px;font-size:.72rem'><b>{r['judul']}</b> {badge} <span style='color:#2563eb'>({rng})</span></li>", unsafe_allow_html=True)
