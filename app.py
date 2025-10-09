@@ -279,8 +279,6 @@ def sop_module():
                 show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
             cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
             st.dataframe(show[cols_show], width='stretch')
-            # Download CSV
-            st.download_button("⬇️ Download CSV", data=show[cols_show].to_csv(index=False).encode("utf-8"), file_name="daftar_sop.csv")
             # Download file per item (opsional pilih)
             if "id" in show.columns and "file_name" in show.columns:
                 opsi = {f"{r['judul']} — {r.get(sop_date_col, '')} ({r['file_name'] or '-'})": r['id'] for _, r in show.iterrows()}
@@ -3792,9 +3790,6 @@ def calendar_module():
                 dff = dff.sort_values("tgl_mulai")
                 show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
                 st.dataframe(dff[show_cols], width='stretch')
-                # Download CSV hasil filter
-                csv_bytes = dff[show_cols].to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV (Hasil Filter)", data=csv_bytes, file_name=f"kalender_gabungan_filtered_{today.isoformat()}.csv", mime="text/csv")
             else:
                 st.info("Tidak ada event sesuai filter.")
 
@@ -4903,10 +4898,6 @@ def audit_trail_module():
             "details": "Detail",
         })[["Nama User","Date","Action","Detail"]]
         st.dataframe(df_present, use_container_width=True)
-        try:
-            st.download_button("Download CSV", df_present.to_csv(index=False).encode("utf-8"), file_name="audit_activity.csv")
-        except Exception:
-            pass
     else:
         st.info("Belum ada aktivitas.")
 if __name__ == "__main__":
