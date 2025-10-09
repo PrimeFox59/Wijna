@@ -1047,12 +1047,6 @@ def auth_sidebar():
 def superuser_panel():
     require_role(["superuser"])
     st.header("Superuser — Manajemen User & Approval")
-    st.subheader("Semua user")
-    conn = get_db()
-    cur = conn.cursor()
-    df = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn)
-    st.dataframe(df)
-
     tab1, tab2 = st.tabs(["🕒 User Baru Menunggu Approval", "👥 Semua User"])
 
     with tab1:
