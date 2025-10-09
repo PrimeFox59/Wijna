@@ -1231,6 +1231,171 @@ def _backup_db_now(service, folder_id: str) -> Tuple[bool, str]:
             pass
         return False, f"Error: {e}"
 
+# --- Scheduled backup slots & auto-restore-on-wake ---
+DEFAULT_SCHEDULE_SLOTS = [
+    {"start": 6,  "end": 12, "name": "slot_morning"},
+    {"start": 12, "end": 18, "name": "slot_afternoon"},
+    {"start": 18, "end": 23, "name": "slot_evening"},
+    {"start": 23, "end": 6,  "name": "slot_night"},  # wrap
+]
+
+def _validate_slot_struct(slots) -> bool:
+    if not isinstance(slots, list) or not slots:
+        return False
+    names = set()
+    for s in slots:
+        if not isinstance(s, dict):
+            return False
+        if 'start' not in s or 'end' not in s or 'name' not in s:
+            return False
+        try:
+            st_h = int(s['start']); en_h = int(s['end'])
+        except Exception:
+            return False
+        if not (0 <= st_h <= 23 and 0 <= en_h <= 23):
+            return False
+        if st_h == en_h:
+            return False
+        nm = str(s['name']).strip()
+        if not nm or nm in names:
+            return False
+        names.add(nm)
+    return True
+
+def get_schedule_slots():
+    raw = _setting_get('scheduled_backup_slots_json')
+    if raw:
+        try:
+            import json as _json
+            slots = _json.loads(raw)
+            if _validate_slot_struct(slots):
+                # normalize
+                return [{"start": int(s['start']), "end": int(s['end']), "name": str(s['name']).strip()} for s in slots]
+        except Exception:
+            pass
+    return DEFAULT_SCHEDULE_SLOTS
+
+def determine_slot(now_local: datetime) -> str:
+    h = now_local.hour
+    for s in get_schedule_slots():
+        st_h = int(s['start']); en_h = int(s['end'])
+        if st_h < en_h:
+            if st_h <= h < en_h:
+                return s['name']
+        else:  # wrap
+            if h >= st_h or h < en_h:
+                return s['name']
+    return 'slot_unknown'
+
+def check_scheduled_backup(service, folder_id: str) -> Tuple[bool, str]:
+    enabled = _setting_get('scheduled_backup_enabled', 'false') == 'true'
+    if not enabled:
+        return False, 'Scheduled backup disabled'
+    base_name = _setting_get('scheduled_backup_filename', 'scheduled_backup.sqlite') or 'scheduled_backup.sqlite'
+    now_local = datetime.now()
+    slot = determine_slot(now_local)
+    if slot == 'slot_unknown':
+        return False, 'Outside defined slots'
+    today_tag = date.today().isoformat()
+    last_slot_done = _setting_get('scheduled_backup_last_slot')
+    last_slot_date = _setting_get('scheduled_backup_last_date')
+    if last_slot_done == slot and last_slot_date == today_tag:
+        return False, 'Slot already backed up'
+    # capacity and overwrite guards
+    if not os.path.exists(DB_PATH):
+        return False, 'DB missing'
+    try:
+        with open(DB_PATH,'rb') as f:
+            data = f.read()
+    except Exception as e:
+        return False, f'Cannot read DB: {e}'
+    try:
+        usage = _folder_usage_quick(service, folder_id)
+        used_now = int(usage.get('total_bytes', 0))
+    except Exception:
+        used_now = 0
+    cap = int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024)
+    try:
+        q = f"name='{base_name}' and '{folder_id}' in parents and trashed=false"
+        resp = service.files().list(q=q, spaces='drive', fields='files(id,size)', supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        existing = resp.get('files', [])
+    except Exception:
+        existing = []
+    if not existing:
+        if used_now >= cap:
+            return False, 'Capacity reached'
+        if used_now + len(data) > cap:
+            return False, 'Backup exceeds capacity'
+    fid = _drive_upload_or_replace(service, folder_id, base_name, data, mimetype='application/x-sqlite3')
+    if fid:
+        _setting_set('scheduled_backup_last_slot', slot)
+        _setting_set('scheduled_backup_last_date', today_tag)
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("INSERT INTO backup_log (file_name, drive_file_id, status, message) VALUES (?,?,?,?)", (base_name, fid, 'SUCCESS', f'scheduled {slot}'))
+            conn.commit()
+        except Exception:
+            pass
+        return True, f'Scheduled backup OK ({slot}) -> {base_name}'
+    else:
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("INSERT INTO backup_log (file_name, drive_file_id, status, message) VALUES (?,?,?,?)", (base_name, None, 'FAILED', f'scheduled {slot} upload error'))
+            conn.commit()
+        except Exception:
+            pass
+        return False, 'Upload failed'
+
+def _is_probably_fresh_seed_db() -> bool:
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users"); user_cnt = cur.fetchone()[0]
+        if user_cnt > 3:  # WIJNA seeds up to 3 users in ensure_db
+            return False
+        cur.execute("SELECT COUNT(*) FROM backup_log"); bkup_cnt = cur.fetchone()[0]
+        if bkup_cnt > 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+def _pick_latest_drive_backup_file(service, folder_id: str):
+    try:
+        files = _drive_list(service, folder_id)
+    except Exception:
+        return None
+    if not files:
+        return None
+    candidates = [f for f in files if f.get('name','').endswith(('.sqlite','.db'))]
+    if not candidates:
+        return None
+    try:
+        candidates.sort(key=lambda x: x.get('modifiedTime',''), reverse=True)
+    except Exception:
+        pass
+    return candidates[0]
+
+def attempt_auto_restore_if_seed(service, folder_id: str) -> Tuple[bool, str]:
+    if _setting_get('auto_restore_enabled','true') != 'true':
+        return False, 'Auto-restore disabled'
+    if not _is_probably_fresh_seed_db():
+        return False, 'DB not fresh'
+    latest = _pick_latest_drive_backup_file(service, folder_id)
+    if not latest:
+        return False, 'No backup found'
+    fid = latest.get('id'); fname = latest.get('name')
+    try:
+        data = _drive_download(service, fid)
+        if not data.startswith(b'SQLite format 3\x00'):
+            return False, 'Invalid sqlite header'
+        with open(DB_PATH,'wb') as f:
+            f.write(data)
+        _setting_set('auto_restore_last_file', fname)
+        _setting_set('auto_restore_last_time', datetime.utcnow().isoformat())
+        return True, f'Restored from {fname}'
+    except Exception as e:
+        return False, f'Restore failed: {e}'
+
 def dunyim_security_module():
     user = require_login()
     st.header("🛡️ Dunyim Security System")
@@ -1241,10 +1406,17 @@ def dunyim_security_module():
     with st.expander("⚙️ Pengaturan", expanded=not bool(folder_id)):
         fld = st.text_input("Folder ID Google Drive", value=folder_id)
         cap = st.number_input("Kapasitas (bytes)", min_value=0, value=int(_setting_get('project_capacity_bytes', 2*1024*1024*1024) or 2*1024*1024*1024))
+        colA, colB = st.columns(2)
+        with colA:
+            sched_enabled = st.checkbox("Aktifkan Scheduled Backup", value=(_setting_get('scheduled_backup_enabled','false')=='true'))
+        with colB:
+            sched_name = st.text_input("Nama file jadwal (overwrite)", value=_setting_get('scheduled_backup_filename','scheduled_backup.sqlite') or 'scheduled_backup.sqlite')
         if st.button("Simpan Pengaturan"):
             if fld:
                 _setting_set('gdrive_folder_id', fld)
             _setting_set('project_capacity_bytes', str(cap))
+            _setting_set('scheduled_backup_enabled', 'true' if sched_enabled else 'false')
+            _setting_set('scheduled_backup_filename', sched_name.strip() or 'scheduled_backup.sqlite')
             st.success("Pengaturan disimpan.")
             st.rerun()
     if not folder_id:
@@ -1268,9 +1440,18 @@ def dunyim_security_module():
             if 'size' in df.columns:
                 df['size'] = df['size'].fillna(0).astype(int).apply(_bytes_fmt)
             st.dataframe(df[['name','id','mimeType','modifiedTime'] + (['size'] if 'size' in df.columns else [])], use_container_width=True, hide_index=True)
-        if st.button("🚀 Backup DB Sekarang"):
-            ok, msg = _backup_db_now(service, folder_id)
-            st.success(msg) if ok else st.error(msg)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🚀 Backup DB Sekarang"):
+                ok, msg = _backup_db_now(service, folder_id)
+                st.success(msg) if ok else st.error(msg)
+        with c2:
+            if st.button("⏱️ Paksa Backup Slot Saat Ini"):
+                ok, msg = check_scheduled_backup(service, folder_id)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.info(msg)
     # Upload
     with tabs[1]:
         f = st.file_uploader("Pilih file untuk upload")
@@ -3649,6 +3830,19 @@ def dashboard():
 def main():
     ensure_db()
     # --- Sidebar Logo ---
+    # One-time pre-login auto-restore if DB looks fresh
+    if "__prelogin_restore_checked" not in st.session_state:
+        st.session_state["__prelogin_restore_checked"] = True
+        try:
+            if _drive_available():
+                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+                if folder_id:
+                    svc = _build_drive()
+                    ok, msg = attempt_auto_restore_if_seed(svc, folder_id)
+                    if ok:
+                        st.toast("Auto-restore DB dari Drive berhasil.")
+        except Exception:
+            pass
     user = get_current_user()
     if not user:
         # --- Full page login/register, no sidebar ---
@@ -3911,6 +4105,15 @@ def main():
     elif choice == "Superuser Panel":
         superuser_panel()
     elif choice == "Dunyim Security":
+        # Check scheduled backup once on module enter (non-blocking)
+        try:
+            if _drive_available():
+                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+                if folder_id:
+                    svc = _build_drive()
+                    check_scheduled_backup(svc, folder_id)
+        except Exception:
+            pass
         dunyim_security_module()
 
 def audit_trail_module():
