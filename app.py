@@ -4119,6 +4119,29 @@ def dashboard():
             st.markdown("<div class='empty-hint'>Belum ada data cuti.</div>", unsafe_allow_html=True)
         else:
             st.dataframe(df_cuti, width='stretch', hide_index=True)
+
+        # Sisa Kuota per Pegawai (ambil baris terakhir per nama)
+        st.caption("Sisa Kuota per Pegawai (berdasarkan pengajuan terakhir)")
+        try:
+            df_sisa = pd.read_sql_query(
+                """
+                SELECT c1.nama, c1.kuota_tahunan, c1.cuti_terpakai, c1.sisa_kuota
+                FROM cuti c1
+                JOIN (
+                    SELECT nama, MAX(tgl_mulai) AS last_tgl
+                    FROM cuti
+                    GROUP BY nama
+                ) last ON last.nama = c1.nama AND last.last_tgl = c1.tgl_mulai
+                ORDER BY c1.sisa_kuota ASC
+                """,
+                raw_conn,
+            )
+        except Exception:
+            df_sisa = pd.DataFrame(columns=["nama","kuota_tahunan","cuti_terpakai","sisa_kuota"])
+        if df_sisa.empty:
+            st.markdown("<div class='empty-hint'>Belum ada data sisa kuota.</div>", unsafe_allow_html=True)
+        else:
+            st.dataframe(df_sisa, width='stretch', hide_index=True)
         try:
             df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 8", raw_conn)
         except Exception:
@@ -4380,6 +4403,7 @@ def main():
             st.write(f"Durasi cuti diajukan: {durasi} hari")
             if durasi > 0 and sisa_kuota < durasi:
                 st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
+            st.caption("Pengajuan akan ditolak otomatis bila Sisa Kuota < Durasi pengajuan.")
             if st.button("Ajukan Cuti"):
                 if not alasan or durasi <= 0:
                     st.warning("Lengkapi data dan pastikan tanggal benar.")
@@ -4388,10 +4412,16 @@ def main():
                 else:
                     cid = gen_id("cuti")
                     now = now_wib_iso()
-                    cur.execute("""
+                    # Update running totals at time of submission
+                    new_cuti_terpakai = cuti_terpakai + durasi
+                    new_sisa = max(0, kuota_tahunan - new_cuti_terpakai)
+                    cur.execute(
+                        """
                         INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
-                    """, (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, "Menunggu Review Finance"))
+                        """,
+                        (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, new_cuti_terpakai, new_sisa, "Menunggu Review Finance"),
+                    )
                     conn.commit()
                     st.success("Pengajuan cuti berhasil diajukan.")
                     # Audit trail
