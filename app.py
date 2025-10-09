@@ -913,6 +913,40 @@ def has_role(roles) -> bool:
     return u.get("role") in (roles or [])
 
 # -------------------------
+# Role hierarchy helpers
+# -------------------------
+# Order: staff < finance < director < superuser
+ROLE_HIERARCHY = {
+    "staff": 1,
+    "finance": 2,
+    "director": 3,
+    "superuser": 4,
+}
+
+def role_rank(role: Optional[str]) -> int:
+    if not role:
+        return 0
+    return ROLE_HIERARCHY.get(role, 0)
+
+def has_min_role(min_role: str) -> bool:
+    u = get_current_user()
+    if not u:
+        return False
+    # superuser always passes
+    if u.get("role") == "superuser":
+        return True
+    return role_rank(u.get("role")) >= role_rank(min_role)
+
+def require_min_role(min_role: str):
+    u = require_login()
+    if u.get("role") == "superuser":
+        return u
+    if role_rank(u.get("role")) < role_rank(min_role):
+        st.error(f"Akses ditolak. Minimal role: {min_role}")
+        st.stop()
+    return u
+
+# -------------------------
 # UI Components: Authentication
 # -------------------------
 def auth_sidebar():
