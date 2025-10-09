@@ -2667,12 +2667,7 @@ def surat_keluar_module():
                     excel_buffer = io.BytesIO()  # reset buffer for next attempt
                     continue
             if not wrote_excel:
-                st.info("Library openpyxl/xlsxwriter tidak tersedia. Gunakan download CSV.")
-            st.download_button(
-                "⬇️ Download Rekap Bulanan (CSV)",
-                df_month.to_csv(index=False),
-                file_name=f"rekap_suratkeluar_{this_month}.csv"
-            )
+                st.info("Library openpyxl/xlsxwriter tidak tersedia. Export Excel dinonaktifkan.")
 
 def mou_module():
     user = require_login()
@@ -3402,10 +3397,9 @@ def delegasi_module():
                         bio = io.BytesIO()
                         continue
                 if not success:
-                    st.info("Engine Excel (openpyxl/xlsxwriter) tidak tersedia. Gunakan CSV.")
+                    st.info("Engine Excel (openpyxl/xlsxwriter) tidak tersedia. Export Excel dinonaktifkan.")
             except Exception:
-                st.warning("Gagal membuat file Excel. Gunakan CSV.")
-            st.download_button("Download Rekap Bulanan (CSV)", df_month.to_csv(index=False), file_name=f"rekap_delegasi_{this_month}.csv")
+                st.warning("Gagal membuat file Excel.")
             by_pic = df_month['pic'].value_counts().head(5)
             st.write("Top 5 PIC:")
             st.dataframe(by_pic)
@@ -3829,7 +3823,7 @@ def notulen_module():
             else:
                 tgl = None
                 st.caption("Tanggal upload akan dicatat otomatis.")
-            f = st.file_uploader("File Notulen (PDF/DOC/IMG)")
+            f = st.file_uploader("File Notulen")
             follow_up = st.text_area("Catatan Follow Up (opsional)") if "follow_up" in nt_cols else None
             deadline = st.date_input("Deadline / Tindak Lanjut", value=date.today()) if "deadline" in nt_cols else None
             submit = st.form_submit_button("💾 Upload Notulen")
@@ -3981,10 +3975,7 @@ def notulen_module():
                 st.dataframe(df_month[["judul", nt_date_col]], width='stretch')
             else:
                 st.dataframe(df_month[["judul"]], width='stretch')
-            try:
-                st.download_button("⬇️ Download Rekap Bulanan (CSV)", df_month.to_csv(index=False).encode("utf-8"), file_name=f"rekap_notulen_{this_month}.csv")
-            except Exception:
-                pass
+            # CSV export removed as requested
 
 # -------------------------
 # User Setting Module
