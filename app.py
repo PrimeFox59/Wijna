@@ -879,13 +879,6 @@ def login_user(email, password):
         st.session_state["user"] = {"id": row["id"], "email": row["email"], "role": row["role"], "full_name": row["full_name"]}
         cur.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
         audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
-        try:
-            # store login audit into audit_logs table (Dunyim)
-            c2 = conn.cursor()
-            c2.execute("INSERT INTO audit_logs (user_email, action, details) VALUES (?,?,?)", (email, 'LOGIN', 'Login sukses'))
-            conn.commit()
-        except Exception:
-            pass
         # Best-effort backup on successful login (any user)
         try:
             if _drive_available():
