@@ -1054,11 +1054,11 @@ def auth_sidebar():
                 status=u["status"],
             ), unsafe_allow_html=True)
             # Peringatan penting agar user melakukan logout setelah selesai
-            st.sidebar.warning("saat selesai menggunakan apps harap logout, menghindari potensi unsaved data saat apps autosleep")
+            st.sidebar.warning("saat selesai menggunakan apps harap **logout**, menghindari potensi unsaved data saat apps autosleep")
         else:
             st.sidebar.write(f"Logged in: **{user['full_name']}** ({user['role']})")
             # Peringatan penting agar user melakukan logout setelah selesai
-            st.sidebar.warning("saat selesai menggunakan apps harap logout, menghindari potensi unsaved data saat apps autosleep")
+            st.sidebar.warning("saat selesai menggunakan apps harap **logout**, menghindari potensi unsaved data saat apps autosleep")
     else:
         tabs = st.sidebar.tabs(["Login", "Register"])
         with tabs[0]:
