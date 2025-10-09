@@ -69,11 +69,40 @@ st.markdown(
 # --- Database connection utility --- 
 def format_datetime_wib(dtstr):
     try:
-        dt_utc = datetime.fromisoformat(dtstr)
-        dt_wib = dt_utc + timedelta(hours=7)
-        return dt_wib.strftime('%d-%m-%Y %H:%M') + ' WIB'
+        dt = datetime.fromisoformat(dtstr)
+        # Assume stored timestamps are already WIB-naive
+        return dt.strftime('%d-%m-%Y %H:%M') + ' WIB'
     except Exception:
         return dtstr
+
+# Timezone helpers: WIB (GMT+7)
+def now_wib() -> datetime:
+    """Return current time in WIB (UTC+7) as a naive datetime."""
+    return datetime.utcnow() + timedelta(hours=7)
+
+def now_wib_iso() -> str:
+    """ISO8601 string of WIB time (no microseconds)."""
+    return now_wib().replace(microsecond=0).isoformat()
+
+def format_date_wib(d: Optional[str]) -> str:
+    """Format a date or datetime string to dd-mm-yyyy in WIB.
+    Accepts ISO date (YYYY-MM-DD) or ISO datetime, returns 'dd-mm-yyyy'.
+    """
+    if not d:
+        return ""
+    try:
+        if len(d) >= 10 and d[4] == '-' and d[7] == '-':
+            # Looks like yyyy-mm-dd or yyyy-mm-ddTHH:MM:SS
+            if 'T' in d:
+                dt = datetime.fromisoformat(d.split('Z')[0].replace('Z',''))
+                # Assume stored as WIB-naive
+                return dt.strftime('%d-%m-%Y')
+            else:
+                y, m, dd = d[:4], d[5:7], d[8:10]
+                return f"{dd}-{m}-{y}"
+    except Exception:
+        pass
+    return str(d)
 
 class _AuditCursor:
     def __init__(self, outer_conn, inner_cursor):
@@ -186,7 +215,7 @@ def sop_module():
                     if sop_date_col == "tanggal_terbit":
                         cols.append("tanggal_terbit"); vals.append(tgl.isoformat())
                     elif sop_date_col == "tanggal_upload":
-                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                        cols.append("tanggal_upload"); vals.append(now_wib_iso())
                     if "director_approved" in sop_cols:
                         cols.append("director_approved"); vals.append(0)
                     for opt in ("memo", "board_note"):
@@ -337,7 +366,7 @@ def ensure_db():
         if count_users == 0:
             try:
                 pw = hash_password("zzz")
-                now = datetime.utcnow().isoformat()
+                now = now_wib_iso()
                 cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
                             ("admin", "Prime", "superuser", pw, "active", now))
                 cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?,?,?,?,?,?)",
@@ -684,7 +713,7 @@ def log_file_delete(modul, file_name, deleted_by, alasan=None):
     conn = get_db()
     cur = conn.cursor()
     log_id = gen_id("log")
-    now = datetime.utcnow().isoformat()
+    now = now_wib_iso()
     cur.execute("INSERT INTO file_log (id, modul, file_name, versi, deleted_by, tanggal_hapus, alasan) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (log_id, modul, file_name, 1, deleted_by, now, alasan or ""))
     conn.commit()
@@ -712,7 +741,7 @@ def generate_cashadvance_monthly_rekap():
         row_cair = cur.fetchone()
         total_cair = row_cair[0] if row_cair else 0
         total_nominal_cair = row_cair[1] if row_cair else 0.0
-        now = datetime.utcnow().isoformat()
+        now = now_wib_iso()
         # Upsert (SQLite 3.24+ supports ON CONFLICT DO UPDATE)
         cur.execute("""
             INSERT INTO rekap_monthly_cashadvance (bulan,total_pengajuan,total_nominal,total_cair,total_nominal_cair,updated_at)
@@ -746,7 +775,7 @@ def audit_log(modul: str, action: str, target=None, details=None, actor=None):
         db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
         conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
         cur = conn.cursor()
-        now = datetime.utcnow().isoformat()
+        now = now_wib_iso()
         # Resolve actor from session if not provided
         if not actor:
             u = st.session_state.get("user")
@@ -805,7 +834,7 @@ def register_user(email, full_name, password):
     conn = get_db()
     cur = conn.cursor()
     pw = hash_password(password)
-    now = datetime.utcnow().isoformat()
+    now = now_wib_iso()
     try:
         cur.execute("INSERT INTO users (email, full_name, role, password_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (email, full_name, "staff", pw, "active", now))
@@ -817,7 +846,7 @@ def register_user(email, full_name, password):
 def login_user(email, password):
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    now = now_wib_iso()
     cur.execute("SELECT * FROM users WHERE email = ?", (email,))
     row = cur.fetchone()
     if not row:
@@ -1142,7 +1171,7 @@ def upload_file_and_store(file_uploader_obj):
         conn = get_db()
         cur = conn.cursor()
         log_id = gen_id("log")
-        now = datetime.utcnow().isoformat()
+        now = now_wib_iso()
         cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload) VALUES (?, ?, ?, ?, ?, ?)",
             (log_id, "upload", name, 1, user["full_name"] if user else "-", now))
         conn.commit()
@@ -1556,11 +1585,12 @@ def check_scheduled_backup(service, folder_id: str) -> Tuple[bool, str]:
     if not enabled:
         return False, 'Scheduled backup disabled'
     base_name = _setting_get('scheduled_backup_filename', 'scheduled_backup.sqlite') or 'scheduled_backup.sqlite'
-    now_local = datetime.now()
+    now_local = now_wib()
     slot = determine_slot(now_local)
     if slot == 'slot_unknown':
         return False, 'Outside defined slots'
-    today_tag = date.today().isoformat()
+    # Tag harian berdasarkan WIB
+    today_tag = now_local.date().isoformat()
     last_slot_done = _setting_get('scheduled_backup_last_slot')
     last_slot_date = _setting_get('scheduled_backup_last_date')
     if last_slot_done == slot and last_slot_date == today_tag:
@@ -1655,7 +1685,7 @@ def attempt_auto_restore_if_seed(service, folder_id: str) -> Tuple[bool, str]:
         with open(DB_PATH,'wb') as f:
             f.write(data)
         _setting_set('auto_restore_last_file', fname)
-        _setting_set('auto_restore_last_time', datetime.utcnow().isoformat())
+        _setting_set('auto_restore_last_time', now_wib_iso())
         return True, f'Restored from {fname}'
     except Exception as e:
         return False, f'Restore failed: {e}'
@@ -1767,7 +1797,7 @@ def dunyim_security_module():
                 if not data.startswith(b"SQLite format 3\x00"):
                     st.error("File bukan SQLite valid.")
                 else:
-                    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                    ts = now_wib().strftime('%Y%m%d_%H%M%S')
                     if os.path.exists(DB_PATH):
                         try:
                             with open(DB_PATH,'rb') as a, open(f"local_backup_before_replace_{ts}.sqlite",'wb') as b:
@@ -1797,7 +1827,7 @@ def dunyim_security_module():
                         if not data.startswith(b"SQLite format 3\x00"):
                             st.error("Bukan SQLite valid.")
                         else:
-                            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                            ts = now_wib().strftime('%Y%m%d_%H%M%S')
                             if os.path.exists(DB_PATH):
                                 try:
                                     with open(DB_PATH,'rb') as a, open(f"local_backup_before_restore_{ts}.sqlite",'wb') as b:
@@ -1910,7 +1940,7 @@ def inventory_module():
                         if keterangan_opsi:
                             full_nama += f" ({keterangan_opsi})"
                         iid = gen_id("inv")
-                        now = datetime.utcnow().isoformat()
+                        now = now_wib_iso()
                         blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
                         # PIC dihapus, set kosong
                         pic = ""
@@ -2859,7 +2889,7 @@ def pmr_module():
                         b2, n2, _ = upload_file_and_store(f2)
                     else:
                         b2, n2 = None, None
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file2_blob,file2_name,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, nama, b1, n1, b2, n2, bulan, "", 0, "", 0, now))
@@ -2985,7 +3015,7 @@ def delegasi_module():
                     st.warning("Tanggal selesai tidak boleh sebelum mulai.")
                 else:
                     did = gen_id("del")
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
                         (did, judul, deskripsi, pic, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
                     conn.commit()
@@ -3013,7 +3043,7 @@ def delegasi_module():
                         st.error("Status 'Selesai' wajib upload file dokumentasi!")
                     else:
                         blob, fname, _ = upload_file_and_store(file_bukti) if file_bukti else (None, None, None)
-                        now = datetime.utcnow().isoformat()
+                        now = now_wib_iso()
                         if status == "Selesai":
                             cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, tanggal_update=? WHERE id=?",
                                 (status, blob, fname, now, row["id"]))
@@ -3333,7 +3363,7 @@ def calendar_module():
                 sumber = st.text_input("Sumber / Dasar Penetapan (opsional)")
                 if st.form_submit_button("Tambah Libur Nasional"):
                     cid = gen_id("cal")
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     cur.execute("INSERT INTO calendar (id,jenis,judul,nama_divisi,tgl_mulai,tgl_selesai,deskripsi,file_blob,file_name,is_holiday,sumber,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (cid, "Libur Nasional", judul, "-", tgl_mulai.isoformat(), tgl_selesai.isoformat(), sumber, None, None, 1, sumber, user["full_name"], now))
                     cur.execute("INSERT INTO public_holidays (tahun,tanggal,nama,keterangan,ditetapkan_oleh,tanggal_penetapan) VALUES (?,?,?,?,?,?)",
@@ -3498,7 +3528,7 @@ def notulen_module():
                     if nt_date_col == "tanggal_rapat":
                         cols.append("tanggal_rapat"); vals.append(tgl.isoformat())
                     elif nt_date_col == "tanggal_upload":
-                        cols.append("tanggal_upload"); vals.append(datetime.utcnow().isoformat())
+                        cols.append("tanggal_upload"); vals.append(now_wib_iso())
                     if "follow_up" in nt_cols:
                         cols.append("follow_up"); vals.append(follow_up or "")
                     if "deadline" in nt_cols and deadline:
@@ -3952,7 +3982,8 @@ def dashboard():
             continue
     cur.execute("SELECT COUNT(*) as c FROM surat_masuk WHERE status='Belum Dibahas'")
     surat_blm = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) as c FROM mou WHERE date(tgl_selesai) <= date('now','+7 day')")
+    # Use localtime so comparisons align better with WIB date
+    cur.execute("SELECT COUNT(*) as c FROM mou WHERE date(tgl_selesai) <= date('now','localtime','+7 day')")
     mou_due7 = cur.fetchone()["c"]
     # Delegasi aktif (tidak selesai)
     try:
@@ -3967,6 +3998,7 @@ def dashboard():
     colB.markdown(f"""<div class='stat-card'><div class='stat-label'>Surat Belum Dibahas</div><div class='stat-value' style='color:#2563eb'>{surat_blm}</div><div class='stat-foot'>Status awal</div></div>""", unsafe_allow_html=True)
     colC.markdown(f"""<div class='stat-card'><div class='stat-label'>MoU ≤ 7 Hari</div><div class='stat-value' style='color:#9333ea'>{mou_due7}</div><div class='stat-foot'>Segera follow-up</div></div>""", unsafe_allow_html=True)
     colD.markdown(f"""<div class='stat-card'><div class='stat-label'>Delegasi Aktif</div><div class='stat-value' style='color:#059669'>{delegasi_aktif}</div><div class='stat-foot'>Belum selesai</div></div>""", unsafe_allow_html=True)
+    st.caption("Waktu ditampilkan dalam WIB (GMT+07:00); format tanggal dd-mm-yyyy.")
 
     # --------------------------------------------------
     # ROW 1: Approval | Status Surat+MoU | Rekap Multi Modul
@@ -4355,7 +4387,7 @@ def main():
                     st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
                 else:
                     cid = gen_id("cuti")
-                    now = datetime.utcnow().isoformat()
+                    now = now_wib_iso()
                     cur.execute("""
                         INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
