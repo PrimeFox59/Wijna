@@ -4212,15 +4212,15 @@ def user_setting_module():
             for idx, p in enumerate(pendings):
                 with st.expander(f"{p['full_name']} — {p['email']}"):
                     st.markdown(f'''
-<div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);">
-<b>Nama:</b> {p['full_name']}<br>
-<b>Email:</b> {p['email']}<br>
-<b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br>
-<b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br>
-<b>Tanggal Daftar:</b> {p['created_at'][:10]}<br>
-<b>User ID:</b> <code>{p['id']}</code>
-</div>
-''', unsafe_allow_html=True)
+                    <div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);">
+                    <b>Nama:</b> {p['full_name']}<br>
+                    <b>Email:</b> {p['email']}<br>
+                    <b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br>
+                    <b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br>
+                    <b>Tanggal Daftar:</b> {p['created_at'][:10]}<br>
+                    <b>User ID:</b> <code>{p['id']}</code>
+                    </div>
+                    ''', unsafe_allow_html=True)
                     # Action buttons for this user
                     col1, col2, col3 = st.columns([1,1,2])
                     if 'superuser_panel_action' not in st.session_state:
@@ -4259,18 +4259,7 @@ def user_setting_module():
         else:
             st.info("Tidak ada user pending.")
         conn1.close()
-
-    with tab2:
-        st.subheader("Semua user")
-        if not has_min_role("director, superuser"):
-            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
-            return
-        conn2 = get_db()
-        df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
-        st.dataframe(df2, width='stretch')
-        conn2.close()
-    # (No form here, only one form with key 'admin_change' exists below)
-
+    
     # Only one form, outside the tabs
     st.markdown("---")
     st.subheader("Aksi User Management")
@@ -4311,6 +4300,19 @@ def user_setting_module():
                     conn3.commit()
                     st.info("User di-set inactive.")
             conn3.close()
+
+    with tab2:
+        st.subheader("Semua user")
+        if not has_min_role("director, superuser"):
+            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
+            return
+        conn2 = get_db()
+        df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
+        st.dataframe(df2, width='stretch')
+        conn2.close()
+    # (No form here, only one form with key 'admin_change' exists below)
+
+    
 # -------------------------
 # Dashboard
 # -------------------------
