@@ -723,6 +723,7 @@ def ensure_db():
             cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('enable_email_notifications','false')")
             cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('pmr_notify_enabled','true')")
             cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('delegasi_notify_enabled','true')")
+            cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('delegasi_deadline_autoshift','false')")
             if GDRIVE_DEFAULT_FOLDER_ID:
                 cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('gdrive_folder_id', ?)", (GDRIVE_DEFAULT_FOLDER_ID,))
         except Exception:
@@ -3218,12 +3219,32 @@ def delegasi_module():
                 pic_value = st.text_input("Penanggung Jawab (PIC)")
             tgl_mulai = st.date_input("Tgl Mulai", value=date.today())
             tgl_selesai = st.date_input("Tgl Selesai", value=date.today())
+            # Holiday-aware hints
+            try:
+                if _is_public_holiday(tgl_mulai):
+                    st.info("Catatan: Tgl Mulai jatuh pada Libur Nasional.")
+                if _is_public_holiday(tgl_selesai):
+                    st.warning("Peringatan: Tgl Selesai jatuh pada Libur Nasional.")
+            except Exception:
+                pass
             if st.form_submit_button("Buat Tugas"):
                 if not (judul and deskripsi and pic_value):
                     st.warning("Semua field wajib diisi.")
                 elif tgl_selesai < tgl_mulai:
                     st.warning("Tanggal selesai tidak boleh sebelum mulai.")
                 else:
+                    # Optional auto-shift deadline to next working day
+                    try:
+                        auto_shift = (_setting_get('delegasi_deadline_autoshift', 'false') == 'true')
+                    except Exception:
+                        auto_shift = False
+                    adj_selesai = tgl_selesai
+                    try:
+                        if auto_shift and _is_public_holiday(adj_selesai):
+                            adj_selesai = _next_working_day(adj_selesai)
+                            st.info(f"Tgl Selesai otomatis digeser ke hari kerja berikutnya: {adj_selesai.isoformat()}")
+                    except Exception:
+                        pass
                     did = gen_id("del")
                     now = now_wib_iso()
                     created_by = user.get('email') or user.get('full_name')
@@ -3234,13 +3255,13 @@ def delegasi_module():
                         _del_cols = set()
                     if {"created_by","review_status"}.issubset(_del_cols):
                         cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now, created_by, "Pending"))
+                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), adj_selesai.isoformat(), "Belum Selesai", now, created_by, "Pending"))
                     else:
                         cur.execute("INSERT INTO delegasi (id,judul,deskripsi,pic,tgl_mulai,tgl_selesai,status,tanggal_update) VALUES (?,?,?,?,?,?,?,?)",
-                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), tgl_selesai.isoformat(), "Belum Selesai", now))
+                                    (did, judul, deskripsi, pic_value, tgl_mulai.isoformat(), adj_selesai.isoformat(), "Belum Selesai", now))
                     conn.commit()
                     try:
-                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic_value} {tgl_mulai}..{tgl_selesai}")
+                        audit_log("delegasi", "create", target=did, details=f"{judul} -> {pic_value} {tgl_mulai}..{adj_selesai}")
                     except Exception:
                         pass
                     try:
@@ -3664,6 +3685,25 @@ def calendar_module():
                     conn.commit()
                     try:
                         audit_log("calendar", "add_holiday", target=cid, details=f"{judul} {tgl_mulai}..{tgl_selesai}")
+                    except Exception:
+                        pass
+                    # Notify all staff about new public holiday
+                    try:
+                        if _email_enabled():
+                            all_staff = _get_all_active_emails()
+                            if all_staff:
+                                tag = f"holiday:{cid}:{tgl_mulai.isoformat()}-{tgl_selesai.isoformat()}"
+                                if not _notif_already_sent('calendar', cid, 'new_holiday', tag):
+                                    subj = f"[WIJNA] Libur Nasional ditetapkan: {judul}"
+                                    body = (
+                                        f"Libur Nasional baru telah ditambahkan.\n"
+                                        f"Nama: {judul}\n"
+                                        f"Tanggal: {tgl_mulai.isoformat()} s/d {tgl_selesai.isoformat()}\n"
+                                        f"Sumber: {sumber or '-'}\n"
+                                        f"Ditetapkan oleh: {user.get('full_name','-')} pada {format_datetime_wib(now)}\n"
+                                    )
+                                    if _send_email(all_staff, subj, body):
+                                        _mark_notif_sent('calendar', cid, 'new_holiday', tag, all_staff)
                     except Exception:
                         pass
                     st.success("Libur Nasional ditambahkan.")
@@ -4172,6 +4212,7 @@ def user_setting_module():
                 enabled_global = (_setting_get('enable_email_notifications','false') == 'true')
                 enabled_pmr = (_setting_get('pmr_notify_enabled','true') == 'true')
                 enabled_delegasi = (_setting_get('delegasi_notify_enabled','true') == 'true')
+                autoshift = (_setting_get('delegasi_deadline_autoshift','false') == 'true')
                 colA, colB = st.columns(2)
                 with colA:
                     ng = st.toggle("Aktifkan notifikasi email", value=enabled_global)
@@ -4182,10 +4223,16 @@ def user_setting_module():
                     np = st.toggle("PMR: Tegur otomatis jika terlambat (> tgl 5)", value=enabled_pmr)
                 with colD:
                     nd = st.toggle("Delegasi: Pengingat ≤3 hari & Lewat tenggat", value=enabled_delegasi)
+                colE, colF = st.columns(2)
+                with colE:
+                    na = st.toggle("Delegasi: Auto-shift deadline jika jatuh pada Libur Nasional", value=autoshift)
+                with colF:
+                    st.caption("Jika aktif, sistem akan memundurkan tenggat ke hari kerja berikutnya.")
                 if st.button("Simpan Pengaturan Email", key="save_email_notif"):
                     _setting_set('enable_email_notifications', 'true' if ng else 'false')
                     _setting_set('pmr_notify_enabled', 'true' if np else 'false')
                     _setting_set('delegasi_notify_enabled', 'true' if nd else 'false')
+                    _setting_set('delegasi_deadline_autoshift', 'true' if na else 'false')
                     st.success("Pengaturan disimpan.")
 
                 # Test email notification block
@@ -4690,14 +4737,15 @@ def main():
             tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
             tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
             alasan = st.text_area("Alasan Cuti")
-            durasi = (tgl_selesai - tgl_mulai).days + 1 if tgl_selesai >= tgl_mulai else 0
+            # Durasi tidak menghitung Libur Nasional (non-working days)
+            durasi = _count_days_excluding_holidays(tgl_mulai, tgl_selesai) if tgl_selesai >= tgl_mulai else 0
             cur.execute("SELECT kuota_tahunan, cuti_terpakai FROM cuti WHERE nama=? ORDER BY tgl_mulai DESC LIMIT 1", (nama,))
             row = cur.fetchone()
             kuota_tahunan = row["kuota_tahunan"] if row else 12
             cuti_terpakai = row["cuti_terpakai"] if row else 0
             sisa_kuota = kuota_tahunan - cuti_terpakai
             st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
-            st.write(f"Durasi cuti diajukan: {durasi} hari")
+            st.write(f"Durasi cuti diajukan (tidak termasuk Libur Nasional): {durasi} hari")
             if durasi > 0 and sisa_kuota < durasi:
                 st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
             st.caption("Pengajuan akan ditolak otomatis bila Sisa Kuota < Durasi pengajuan.")
