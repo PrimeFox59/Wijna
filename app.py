@@ -22,7 +22,7 @@ except Exception:
 # menyebabkan NameError (variabel cur belum didefinisikan) dan agar lebih terstruktur.
 
 DB_PATH = "office_ops.db"
-GDRIVE_DEFAULT_FOLDER_ID = os.environ.get("DUNYIM_GDRIVE_FOLDER_ID", "")
+GDRIVE_DEFAULT_FOLDER_ID = os.environ.get("DUNYIM_GDRIVE_FOLDER_ID", "1CxYo2ZGu8jweKjmEws41nT3cexJju5_1")
 SALT = "office_ops_salt_v1"
 
 # --- Password hashing utility ---
@@ -820,6 +820,15 @@ def login_user(email, password):
             c2 = conn.cursor()
             c2.execute("INSERT INTO audit_logs (user_email, action, details) VALUES (?,?,?)", (email, 'LOGIN', 'Login sukses'))
             conn.commit()
+        except Exception:
+            pass
+        # Best-effort backup on successful login (any user)
+        try:
+            if _drive_available():
+                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+                if folder_id:
+                    service = _build_drive()
+                    _backup_db_now(service, folder_id)
         except Exception:
             pass
         conn.commit()
@@ -3830,19 +3839,18 @@ def dashboard():
 def main():
     ensure_db()
     # --- Sidebar Logo ---
-    # One-time pre-login auto-restore if DB looks fresh
-    if "__prelogin_restore_checked" not in st.session_state:
-        st.session_state["__prelogin_restore_checked"] = True
-        try:
-            if _drive_available():
-                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
-                if folder_id:
-                    svc = _build_drive()
-                    ok, msg = attempt_auto_restore_if_seed(svc, folder_id)
-                    if ok:
-                        st.toast("Auto-restore DB dari Drive berhasil.")
-        except Exception:
-            pass
+    # Pre-login auto-restore: run before showing login UI; safe to run multiple times per session
+    try:
+        user = get_current_user()
+        if not user and _drive_available():
+            folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+            if folder_id:
+                svc = _build_drive()
+                ok, msg = attempt_auto_restore_if_seed(svc, folder_id)
+                if ok:
+                    st.toast("Auto-restore DB dari Drive berhasil.")
+    except Exception:
+        pass
     user = get_current_user()
     if not user:
         # --- Full page login/register, no sidebar ---
