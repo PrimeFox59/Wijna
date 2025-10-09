@@ -3861,6 +3861,35 @@ def user_setting_module():
                     _setting_set('delegasi_notify_enabled', 'true' if nd else 'false')
                     st.success("Pengaturan disimpan.")
 
+                # Test email notification block
+                st.markdown("#### 🔔 Kirim Email Uji Coba")
+                st.caption("Gunakan ini untuk menguji apakah konfigurasi SMTP dan pengiriman email berjalan.")
+                with st.form("test_email_form"):
+                    default_to = me["email"] or ""
+                    test_to = st.text_input("Kirim ke (email)", value=default_to)
+                    subject = st.text_input("Subjek", value="[WIJNA] Test Notifikasi Email")
+                    body = st.text_area("Isi Pesan", value="Ini adalah email uji dari WIJNA Manajemen System.")
+                    submit_test = st.form_submit_button("Kirim Email Tes")
+                    if submit_test:
+                        # Basic validations
+                        if not test_to or "@" not in test_to:
+                            st.warning("Masukkan alamat email tujuan yang valid.")
+                        else:
+                            # Attempt sending
+                            ok = False
+                            try:
+                                ok = _send_email([test_to], subject.strip(), body)
+                            except Exception:
+                                ok = False
+                            if ok:
+                                st.success(f"Email uji berhasil dikirim ke {test_to}.")
+                            else:
+                                # Provide hints if failed
+                                st.error("Gagal mengirim email uji. Periksa kembali kredensial di secrets dan koneksi internet.")
+                                usern, apppw = _smtp_settings()
+                                if not usern or not apppw:
+                                    st.info("Hint: Pastikan secrets.email_credentials.username dan app_password terisi.")
+
 # -------------------------
 # Dashboard
 # -------------------------
