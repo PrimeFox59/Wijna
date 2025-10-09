@@ -1007,11 +1007,11 @@ def auth_sidebar():
                 status=u["status"],
             ), unsafe_allow_html=True)
             # Peringatan penting agar user melakukan logout setelah selesai
-            st.sidebar.warning("⚠️⚠️⚠️saat selesai menggunakan apps wajib logout, potensi data tidak terintegrasi saat apps autosleep")
+            st.sidebar.warning("saat selesai menggunakan apps wajib logout, potensi data tidak terintegrasi saat apps autosleep")
         else:
             st.sidebar.write(f"Logged in: **{user['full_name']}** ({user['role']})")
             # Peringatan penting agar user melakukan logout setelah selesai
-            st.sidebar.warning("⚠️⚠️⚠️ saat selesai menggunakan apps wajib logout, potensi data tidak terintegrasi saat apps autosleep")
+            st.sidebar.warning("saat selesai menggunakan apps wajib logout, potensi data tidak terintegrasi saat apps autosleep")
     else:
         tabs = st.sidebar.tabs(["Login", "Register"])
         with tabs[0]:
@@ -2001,7 +2001,7 @@ def inventory_module():
     if user["role"] in ["finance", "superuser"]:
         tab_labels.append("💰 Review Finance")
         def finance_tab():
-            st.info("Approve item yang sudah diinput staf.")
+            st.info("Approve item yang sudah diinput staff.")
             cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
             rows = cur.fetchall()
             for idx, r in enumerate(rows):
@@ -2409,9 +2409,9 @@ def surat_keluar_module():
         "📋 Daftar & Rekap Surat Keluar"
     ])
 
-    # --- Tab 1: Input Draft oleh Staf ---
+    # --- Tab 1: Input Draft oleh Staff ---
     with tab1:
-        st.markdown("### Input Draft Surat Keluar (Staf)")
+        st.markdown("### Input Draft Surat Keluar (Staff)")
         draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True, key="draft_type_sk")
         with st.form("sk_add", clear_on_submit=True):
             col1, col2 = st.columns(2)
@@ -2567,7 +2567,7 @@ def mou_module():
 
     # --- Tab 1: Input Draft MoU ---
     with tab1:
-        st.markdown("### Input Draft MoU (Staf)")
+        st.markdown("### Input Draft MoU (Staff)")
         jenis_options = [
             "Programmatic MoU",
             "Funding MoU / Grant Agreement",
@@ -2715,7 +2715,7 @@ def cash_advance_module():
     conn = get_db()
     cur = conn.cursor()
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📝 Input Staf",
+        "📝 Input Staff",
         "💰 Review Finance",
         "✅ Approval Director",
         "📋 Daftar & Rekap"
@@ -2723,7 +2723,7 @@ def cash_advance_module():
 
     # --- Tab 1: Input Staf ---
     with tab1:
-        st.markdown("### Pengajuan Cash Advance (Staf)")
+        st.markdown("### Pengajuan Cash Advance (Staff)")
         # --- Real-time total calculation ---
         if 'ca_nominals' not in st.session_state:
             st.session_state['ca_nominals'] = [0.0]*10
@@ -2902,14 +2902,14 @@ def pmr_module():
     conn = get_db()
     cur = conn.cursor()
     tab_upload, tab_finance, tab_director, tab_rekap = st.tabs([
-        "📝 Upload Laporan Bulanan (Staf)",
+        "📝 Upload Laporan Bulanan (Staff)",
         "💰 Review & Approval Finance",
         "✅ Approval Director PMR",
         "📋 Daftar & Rekap PMR"
     ])
 
     with tab_upload:
-        st.markdown("### Upload Laporan Bulanan (Staf)")
+        st.markdown("### Upload Laporan Bulanan (Staff)")
         with st.form("pmr_add", clear_on_submit=True):
             nama = st.text_input("Nama Pegawai")
             bulan = st.selectbox("Bulan (YYYY-MM)", options=[f"{y}-{m:02d}" for y in range(date.today().year-1, date.today().year+2) for m in range(1,13)])
@@ -3320,7 +3320,7 @@ def flex_module():
         st.error(f"Struktur tabel flex belum sesuai. Kolom berikut belum ada: {', '.join(missing)}.\n\nSilakan backup data, drop tabel flex, lalu jalankan ulang aplikasi agar tabel otomatis dibuat ulang.")
         return
     tabs = st.tabs([
-        "📝 Input Staf",
+        "📝 Input Staff",
         "💰 Review Finance",
         "✅ Approval Director",
         "📋 Daftar Flex"
@@ -3698,7 +3698,7 @@ def notulen_module():
 
     # --- Tab 1: Upload ---
     with tab_upload:
-        st.subheader("🆕 Upload Notulen (staf upload, Director approve final)")
+        st.subheader("🆕 Upload Notulen (staff upload, Director approve final)")
         with st.form("not_add", clear_on_submit=True):
             judul = st.text_input("Judul Rapat")
             if nt_date_col == "tanggal_rapat":
