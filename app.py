@@ -1041,119 +1041,7 @@ def auth_sidebar():
                         else:
                             st.error(msg)
 
-# -------------------------
-# Admin (superuser) panel
-# -------------------------
-def superuser_panel():
-    require_role(["superuser"])
-    st.header("Superuser — Manajemen User & Approval")
-    tab1, tab2 = st.tabs(["🕒 User Baru Menunggu Approval", "👥 Semua User"])
 
-    with tab1:
-        st.subheader("User baru menunggu approval")
-        conn1 = get_db()
-        cur1 = conn1.cursor()
-        cur1.execute("SELECT id,email,full_name,role,status,created_at FROM users WHERE status = 'pending'")
-        pendings = cur1.fetchall()
-        if pendings:
-            for idx, p in enumerate(pendings):
-                with st.expander(f"{p['full_name']} — {p['email']}"):
-                    st.markdown(f'''
-<div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);">
-<b>Nama:</b> {p['full_name']}<br>
-<b>Email:</b> {p['email']}<br>
-<b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br>
-<b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br>
-<b>Tanggal Daftar:</b> {p['created_at'][:10]}<br>
-<b>User ID:</b> <code>{p['id']}</code>
-</div>
-''', unsafe_allow_html=True)
-                    # Action buttons for this user
-                    col1, col2, col3 = st.columns([1,1,2])
-                    if 'superuser_panel_action' not in st.session_state:
-                        st.session_state['superuser_panel_action'] = {}
-                    with col1:
-                        if st.button("Approve", key=f"approve_{p['id']}_card_{idx}"):
-                            conn_btn = get_db()
-                            cur_btn = conn_btn.cursor()
-                            cur_btn.execute("UPDATE users SET status='active' WHERE id = ?", (p['id'],))
-                            conn_btn.commit()
-                            conn_btn.close()
-                            st.success("User diapprove.")
-                            st.rerun()
-                    with col2:
-                        if st.button("Reject", key=f"reject_{p['id']}_card_{idx}"):
-                            conn_btn = get_db()
-                            cur_btn = conn_btn.cursor()
-                            cur_btn.execute("UPDATE users SET status='inactive' WHERE id = ?", (p['id'],))
-                            conn_btn.commit()
-                            conn_btn.close()
-                            st.info("User di-set inactive.")
-                            st.rerun()
-                    with col3:
-                        new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p['role']), key=f"role_{p['id']}_card_{idx}")
-                        if st.button("Update Role", key=f"setrole_{p['id']}_card_{idx}"):
-                            conn_btn = get_db()
-                            cur_btn = conn_btn.cursor()
-                            cur_btn.execute("UPDATE users SET role=? WHERE id=?", (new_role, p['id']))
-                            conn_btn.commit()
-                            conn_btn.close()
-                            st.success("Role diupdate.")
-                            st.rerun()
-        else:
-            st.info("Tidak ada user pending.")
-        conn1.close()
-
-    with tab2:
-        st.subheader("Semua user")
-        conn2 = get_db()
-        df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
-        st.dataframe(df2, width='stretch')
-        conn2.close()
-    # (No form here, only one form with key 'admin_change' exists below)
-
-    # Only one form, outside the tabs
-    st.markdown("---")
-    st.subheader("Aksi User Management")
-    # Fetch all users for dropdown
-    conn3 = get_db()
-    cur3 = conn3.cursor()
-    cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC")
-    user_rows = cur3.fetchall()
-    conn3.close()
-    user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
-    user_id_map = {f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}": row['id'] for row in user_rows}
-    with st.form("admin_change"):
-        selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
-        uid = user_id_map[selected_user] if selected_user else ""
-        newrole = st.selectbox("Pilih role baru", ["staff","finance","director","superuser"])
-        newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
-        action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"])
-        submit = st.form_submit_button("Apply")
-        if submit:
-            conn3 = get_db()
-            cur3 = conn3.cursor()
-            if not uid:
-                st.error("Masukkan user id.")
-            else:
-                if action == "Update User":
-                    if newpw:
-                        cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
-                    else:
-                        cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
-                    conn3.commit()
-                    st.success("User updated.")
-                elif action == "Approve":
-                    cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,))
-                    conn3.commit()
-                    st.success("User diapprove.")
-                elif action == "Reject":
-                    cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,))
-                    conn3.commit()
-                    st.info("User di-set inactive.")
-            conn3.close()
-
-        # (No form here, only one form with key 'admin_change' exists below)
 
 # -------------------------
 # Common helpers for modules
@@ -4016,7 +3904,7 @@ def user_setting_module():
             unsafe_allow_html=True,
     )
 
-    tab_profile, tab_admin = st.tabs(["👤 Profil Saya", "🔐 Admin (Director)"])
+    tab_profile, tab_admin, tab1, tab2 = st.tabs(["👤 Profil Saya", "🔐 Admin (Director)","🕒 User Baru Menunggu Approval", "👥 Semua User"])
 
     # --- Tab 1: Profil Saya ---
     with tab_profile:
@@ -4229,7 +4117,116 @@ def user_setting_module():
                                 usern, apppw = _smtp_settings()
                                 if not usern or not apppw:
                                     st.info("Hint: Pastikan secrets.email_credentials.username dan app_password terisi.")
+    
+    with tab1:
+        st.subheader("User baru menunggu approval")
+        if not has_min_role("director, superuser"):
+            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
+            return
+        conn1 = get_db()
+        cur1 = conn1.cursor()
+        cur1.execute("SELECT id,email,full_name,role,status,created_at FROM users WHERE status = 'pending'")
+        pendings = cur1.fetchall()
+        if pendings:
+            for idx, p in enumerate(pendings):
+                with st.expander(f"{p['full_name']} — {p['email']}"):
+                    st.markdown(f'''
+<div style="background:#f8fbff;border-radius:10px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;box-shadow:0 2px 8px rgba(80,140,255,0.07);">
+<b>Nama:</b> {p['full_name']}<br>
+<b>Email:</b> {p['email']}<br>
+<b>Role:</b> <span style="color:#2563eb;font-weight:600">{p['role']}</span><br>
+<b>Status:</b> <span style="color:#eab308;font-weight:600">{p['status']}</span><br>
+<b>Tanggal Daftar:</b> {p['created_at'][:10]}<br>
+<b>User ID:</b> <code>{p['id']}</code>
+</div>
+''', unsafe_allow_html=True)
+                    # Action buttons for this user
+                    col1, col2, col3 = st.columns([1,1,2])
+                    if 'superuser_panel_action' not in st.session_state:
+                        st.session_state['superuser_panel_action'] = {}
+                    with col1:
+                        if st.button("Approve", key=f"approve_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET status='active' WHERE id = ?", (p['id'],))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.success("User diapprove.")
+                            st.rerun()
+                    with col2:
+                        if st.button("Reject", key=f"reject_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET status='inactive' WHERE id = ?", (p['id'],))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.info("User di-set inactive.")
+                            st.rerun()
+                    with col3:
+                        new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p['role']), key=f"role_{p['id']}_card_{idx}")
+                        if st.button("Update Role", key=f"setrole_{p['id']}_card_{idx}"):
+                            conn_btn = get_db()
+                            cur_btn = conn_btn.cursor()
+                            cur_btn.execute("UPDATE users SET role=? WHERE id=?", (new_role, p['id']))
+                            conn_btn.commit()
+                            conn_btn.close()
+                            st.success("Role diupdate.")
+                            st.rerun()
+        else:
+            st.info("Tidak ada user pending.")
+        conn1.close()
 
+    with tab2:
+        st.subheader("Semua user")
+        if not has_min_role("director, superuser"):
+            st.info("Hanya Director/Superuser yang dapat mengakses menu ini.")
+            return
+        conn2 = get_db()
+        df2 = pd.read_sql_query("SELECT id,email,full_name,role,status,last_login,created_at FROM users", conn2)
+        st.dataframe(df2, width='stretch')
+        conn2.close()
+    # (No form here, only one form with key 'admin_change' exists below)
+
+    # Only one form, outside the tabs
+    st.markdown("---")
+    st.subheader("Aksi User Management")
+    # Fetch all users for dropdown
+    conn3 = get_db()
+    cur3 = conn3.cursor()
+    cur3.execute("SELECT id, email, full_name, role, status FROM users ORDER BY created_at DESC")
+    user_rows = cur3.fetchall()
+    conn3.close()
+    user_options = [f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}" for row in user_rows]
+    user_id_map = {f"{row['id']} | {row['email']} | {row['full_name']} | {row['role']} | {row['status']}": row['id'] for row in user_rows}
+    with st.form("admin_change"):
+        selected_user = st.selectbox("Pilih user untuk edit", user_options, key="admin_user_select")
+        uid = user_id_map[selected_user] if selected_user else ""
+        newrole = st.selectbox("Pilih role baru", ["staff","finance","director","superuser"])
+        newpw = st.text_input("Set new password (kosong = tidak diganti)", type="password")
+        action = st.selectbox("Aksi", ["Update User", "Approve", "Reject"])
+        submit = st.form_submit_button("Apply")
+        if submit:
+            conn3 = get_db()
+            cur3 = conn3.cursor()
+            if not uid:
+                st.error("Masukkan user id.")
+            else:
+                if action == "Update User":
+                    if newpw:
+                        cur3.execute("UPDATE users SET role=?, password_hash=? WHERE id=?", (newrole, hash_password(newpw), uid))
+                    else:
+                        cur3.execute("UPDATE users SET role=? WHERE id=?", (newrole, uid))
+                    conn3.commit()
+                    st.success("User updated.")
+                elif action == "Approve":
+                    cur3.execute("UPDATE users SET status='active' WHERE id = ?", (uid,))
+                    conn3.commit()
+                    st.success("User diapprove.")
+                elif action == "Reject":
+                    cur3.execute("UPDATE users SET status='inactive' WHERE id = ?", (uid,))
+                    conn3.commit()
+                    st.info("User di-set inactive.")
+            conn3.close()
 # -------------------------
 # Dashboard
 # -------------------------
