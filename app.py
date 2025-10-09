@@ -3040,7 +3040,6 @@ def pmr_module():
 def delegasi_module():
     user = require_login()
     st.header("🗂️ Delegasi Tugas & Monitoring")
-    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Alur: Pemberi tugas membuat → PIC update status/upload bukti → Director monitor → Sinkron kalender & peringatan tenggat.</div>", unsafe_allow_html=True)
     conn = get_db()
     cur = conn.cursor()
     tab1, tab2, tab3, tab4 = st.tabs(["🆕 Buat Tugas", "📝 Update Status/Bukti", "👀 Monitoring Director", "📅 Rekap & Filter"])
@@ -3427,7 +3426,6 @@ def flex_module():
 def kalender_pemakaian_mobil_kantor():
     user = require_login()
     st.header("🚗 Kalender & Booking Mobil Kantor")
-    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Input/edit/hapus hanya oleh Finance, view oleh semua user, cek bentrok jadwal, sinkron ke Kalender Bersama.</div>", unsafe_allow_html=True)
     conn = get_db()
     cur = conn.cursor()
     tab1, tab2, tab3 = st.tabs(["📝 Input/Edit/Hapus (Finance)", "📋 Daftar Booking & Filter", "📅 Rekap Bulanan & Bentrok"])
@@ -4679,7 +4677,6 @@ def main():
         ("Notulen", "🗒️ Notulen"),
         ("User Setting", "⚙️ User Setting"),
         ("Audit Trail", "🕵️ Audit Trail"),
-        ("Superuser Panel", "🔑 Superuser Panel"),
         ("Dunyim Security", "🛡️ Dunyim Security")
     ]
     if "page" not in st.session_state:
