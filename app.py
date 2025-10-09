@@ -1731,6 +1731,7 @@ def attempt_auto_restore_if_seed(service, folder_id: str) -> Tuple[bool, str]:
 
 def dunyim_security_module():
     user = require_login()
+    require_role([ "superuser"])
     st.header("🛡️ Dunyim Security System")
     if not _drive_available():
         st.error("Paket Google API belum terpasang. Tambahkan 'google-api-python-client' dan 'google-auth' di requirements.")
@@ -1959,7 +1960,7 @@ def inventory_module():
     # --- UI with Tabs (always show tabs, even if df_month is empty) ---
     tab_labels = []
     tab_contents = []
-    if user["role"] in ["staff", "superuser"]:
+    if user["role"] in ["staff", "finance", "director", "superuser"]:
         st.markdown("# 📦 Inventory")
         tab_labels.append("➕ Tambah Barang")
         def staff_tab():
@@ -4526,6 +4527,58 @@ def dashboard():
             st.dataframe(df_hist, width='stretch', hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
+def audit_trail_module():
+    user = require_login()
+    st.header("🕵️ Audit Trail / Log Aktivitas")
+    conn = get_db()
+    cur = conn.cursor()
+    # Simple filters for Activity view (audit_logs)
+    st.markdown("#### Activity")
+    c1, c2 = st.columns(2)
+    with c1:
+        date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=7))
+    with c2:
+        date_max = st.date_input("Sampai tanggal", value=date.today())
+    q = st.text_input("Cari (Nama/Action/Detail)", "")
+
+    # Load from audit_logs with basic range filter
+    try:
+        params: List = []
+        query = "SELECT user_email as nama_user, timestamp as tanggal, action, details FROM audit_logs WHERE 1=1"
+        if date_min:
+            query += " AND date(timestamp) >= date(?)"
+            params.append(date_min.isoformat())
+        if date_max:
+            query += " AND date(timestamp) <= date(?)"
+            params.append(date_max.isoformat())
+        query += " ORDER BY timestamp DESC"
+        df = pd.read_sql_query(query, conn, params=params)
+    except Exception:
+        df = pd.DataFrame(columns=["nama_user","tanggal","action","details"])
+
+    # Quick search filter
+    if q and not df.empty:
+        ql = q.lower()
+        def _has(x):
+            try:
+                return ql in str(x).lower()
+            except Exception:
+                return False
+        mask = df.apply(lambda r: _has(r.get("nama_user")) or _has(r.get("action")) or _has(r.get("details")), axis=1)
+        df = df[mask]
+
+    # Present concise columns with nicer headers
+    if not df.empty:
+        df_present = df.rename(columns={
+            "nama_user": "Nama User",
+            "tanggal": "Date",
+            "action": "Action",
+            "details": "Detail",
+        })[["Nama User","Date","Action","Detail"]]
+        st.dataframe(df_present, use_container_width=True)
+    else:
+        st.info("Belum ada aktivitas.")
+
 
 # -------------------------
 # Main app flow
@@ -4815,8 +4868,6 @@ def main():
         user_setting_module()
     elif choice == "Audit Trail":
         audit_trail_module()
-    elif choice == "Superuser Panel":
-        superuser_panel()
     elif choice == "Dunyim Security":
         # Check scheduled backup once on module enter (non-blocking)
         try:
@@ -4829,57 +4880,7 @@ def main():
             pass
         dunyim_security_module()
 
-def audit_trail_module():
-    user = require_login()
-    st.header("🕵️ Audit Trail / Log Aktivitas")
-    conn = get_db()
-    cur = conn.cursor()
-    # Simple filters for Activity view (audit_logs)
-    st.markdown("#### Activity")
-    c1, c2 = st.columns(2)
-    with c1:
-        date_min = st.date_input("Dari tanggal", value=date.today() - timedelta(days=7))
-    with c2:
-        date_max = st.date_input("Sampai tanggal", value=date.today())
-    q = st.text_input("Cari (Nama/Action/Detail)", "")
 
-    # Load from audit_logs with basic range filter
-    try:
-        params: List = []
-        query = "SELECT user_email as nama_user, timestamp as tanggal, action, details FROM audit_logs WHERE 1=1"
-        if date_min:
-            query += " AND date(timestamp) >= date(?)"
-            params.append(date_min.isoformat())
-        if date_max:
-            query += " AND date(timestamp) <= date(?)"
-            params.append(date_max.isoformat())
-        query += " ORDER BY timestamp DESC"
-        df = pd.read_sql_query(query, conn, params=params)
-    except Exception:
-        df = pd.DataFrame(columns=["nama_user","tanggal","action","details"])
-
-    # Quick search filter
-    if q and not df.empty:
-        ql = q.lower()
-        def _has(x):
-            try:
-                return ql in str(x).lower()
-            except Exception:
-                return False
-        mask = df.apply(lambda r: _has(r.get("nama_user")) or _has(r.get("action")) or _has(r.get("details")), axis=1)
-        df = df[mask]
-
-    # Present concise columns with nicer headers
-    if not df.empty:
-        df_present = df.rename(columns={
-            "nama_user": "Nama User",
-            "tanggal": "Date",
-            "action": "Action",
-            "details": "Detail",
-        })[["Nama User","Date","Action","Detail"]]
-        st.dataframe(df_present, use_container_width=True)
-    else:
-        st.info("Belum ada aktivitas.")
 if __name__ == "__main__":
     ensure_db()
     main()
