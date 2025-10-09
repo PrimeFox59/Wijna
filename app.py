@@ -97,7 +97,8 @@ def format_date_wib(d: Optional[str]) -> str:
                 dt = datetime.fromisoformat(d.split('Z')[0].replace('Z',''))
                 # Assume stored as WIB-naive
                 return dt.strftime('%d-%m-%Y')
-            else:
+            # else:  # Removed due to missing corresponding if or code block
+                pass
                 y, m, dd = d[:4], d[5:7], d[8:10]
                 return f"{dd}-{m}-{y}"
     except Exception:
@@ -194,7 +195,7 @@ def sop_module():
     sop_cols = [row[1] for row in cur.fetchall()]
     sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
 
-    tab_upload, tab_daftar, tab_approve = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director"])
+    tab_upload, tab_daftar, tab_approve, tab_board = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director", "👥 Review Board"])
 
     # --- Tab 1: Upload SOP ---
     with tab_upload:
@@ -208,6 +209,7 @@ def sop_module():
                 if not judul or not f:
                     st.warning("Judul dan file wajib diisi.")
                 else:
+                    pass
                     sid = gen_id("sop")
                     blob, fname, _ = upload_file_and_store(f)
                     cols = ["id", "judul", "file_blob", "file_name"]
@@ -280,6 +282,34 @@ def sop_module():
             cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
             st.dataframe(show[cols_show], width='stretch')
             # Download file per item (opsional pilih)
+
+        # --- Tab 4: Review Board (Opsional) ---
+        with tab_board:
+            if user["role"] in ["board", "superuser"]:
+                try:
+                    dfb = pd.read_sql_query("SELECT id, judul, tanggal_upload, board_note FROM sop ORDER BY COALESCE(tanggal_upload, id) DESC", conn)
+                except Exception:
+                    dfb = pd.DataFrame()
+                if dfb.empty:
+                    st.info("Belum ada SOP untuk direview.")
+                else:
+                    for _, row in dfb.iterrows():
+                        st.markdown(f"**{row['judul']}**")
+                        cur_note = row.get('board_note') or ""
+                        note = st.text_area("Catatan Board", value=cur_note, key=f"sop_board_note_{row['id']}")
+                        if st.button("Simpan Catatan", key=f"sop_board_save_{row['id']}"):
+                            try:
+                                cur.execute("UPDATE sop SET board_note=? WHERE id=?", (note, row['id']))
+                                conn.commit()
+                                st.success("Catatan Board disimpan.")
+                                try:
+                                    audit_log("sop", "board_review", target=row['id'], details=f"note={note}")
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                st.error(f"Gagal simpan: {e}")
+            else:
+                st.info("Hanya Board yang dapat review di sini.")
             if "id" in show.columns and "file_name" in show.columns:
                 opsi = {f"{r['judul']} — {r.get(sop_date_col, '')} ({r['file_name'] or '-'})": r['id'] for _, r in show.iterrows()}
                 if opsi:
@@ -289,8 +319,8 @@ def sop_module():
                         row = pd.read_sql_query("SELECT file_blob, file_name FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
                         if row["file_blob"] is not None and row["file_name"]:
                             st.download_button("⬇️ Download File", data=row["file_blob"], file_name=row["file_name"], mime="application/octet-stream")
-        else:
-            st.info("Belum ada SOP.")
+            else:
+                st.info("Belum ada SOP.")
 
         # Rekap Bulanan SOP
         st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
@@ -424,6 +454,14 @@ def ensure_db():
             )
             """
         )
+        # Ensure SOP has board_note column for Board reviewer notes
+        try:
+            cur.execute("PRAGMA table_info(sop)")
+            sop_cols_existing = {row[1] for row in cur.fetchall()}
+            if "board_note" not in sop_cols_existing:
+                cur.execute("ALTER TABLE sop ADD COLUMN board_note TEXT")
+        except Exception:
+            pass
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS notulen (
@@ -439,6 +477,14 @@ def ensure_db():
             )
             """
         )
+        # Ensure Notulen has board_note column for Board reviewer notes
+        try:
+            cur.execute("PRAGMA table_info(notulen)")
+            nt_cols_existing = {row[1] for row in cur.fetchall()}
+            if "board_note" not in nt_cols_existing:
+                cur.execute("ALTER TABLE notulen ADD COLUMN board_note TEXT")
+        except Exception:
+            pass
         # File Log for audit
         cur.execute(
             """
@@ -955,6 +1001,7 @@ def has_role(roles) -> bool:
 # Order: staff < finance < director < superuser
 ROLE_HIERARCHY = {
     "staff": 1,
+    "board": 1,
     "finance": 2,
     "director": 3,
     "superuser": 4,
@@ -3694,7 +3741,7 @@ def notulen_module():
     nt_cols = [row[1] for row in cur.fetchall()]
     nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
 
-    tab_upload, tab_list, tab_rekap = st.tabs(["🆕 Upload Notulen", "📋 Daftar Notulen", "📅 Rekap Bulanan Notulen"])
+    tab_upload, tab_list, tab_rekap, tab_board = st.tabs(["🆕 Upload Notulen", "📋 Daftar Notulen", "📅 Rekap Bulanan Notulen", "👥 Review Board"]) 
 
     # --- Tab 1: Upload ---
     with tab_upload:
@@ -3841,6 +3888,37 @@ def notulen_module():
     # --- Tab 3: Rekap ---
     with tab_rekap:
         st.subheader("📅 Rekap Bulanan Notulen (Otomatis)")
+    
+    # --- Tab 4: Review Board (Opsional) ---
+    with tab_board:
+        if user["role"] in ["board", "superuser"]:
+            try:
+                df_nb = pd.read_sql_query("SELECT id, judul, " + (nt_date_col if nt_date_col else "'') AS tanggal") + ", board_note FROM notulen ORDER BY " + (nt_date_col if nt_date_col else "id") + " DESC", conn)
+            except Exception:
+                try:
+                    df_nb = pd.read_sql_query("SELECT id, judul, board_note FROM notulen ORDER BY id DESC", conn)
+                except Exception:
+                    df_nb = pd.DataFrame()
+            if df_nb.empty:
+                st.info("Belum ada notulen untuk direview.")
+            else:
+                for _, row in df_nb.iterrows():
+                    st.markdown(f"**{row['judul']}**")
+                    cur_note = row.get('board_note') or ""
+                    note = st.text_area("Catatan Board", value=cur_note, key=f"notulen_board_note_{row['id']}")
+                    if st.button("Simpan Catatan", key=f"notulen_board_save_{row['id']}"):
+                        try:
+                            cur.execute("UPDATE notulen SET board_note=? WHERE id=?", (note, row['id']))
+                            conn.commit()
+                            st.success("Catatan Board disimpan.")
+                            try:
+                                audit_log("notulen", "board_review", target=row['id'], details=f"note={note}")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            st.error(f"Gagal simpan: {e}")
+        else:
+            st.info("Hanya Board yang dapat review di sini.")
         cur.execute("PRAGMA table_info(notulen)")
         nt_cols = [row[1] for row in cur.fetchall()]
         nt_date_col = "tanggal_rapat" if "tanggal_rapat" in nt_cols else ("tanggal_upload" if "tanggal_upload" in nt_cols else None)
@@ -4166,7 +4244,10 @@ def user_setting_module():
                             st.info("User di-set inactive.")
                             st.rerun()
                     with col3:
-                        new_role = st.selectbox("Set role", ["staff","finance","director","superuser"], index=["staff","finance","director","superuser"].index(p['role']), key=f"role_{p['id']}_card_{idx}")
+                        role_options = ["staff","board","finance","director","superuser"]
+                        # Normalize existing role to options
+                        current_role = p['role'] if p['role'] in role_options else "staff"
+                        new_role = st.selectbox("Set role", role_options, index=role_options.index(current_role), key=f"role_{p['id']}_card_{idx}")
                         if st.button("Update Role", key=f"setrole_{p['id']}_card_{idx}"):
                             conn_btn = get_db()
                             cur_btn = conn_btn.cursor()
@@ -4308,7 +4389,7 @@ def dashboard():
     colB.markdown(f"""<div class='stat-card'><div class='stat-label'>Surat Belum Dibahas</div><div class='stat-value' style='color:#2563eb'>{surat_blm}</div><div class='stat-foot'>Status awal</div></div>""", unsafe_allow_html=True)
     colC.markdown(f"""<div class='stat-card'><div class='stat-label'>MoU ≤ 7 Hari</div><div class='stat-value' style='color:#9333ea'>{mou_due7}</div><div class='stat-foot'>Segera follow-up</div></div>""", unsafe_allow_html=True)
     colD.markdown(f"""<div class='stat-card'><div class='stat-label'>Delegasi Aktif</div><div class='stat-value' style='color:#059669'>{delegasi_aktif}</div><div class='stat-foot'>Belum selesai</div></div>""", unsafe_allow_html=True)
-    st.caption("Waktu ditampilkan dalam WIB (GMT+07:00); format tanggal dd-mm-yyyy.")
+
 
     # --------------------------------------------------
     # ROW 1: Approval | Status Surat+MoU | Rekap Multi Modul
