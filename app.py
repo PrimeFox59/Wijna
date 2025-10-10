@@ -925,13 +925,9 @@ def login_user(email, password):
         # Commit before calling audit_log to prevent cross-connection SQLite lock
         conn.commit()
         audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
-        # Best-effort backup on successful login (any user)
+        # Defer backup to after rerun to avoid blocking login button
         try:
-            if _drive_available():
-                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
-                if folder_id:
-                    service = _build_drive()
-                    _backup_db_now(service, folder_id)
+            st.session_state["__post_login_backup"] = True
         except Exception:
             pass
         conn.commit()
@@ -4821,6 +4817,20 @@ def main():
     st.sidebar.image(logo_path)
     st.sidebar.markdown("<h2 style='text-align:center;margin-bottom:0.5em;'>WIJNA Manajemen System</h2>", unsafe_allow_html=True)
     auth_sidebar()
+
+    # One-time post-login backup to Google Drive (non-blocking on first click)
+    if st.session_state.get("__post_login_backup"):
+        try:
+            if _drive_available():
+                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+                if folder_id:
+                    with st.spinner("Menyinkronkan database ke Drive (sekali setelah login)..."):
+                        service = _build_drive()
+                        _backup_db_now(service, folder_id)
+            st.session_state.pop("__post_login_backup", None)
+        except Exception:
+            # Clear the flag even if it fails to avoid repeating
+            st.session_state.pop("__post_login_backup", None)
 
     menu = [
         ("Dashboard", "🏠 Dashboard"),
