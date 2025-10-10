@@ -1273,6 +1273,26 @@ def _send_email(recipients: List[str], subject: str, body: str) -> bool:
     except Exception:
         return False
 
+# --- Notification toggles helpers ---
+def _bool_from_str(val: Optional[str], default: bool = True) -> bool:
+    if val is None:
+        return default
+    v = str(val).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+def _notif_toggle_key(entity_type: str, kind: str) -> str:
+    safe_entity = (entity_type or "").strip().lower().replace(" ", "_")
+    safe_kind = (kind or "decision").strip().lower().replace(" ", "_")
+    return f"notify_{safe_entity}_{safe_kind}_enabled"
+
+def _notif_toggle_enabled(entity_type: str, kind: str, default: bool = True) -> bool:
+    try:
+        key = _notif_toggle_key(entity_type, kind)
+        val = _setting_get(key)
+        return _bool_from_str(val, default)
+    except Exception:
+        return default
+
 def _notif_already_sent(entity_type: str, entity_id: str, kind: str, tag: str) -> bool:
     try:
         conn = get_db(); cur = conn.cursor()
@@ -1374,6 +1394,9 @@ def notify_review_request(entity_type: str, title: str, entity_id: Optional[str]
     - recipients_extra: extra email addresses
     """
     try:
+        # Check per-event toggle (request stage)
+        if not _notif_toggle_enabled(entity_type, "request", True):
+            return
         if not _email_enabled():
             return
         # Build recipient list by roles
@@ -1413,11 +1436,33 @@ def notify_review_request(entity_type: str, title: str, entity_id: Optional[str]
 def notify_decision(entity_type: str, title: str, decision: str, entity_id: Optional[str] = None,
                     recipients_roles: Optional[Tuple[str, ...]] = None,
                     recipients_users: Optional[List[str]] = None,
-                    tag_suffix: str = "") -> None:
-    """Generic notifier for decisions (approve/reject/reviewed)."""
+                    tag_suffix: str = "",
+                    decision_note: Optional[str] = None,
+                    acted_by_role: Optional[str] = None,
+                    decision_kind: Optional[str] = None) -> None:
+    """Generic notifier for decisions (approve/reject/reviewed).
+    - decision_note: optional note to include; if absent and entity_id provided, try to fetch from DB based on module and acted_by_role.
+    - acted_by_role: one of 'finance','director','board' to determine toggle kind; if omitted, inferred from decision_kind or recipients_roles.
+    - decision_kind: override toggle kind, e.g., 'finance_decision','director_decision','board_decision'.
+    """
     try:
         if not _email_enabled():
             return
+        # Determine kind for toggle & dedup
+        kind = (decision_kind or "").strip().lower()
+        if not kind:
+            role = (acted_by_role or "").strip().lower()
+            if role in ("finance", "director", "board"):
+                kind = f"{role}_decision"
+            elif recipients_roles and len(recipients_roles) == 1 and recipients_roles[0] in ("finance","director","board"):
+                kind = f"{recipients_roles[0]}_decision"
+            else:
+                kind = "decision"
+
+        # Gate by per-event toggle
+        if not _notif_toggle_enabled(entity_type, kind, True):
+            return
+
         recipients: List[str] = []
         if recipients_roles:
             roles = [r.strip().lower() for r in recipients_roles]
@@ -1425,19 +1470,76 @@ def notify_decision(entity_type: str, title: str, decision: str, entity_id: Opti
                 recipients += _get_director_emails()
             if "finance" in roles:
                 recipients += _get_finance_emails()
+            if "board" in roles:
+                recipients += _get_board_emails()
         if recipients_users:
             recipients += [e for e in recipients_users if e and '@' in e]
         recipients = sorted(set([e.lower() for e in recipients if e]))
         if not recipients:
             return
-        subj = f"[WIJNA] {entity_type.replace('_',' ').title()} — {decision.replace('_',' ').title()} — {title}"
+
+        # Try resolve decision note if not provided
+        note = (decision_note or "").strip()
+        if not note and entity_id:
+            try:
+                conn = get_db(); cur = conn.cursor()
+                et = (entity_type or "").strip().lower()
+                if et == "inventory":
+                    col = "director_note" if "director" in kind else ("finance_note" if "finance" in kind else None)
+                    if col:
+                        cur.execute(f"SELECT {col} FROM inventory WHERE id=?", (entity_id,))
+                        r = cur.fetchone(); note = (r[col] if r and r[col] else "")
+                elif et == "cuti":
+                    col = "director_note" if "director" in kind else ("finance_note" if "finance" in kind else None)
+                    if col:
+                        cur.execute(f"SELECT {col} FROM cuti WHERE id=?", (entity_id,))
+                        r = cur.fetchone(); note = (r[col] if r and r[col] else "")
+                elif et == "cash_advance":
+                    col = "director_note" if "director" in kind else ("finance_note" if "finance" in kind else None)
+                    if col:
+                        cur.execute(f"SELECT {col} FROM cash_advance WHERE id=?", (entity_id,))
+                        r = cur.fetchone(); note = (r[col] if r and r[col] else "")
+                elif et == "flex":
+                    col = "catatan_director" if "director" in kind else ("catatan_finance" if "finance" in kind else None)
+                    if col:
+                        cur.execute(f"SELECT {col} FROM flex WHERE id=?", (entity_id,))
+                        r = cur.fetchone(); note = (r[col] if r and r[col] else "")
+                elif et == "mou":
+                    col = "director_note" if "director" in kind else ("board_note" if "board" in kind else None)
+                    if col:
+                        cur.execute(f"SELECT {col} FROM mou WHERE id=?", (entity_id,))
+                        r = cur.fetchone(); note = (r[col] if r and r[col] else "")
+            except Exception:
+                pass
+
+        # Subject & body
+        decision_label = decision.replace('_',' ').title()
+        subj = f"[WIJNA] {entity_type.replace('_',' ').title()} — {decision_label} — {title}"
         ts = format_datetime_wib(now_wib_iso())
-        body = f"Keputusan: {decision}\nWaktu: {ts}\n\n{title}\n\nNotifikasi otomatis."
+        actor = get_current_user() or {}
+        actor_name = actor.get('full_name') or actor.get('email') or '-'
+        actor_role = (acted_by_role or actor.get('role') or '').title()
+        lines = [
+            f"Keputusan: {decision_label}",
+            f"Modul: {entity_type}",
+            f"Judul/Referensi: {title}",
+            f"Waktu: {ts}",
+            f"Oleh: {actor_name} ({actor_role or '-'})",
+        ]
+        if note:
+            lines.append("")
+            lines.append("Catatan Keputusan:")
+            lines.append(note)
+        lines.append("")
+        lines.append("Notifikasi otomatis WIJNA.")
+        body = "\n".join(lines)
+
+        # Dedup key uses the computed kind
         tag = f"{entity_type}:{decision}:{entity_id or title}:{tag_suffix or '-'}"
-        if _notif_already_sent(entity_type, entity_id or '-', 'decision', tag):
+        if _notif_already_sent(entity_type, entity_id or '-', kind, tag):
             return
         if _send_email(recipients, subj, body):
-            _mark_notif_sent(entity_type, entity_id or '-', 'decision', tag, recipients)
+            _mark_notif_sent(entity_type, entity_id or '-', kind, tag, recipients)
     except Exception:
         pass
 
@@ -4348,6 +4450,38 @@ def user_setting_module():
                     na = st.toggle("Delegasi: Auto-shift deadline jika jatuh pada Libur Nasional", value=autoshift)
                 with colF:
                     st.caption("Jika aktif, sistem akan memundurkan tenggat ke hari kerja berikutnya.")
+
+                st.markdown("---")
+                st.markdown("#### Toggle Notifikasi per Event")
+                st.caption("Aktif/nonaktifkan pengiriman email untuk tiap modul dan tahap event.")
+                modules = [
+                    ("inventory", "Inventory"),
+                    ("cuti", "Cuti"),
+                    ("cash_advance", "Cash Advance"),
+                    ("flex", "Flex Time"),
+                    ("mou", "MoU"),
+                ]
+                events = [
+                    ("request", "Permintaan Review (Submit)"),
+                    ("finance_decision", "Keputusan Finance"),
+                    ("director_decision", "Keputusan Director"),
+                    ("board_decision", "Keputusan Board (khusus MoU/SOP/Notulen)"),
+                ]
+                # Render a grid of toggles
+                for ent_key, ent_label in modules:
+                    st.markdown(f"**{ent_label}**")
+                    c1, c2, c3, c4 = st.columns(4)
+                    cols = [c1, c2, c3, c4]
+                    vals = []
+                    for idx, (evt_key, evt_label) in enumerate(events):
+                        with cols[idx]:
+                            cur_val = _notif_toggle_enabled(ent_key, evt_key, True)
+                            vals.append(st.toggle(evt_label, value=cur_val, key=f"tgl_{ent_key}_{evt_key}"))
+                    # Save for this module
+                    if st.button(f"Simpan Toggle {ent_label}", key=f"save_toggles_{ent_key}"):
+                        for (evt_key, _), v in zip(events, vals):
+                            _setting_set(_notif_toggle_key(ent_key, evt_key), 'true' if v else 'false')
+                        st.success(f"Toggle notifikasi {ent_label} disimpan.")
                 if st.button("Simpan Pengaturan Email", key="save_email_notif"):
                     _setting_set('enable_email_notifications', 'true' if ng else 'false')
                     _setting_set('pmr_notify_enabled', 'true' if np else 'false')
