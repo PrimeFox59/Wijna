@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import sqlite3
 from sqlite3 import Connection
+import sqlite3
+import pandas as pd
 from datetime import datetime, date, timedelta
 import io
 import base64
@@ -578,6 +580,11 @@ def ensure_db():
             director_approved INTEGER DEFAULT 0
         )
         """)
+        # Migration: track requester for cash advance
+        try:
+            cur.execute("ALTER TABLE cash_advance ADD COLUMN requested_by TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pmr (
             id TEXT PRIMARY KEY,
@@ -598,6 +605,11 @@ def ensure_db():
         CREATE TABLE IF NOT EXISTS cuti (
             id TEXT PRIMARY KEY,
             nama TEXT,
+        # Migration: track creator for MoU
+        try:
+            cur.execute("ALTER TABLE mou ADD COLUMN created_by TEXT")
+        except Exception:
+            pass
             tgl_mulai TEXT,
             tgl_selesai TEXT,
             durasi INTEGER,
@@ -686,6 +698,11 @@ def ensure_db():
             file_name TEXT
         )
         """)
+        # Optional requester column for inventory (when loan requests reuse pic field already, so this is optional)
+        try:
+            cur.execute("ALTER TABLE inventory ADD COLUMN requested_by TEXT")
+        except Exception:
+            pass
         # Rekap bulanan cash advance (aggregated summary), one row per bulan (YYYY-MM)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS rekap_monthly_cashadvance (
@@ -1286,6 +1303,20 @@ def _get_director_emails() -> List[str]:
 def _get_user_email_by_name(full_name: str) -> Optional[str]:
     if not full_name:
         return None
+
+def _get_board_emails() -> List[str]:
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE status='active' AND role='board'")
+        rows = cur.fetchall() or []
+        emails: List[str] = []
+        for r in rows:
+            e = r['email'] if isinstance(r, dict) else (r[0] if r else None)
+            if e and '@' in e:
+                emails.append(str(e).strip().lower())
+        return sorted(set(emails))
+    except Exception:
+        return []
     try:
         conn = get_db(); cur = conn.cursor()
         # case-insensitive match on full_name
@@ -1294,6 +1325,23 @@ def _get_user_email_by_name(full_name: str) -> Optional[str]:
         if not row:
             return None
         return row['email'] if isinstance(row, dict) else row[0]
+    except Exception:
+        return None
+
+def _resolve_user_email_by_id_or_name(user_ref: Optional[str]) -> Optional[str]:
+    """Resolve a user email from a stored reference: supports user id, email, or full name."""
+    if not user_ref:
+        return None
+    try:
+        ur = str(user_ref).strip()
+        if '@' in ur:
+            return ur
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE id=?", (ur,))
+        row = cur.fetchone()
+        if row:
+            return row['email'] if isinstance(row, dict) else row[0]
+        return _get_user_email_by_name(ur)
     except Exception:
         return None
 
@@ -1335,6 +1383,8 @@ def notify_review_request(entity_type: str, title: str, entity_id: Optional[str]
             recips.extend(_get_finance_emails())
         if "director" in roles:
             recips.extend(_get_director_emails())
+        if "board" in roles:
+            recips.extend(_get_board_emails())
         if recipients_extra:
             recips.extend([e for e in recipients_extra if e and '@' in e])
         # Deduplicate
@@ -1358,6 +1408,37 @@ def notify_review_request(entity_type: str, title: str, entity_id: Optional[str]
             _mark_notif_sent(entity_type, entity_id or '-', 'review-request', tag, recips)
     except Exception:
         # best effort only
+        pass
+
+def notify_decision(entity_type: str, title: str, decision: str, entity_id: Optional[str] = None,
+                    recipients_roles: Optional[Tuple[str, ...]] = None,
+                    recipients_users: Optional[List[str]] = None,
+                    tag_suffix: str = "") -> None:
+    """Generic notifier for decisions (approve/reject/reviewed)."""
+    try:
+        if not _email_enabled():
+            return
+        recipients: List[str] = []
+        if recipients_roles:
+            roles = [r.strip().lower() for r in recipients_roles]
+            if "director" in roles:
+                recipients += _get_director_emails()
+            if "finance" in roles:
+                recipients += _get_finance_emails()
+        if recipients_users:
+            recipients += [e for e in recipients_users if e and '@' in e]
+        recipients = sorted(set([e.lower() for e in recipients if e]))
+        if not recipients:
+            return
+        subj = f"[WIJNA] {entity_type.replace('_',' ').title()} — {decision.replace('_',' ').title()} — {title}"
+        ts = format_datetime_wib(now_wib_iso())
+        body = f"Keputusan: {decision}\nWaktu: {ts}\n\n{title}\n\nNotifikasi otomatis."
+        tag = f"{entity_type}:{decision}:{entity_id or title}:{tag_suffix or '-'}"
+        if _notif_already_sent(entity_type, entity_id or '-', 'decision', tag):
+            return
+        if _send_email(recipients, subj, body):
+            _mark_notif_sent(entity_type, entity_id or '-', 'decision', tag, recipients)
+    except Exception:
         pass
 
 # --- Helpers: Public Holiday utilities & working days ---
@@ -2075,6 +2156,16 @@ def inventory_module():
                                 audit_log("inventory", "finance_review", target=r["id"], details=note)
                             except Exception:
                                 pass
+                            # Notify Director + requester (if resolvable from PIC)
+                            try:
+                                requester_email = None
+                                # PIC may store requester id or name; try resolve
+                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                                notify_decision("inventory", title=r['name'], decision="finance_reviewed", entity_id=r['id'],
+                                                recipients_roles=("director",), recipients_users=[requester_email] if requester_email else None,
+                                                tag_suffix="finance")
+                            except Exception:
+                                pass
                             st.success("Finance reviewed. Menunggu persetujuan Director.")
                     with colf2:
                         st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
@@ -2112,6 +2203,14 @@ def inventory_module():
                                 audit_log("inventory", "director_approval", target=r["id"], details=f"approve=1; note={note2}")
                             except Exception:
                                 pass
+                            # Notify requester + Finance
+                            try:
+                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                                notify_decision("inventory", title=r['name'], decision="director_approved", entity_id=r['id'],
+                                                recipients_roles=("finance",), recipients_users=[requester_email] if requester_email else None,
+                                                tag_suffix="director")
+                            except Exception:
+                                pass
                             st.success("Item telah di-approve Director.")
                     with colB:
                         if st.button("❌ Tolak", key=f"reject_dir_{r['id']}_director_{idx}"):
@@ -2119,6 +2218,13 @@ def inventory_module():
                             conn.commit()
                             try:
                                 audit_log("inventory", "director_approval", target=r["id"], details=f"approve=0; note={note2}")
+                            except Exception:
+                                pass
+                            try:
+                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                                notify_decision("inventory", title=r['name'], decision="director_rejected", entity_id=r['id'],
+                                                recipients_roles=("finance",), recipients_users=[requester_email] if requester_email else None,
+                                                tag_suffix="director")
                             except Exception:
                                 pass
         tab_contents.append(director_tab)
@@ -2643,12 +2749,19 @@ def mou_module():
                 else:
                     mid = gen_id("mou")
                     blob, fname, _ = upload_file_and_store(f)
-                    cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,board_note,board_approved,final_blob,final_name)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, "", 0, None, None))
+                    created_by = (user.get('id') if isinstance(user, dict) else None)
+                    cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,board_note,board_approved,final_blob,final_name,created_by)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, "", 0, None, None, created_by))
                     conn.commit()
                     try:
                         audit_log("mou", "create", target=mid, details=f"{nomor} - {nama} ({jenis})")
+                    except Exception:
+                        pass
+                    # Notify Board and Director for new draft
+                    try:
+                        title = f"{nomor} — {nama}"
+                        notify_review_request("mou", title=title, entity_id=mid, recipients_roles=("board","director"))
                     except Exception:
                         pass
                     st.success("MoU tersimpan (draft).")
@@ -2673,6 +2786,24 @@ def mou_module():
                         st.success("Review Board disimpan.")
                         try:
                             audit_log("mou", "board_review", target=row['id'], details=f"approve={bool(approve)}; note={note}")
+                        except Exception:
+                            pass
+                        # Notify Director + creator/applicant
+                        try:
+                            creator_email = None
+                            try:
+                                r2 = pd.read_sql_query("SELECT created_by, nomor, nama FROM mou WHERE id=?", conn, params=(row['id'],))
+                                if not r2.empty:
+                                    creator_email = _resolve_user_email_by_id_or_name(r2.iloc[0].get('created_by'))
+                                    title = f"{r2.iloc[0]['nomor']} — {r2.iloc[0]['nama']}"
+                                else:
+                                    title = f"{row['nomor']} — {row['nama']}"
+                            except Exception:
+                                title = f"{row['nomor']} — {row['nama']}"
+                            decision = "board_approved" if approve else "board_rejected"
+                            notify_decision("mou", title=title, decision=decision, entity_id=row['id'],
+                                            recipients_roles=("director",), recipients_users=[creator_email] if creator_email else None,
+                                            tag_suffix="board")
                         except Exception:
                             pass
                         st.rerun()
@@ -2809,8 +2940,14 @@ def cash_advance_module():
                 st.error("Nama Program dan minimal 1 item wajib diisi.")
             else:
                 cid = gen_id("ca")
-                cur.execute("INSERT INTO cash_advance (id,divisi,items_json,totals,tanggal,finance_note,finance_approved,director_note,director_approved) VALUES (?,?,?,?,?,?,?,?,?)",
-                            (cid, nama_program, json.dumps(items), total, tanggal.isoformat(), "", 0, "", 0))
+                requester_id = (user.get('id') if isinstance(user, dict) else None)
+                try:
+                    cur.execute("INSERT INTO cash_advance (id,divisi,items_json,totals,tanggal,finance_note,finance_approved,director_note,director_approved,requested_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (cid, nama_program, json.dumps(items), total, tanggal.isoformat(), "", 0, "", 0, requester_id))
+                except Exception:
+                    # fallback if column doesn't exist yet
+                    cur.execute("INSERT INTO cash_advance (id,divisi,items_json,totals,tanggal,finance_note,finance_approved,director_note,director_approved) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (cid, nama_program, json.dumps(items), total, tanggal.isoformat(), "", 0, "", 0))
                 conn.commit()
                 try:
                     audit_log("cash_advance", "create", target=cid, details=f"divisi={nama_program}; total={total}")
@@ -2827,7 +2964,7 @@ def cash_advance_module():
     with tab2:
         st.markdown("### Review & Approval Finance")
         if user["role"] in ["finance", "superuser"]:
-            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved, COALESCE(requested_by,'') as requested_by FROM cash_advance ORDER BY tanggal DESC", conn)
             for idx, row in df.iterrows():
                 with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"):
                     items = json.loads(row['items_json']) if row['items_json'] else []
@@ -2861,6 +2998,16 @@ def cash_advance_module():
                         except Exception:
                             pass
                         st.success("Diajukan ke Director.")
+                        # Notify Director + applicant
+                        try:
+                            applicant_email = _resolve_user_email_by_id_or_name(row.get('requested_by')) if isinstance(row, dict) else None
+                            decision = "finance_approved"
+                            title_txt = f"{row['divisi']} — {format_rp(row['totals'])}"
+                            notify_decision("cash_advance", title=title_txt, decision=decision, entity_id=row['id'],
+                                            recipients_roles=("director",), recipients_users=[applicant_email] if applicant_email else None,
+                                            tag_suffix="finance")
+                        except Exception:
+                            pass
                         st.rerun()
                     if return_user:
                         cur.execute("UPDATE cash_advance SET finance_note=?, finance_approved=0 WHERE id=?", (note + "\n[Perlu revisi oleh user]", row['id']))
@@ -2870,6 +3017,16 @@ def cash_advance_module():
                         except Exception:
                             pass
                         st.warning("Dikembalikan ke user peminta.")
+                        # Notify Director + applicant of rejection
+                        try:
+                            applicant_email = _resolve_user_email_by_id_or_name(row.get('requested_by')) if isinstance(row, dict) else None
+                            decision = "finance_rejected"
+                            title_txt = f"{row['divisi']} — {format_rp(row['totals'])}"
+                            notify_decision("cash_advance", title=title_txt, decision=decision, entity_id=row['id'],
+                                            recipients_roles=("director",), recipients_users=[applicant_email] if applicant_email else None,
+                                            tag_suffix="finance")
+                        except Exception:
+                            pass
                         st.rerun()
         else:
             st.info("Hanya Finance yang dapat review di sini.")
@@ -2878,7 +3035,7 @@ def cash_advance_module():
     with tab3:
         st.markdown("### Approval Director Cash Advance")
         if user["role"] in ["director", "superuser"]:
-            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
+            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved, COALESCE(requested_by,'') as requested_by FROM cash_advance ORDER BY tanggal DESC", conn)
             for idx, row in df.iterrows():
                 with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {row['totals']:,.0f}"):
                     items = json.loads(row['items_json']) if row['items_json'] else []
@@ -2895,6 +3052,16 @@ def cash_advance_module():
                         except Exception:
                             pass
                         st.success("Approval Director disimpan.")
+                        # Notify applicant + Finance
+                        try:
+                            applicant_email = _resolve_user_email_by_id_or_name(row.get('requested_by')) if isinstance(row, dict) else None
+                            decision = "director_approved" if approve else "director_rejected"
+                            title_txt = f"{row['divisi']} — {format_rp(row['totals'])}"
+                            notify_decision("cash_advance", title=title_txt, decision=decision, entity_id=row['id'],
+                                            recipients_roles=("finance",), recipients_users=[applicant_email] if applicant_email else None,
+                                            tag_suffix="director")
+                        except Exception:
+                            pass
                         st.rerun()
         else:
             st.info("Hanya Director yang dapat approve di sini.")
@@ -3401,6 +3568,11 @@ def flex_module():
                         audit_log("flex", "create", target=fid, details=f"{nama} {tanggal} {jam_mulai}-{jam_selesai}; alasan={alasan}")
                     except Exception:
                         pass
+                    # Notify Finance + Director new request
+                    try:
+                        notify_review_request("flex", title=f"{nama} • {tanggal} {jam_mulai}-{jam_selesai}", entity_id=fid, recipients_roles=("finance","director"))
+                    except Exception:
+                        pass
                     st.success("Flex time diajukan.")
 
     # --- Tab 2: Review Finance ---
@@ -3421,6 +3593,15 @@ def flex_module():
                         conn.commit()
                         try:
                             audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        # Notify Director + applicant
+                        try:
+                            applicant_email = _get_user_email_by_name(row['nama'])
+                            decision = "finance_approved" if approve else "finance_rejected"
+                            notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
+                                            entity_id=row['id'], recipients_roles=("director",),
+                                            recipients_users=[applicant_email] if applicant_email else None, tag_suffix="finance")
                         except Exception:
                             pass
                         st.success("Status review finance diperbarui.")
@@ -3445,6 +3626,15 @@ def flex_module():
                         conn.commit()
                         try:
                             audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                        except Exception:
+                            pass
+                        # Notify applicant + Finance
+                        try:
+                            applicant_email = _get_user_email_by_name(row['nama'])
+                            decision = "director_approved" if approve else "director_rejected"
+                            notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
+                                            entity_id=row['id'], recipients_roles=("finance",),
+                                            recipients_users=[applicant_email] if applicant_email else None, tag_suffix="director")
                         except Exception:
                             pass
                         st.success("Status approval director diperbarui.")
@@ -4984,6 +5174,15 @@ def main():
                                 audit_log("cuti", "finance_review", target=row["id"], details=f"approve={bool(approve)}; status={status}")
                             except Exception:
                                 pass
+                            # Notify Director + applicant
+                            try:
+                                pemohon_email = _get_user_email_by_name(row['nama'])
+                                decision = "finance_approved" if approve else "finance_rejected"
+                                notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
+                                                entity_id=row['id'], recipients_roles=("director",),
+                                                recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="finance")
+                            except Exception:
+                                pass
                             st.rerun()
             else:
                 st.info("Hanya Finance/Superuser yang dapat review di sini.")
@@ -5014,6 +5213,15 @@ def main():
                             # Audit trail
                             try:
                                 audit_log("cuti", "director_approval", target=row["id"], details=f"approve={bool(approve)}")
+                            except Exception:
+                                pass
+                            # Notify applicant + Finance
+                            try:
+                                pemohon_email = _get_user_email_by_name(row['nama'])
+                                decision = "director_approved" if approve else "director_rejected"
+                                notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
+                                                entity_id=row['id'], recipients_roles=("finance",),
+                                                recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="director")
                             except Exception:
                                 pass
                             st.rerun()
