@@ -2224,6 +2224,11 @@ def inventory_module():
                             audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
                         except Exception:
                             pass
+                        # Notify Finance + Director immediately on draft creation
+                        try:
+                            notify_review_request("inventory", title=f"{full_nama} — {loc}", entity_id=iid, recipients_roles=("finance","director"))
+                        except Exception:
+                            pass
                         st.success("Item disimpan sebagai draft. Menunggu review Finance.")
         tab_contents.append(staff_tab)
     if user["role"] in ["finance", "superuser"]:
