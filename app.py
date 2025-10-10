@@ -2263,14 +2263,55 @@ def inventory_module():
                                 requester_email = None
                                 # PIC may store requester id or name; try resolve
                                 requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision("inventory", title=r['name'], decision="finance_reviewed", entity_id=r['id'],
-                                                recipients_roles=("director",), recipients_users=[requester_email] if requester_email else None,
-                                                tag_suffix="finance")
+                                notify_decision(
+                                    "inventory",
+                                    title=r['name'],
+                                    decision="finance_reviewed",
+                                    entity_id=r['id'],
+                                    recipients_roles=("director",),
+                                    recipients_users=[requester_email] if requester_email else None,
+                                    tag_suffix="finance",
+                                    decision_note=note,
+                                    acted_by_role="finance",
+                                    decision_kind="finance_decision",
+                                )
                             except Exception:
                                 pass
                             st.success("Finance reviewed. Menunggu persetujuan Director.")
                     with colf2:
                         st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
+            # Section: items waiting for Director approval with resend option
+            st.markdown("---")
+            st.subheader("Menunggu Approval Director (Kirim Ulang Notifikasi)")
+            cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0 ORDER BY updated_at DESC")
+            waiting = cur.fetchall()
+            if not waiting:
+                st.caption("Tidak ada item yang menunggu.")
+            else:
+                for jdx, w in enumerate(waiting):
+                    col1, col2, col3 = st.columns([3,3,2])
+                    with col1:
+                        st.write(f"{w['name']} ({w['id']})")
+                    with col2:
+                        st.write(f"PIC: {w['pic']}")
+                    with col3:
+                        if st.button("Kirim Ulang Notifikasi", key=f"resend_dir_{w['id']}"):
+                            try:
+                                requester_email = _resolve_user_email_by_id_or_name(w.get('pic')) if isinstance(w, sqlite3.Row) else None
+                                notify_decision(
+                                    "inventory",
+                                    title=w['name'],
+                                    decision="finance_reviewed",
+                                    entity_id=w['id'],
+                                    recipients_roles=("director",),
+                                    recipients_users=[requester_email] if requester_email else None,
+                                    tag_suffix="finance-resend",
+                                    acted_by_role="finance",
+                                    decision_kind="finance_decision",
+                                )
+                                st.success("Notifikasi dikirim.")
+                            except Exception:
+                                st.warning("Gagal mengirim notifikasi.")
         tab_contents.append(finance_tab)
     if user["role"] in ["director", "superuser"]:
         tab_labels.append("✅ Approval Director")
@@ -2308,9 +2349,18 @@ def inventory_module():
                             # Notify requester + Finance
                             try:
                                 requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision("inventory", title=r['name'], decision="director_approved", entity_id=r['id'],
-                                                recipients_roles=("finance",), recipients_users=[requester_email] if requester_email else None,
-                                                tag_suffix="director")
+                                notify_decision(
+                                    "inventory",
+                                    title=r['name'],
+                                    decision="director_approved",
+                                    entity_id=r['id'],
+                                    recipients_roles=("finance",),
+                                    recipients_users=[requester_email] if requester_email else None,
+                                    tag_suffix="director",
+                                    decision_note=note2,
+                                    acted_by_role="director",
+                                    decision_kind="director_decision",
+                                )
                             except Exception:
                                 pass
                             st.success("Item telah di-approve Director.")
@@ -2324,9 +2374,18 @@ def inventory_module():
                                 pass
                             try:
                                 requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision("inventory", title=r['name'], decision="director_rejected", entity_id=r['id'],
-                                                recipients_roles=("finance",), recipients_users=[requester_email] if requester_email else None,
-                                                tag_suffix="director")
+                                notify_decision(
+                                    "inventory",
+                                    title=r['name'],
+                                    decision="director_rejected",
+                                    entity_id=r['id'],
+                                    recipients_roles=("finance",),
+                                    recipients_users=[requester_email] if requester_email else None,
+                                    tag_suffix="director",
+                                    decision_note=note2,
+                                    acted_by_role="director",
+                                    decision_kind="director_decision",
+                                )
                             except Exception:
                                 pass
         tab_contents.append(director_tab)
