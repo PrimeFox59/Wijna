@@ -2189,57 +2189,67 @@ def inventory_module():
             )""")
             conn.commit()
             df_month = pd.DataFrame()
-    # --- UI with Tabs (always show tabs, even if df_month is empty) ---
-    tab_labels = []
-    tab_contents = []
-    if user["role"] in ["staff", "finance", "director", "superuser"]:
-        st.markdown("# 📦 Inventory")
-        tab_labels.append("➕ Tambah Barang")
-        def staff_tab():
-            with st.form("inv_add"):
-                name = st.text_input("Nama Barang")
-                keterangan_opsi = st.selectbox("Keterangan Tambahan", ["", "dijual", "rusak"], index=0)
-                loc = st.text_input("Tempat Barang")
-                status = st.selectbox("Status", ["Tersedia","Dipinjam","Rusak","Dijual"])
-                # PIC dihapus
-                f = st.file_uploader("Lampiran (opsional)")
-                submitted = st.form_submit_button("Simpan (draft)")
-                if submitted:
-                    if not name:
-                        st.warning("Nama barang wajib diisi.")
-                    else:
-                        full_nama = name
-                        if keterangan_opsi:
-                            full_nama += f" ({keterangan_opsi})"
-                        iid = gen_id("inv")
-                        now = now_wib_iso()
-                        blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
-                        # PIC dihapus, set kosong
-                        pic = ""
-                        cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    (iid, full_nama, loc, status, pic, now, '', 0, '', 0, blob, fname))
-                        conn.commit()
-                        try:
-                            audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
-                        except Exception:
-                            pass
-                        # Notify Finance + Director immediately on draft creation
-                        try:
-                            notify_review_request("inventory", title=f"{full_nama} — {loc}", entity_id=iid, recipients_roles=("finance","director"))
-                        except Exception:
-                            pass
-                        st.success("Item disimpan sebagai draft. Menunggu review Finance.")
-        tab_contents.append(staff_tab)
-    if user["role"] in ["finance", "superuser"]:
-        tab_labels.append("💰 Review Finance")
-        def finance_tab():
-            st.info("Approve item yang sudah diinput staff.")
-            cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
-            rows = cur.fetchall()
-            for idx, r in enumerate(rows):
-                with st.container():
-                    st.markdown(f"""
+    # --- UI with Tabs: Selalu tampilkan SEMUA tab; hak akses diatur di dalam masing-masing tab ---
+    st.markdown("# 📦 Inventory")
+
+    tab_labels = [
+        "➕ Tambah Barang",
+        "💰 Review Finance",
+        "✅ Approval Director",
+        "📦 Daftar Inventaris",
+    ]
+
+    # Tab 1: Tambah Barang (aksi hanya untuk Staff/Superuser)
+    def staff_tab():
+        allowed = user["role"] in ["staff", "superuser"]
+        if not allowed:
+            st.info("Hanya Staff atau Superuser yang dapat menambah barang. Tab ini ditampilkan untuk transparansi alur kerja.")
+            return
+        with st.form("inv_add"):
+            name = st.text_input("Nama Barang")
+            keterangan_opsi = st.selectbox("Keterangan Tambahan", ["", "dijual", "rusak"], index=0)
+            loc = st.text_input("Tempat Barang")
+            status = st.selectbox("Status", ["Tersedia","Dipinjam","Rusak","Dijual"])
+            # PIC dihapus
+            f = st.file_uploader("Lampiran (opsional)")
+            submitted = st.form_submit_button("Simpan (draft)")
+            if submitted:
+                if not name:
+                    st.warning("Nama barang wajib diisi.")
+                else:
+                    full_nama = name
+                    if keterangan_opsi:
+                        full_nama += f" ({keterangan_opsi})"
+                    iid = gen_id("inv")
+                    now = now_wib_iso()
+                    blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
+                    # PIC dihapus, set kosong
+                    pic = ""
+                    cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (iid, full_nama, loc, status, pic, now, '', 0, '', 0, blob, fname))
+                    conn.commit()
+                    try:
+                        audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
+                    except Exception:
+                        pass
+                    # Notify Finance + Director immediately on draft creation
+                    try:
+                        notify_review_request("inventory", title=f"{full_nama} — {loc}", entity_id=iid, recipients_roles=("finance","director"))
+                    except Exception:
+                        pass
+                    st.success("Item disimpan sebagai draft. Menunggu review Finance.")
+
+    # Tab 2: Review Finance (aksi hanya untuk Finance/Superuser; lainnya read-only)
+    def finance_tab():
+        allowed = user["role"] in ["finance", "superuser"]
+        if not allowed:
+            st.info("Hanya Finance atau Superuser yang dapat melakukan review. Anda dapat melihat daftar yang menunggu review.")
+        cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
+        rows = cur.fetchall()
+        for idx, r in enumerate(rows):
+            with st.container():
+                st.markdown(f"""
 <div style='border:1.5px solid #b3d1ff; border-radius:10px; padding:1.2em 1em; margin-bottom:1.5em; background:#f8fbff;'>
 <b>📦 {r['name']}</b> <span style='color:#888;'>(ID: {r['id']})</span><br>
 <b>Lokasi:</b> {r['location']}<br>
@@ -2247,156 +2257,167 @@ def inventory_module():
 <b>Penanggung Jawab:</b> {r['pic']}<br>
 <b>Terakhir Update:</b> {r['updated_at']}<br>
 """, unsafe_allow_html=True)
-                    # Download file jika ada, but check for missing keys
-                    file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
-                    file_name = r['file_name'] if 'file_name' in r.keys() else None
-                    if file_blob and file_name:
-                        show_file_download(file_blob, file_name)
-                    st.markdown("**Catatan Finance:**")
-                    note = st.text_area("Tulis catatan atau alasan jika perlu", value=r["finance_note"] or "", key=f"fin_note_{r['id']}_finance_{idx}")
-                    colf1, colf2 = st.columns([1,2])
-                    with colf1:
-                        if st.button("🔎 Review", key=f"ap_fin_{r['id']}_finance_{idx}"):
-                            cur.execute("UPDATE inventory SET finance_note=?, finance_approved=1 WHERE id=?", (note, r["id"]))
-                            conn.commit()
-                            try:
-                                audit_log("inventory", "finance_review", target=r["id"], details=note)
-                            except Exception:
-                                pass
-                            # Notify Director + requester (if resolvable from PIC)
-                            try:
-                                requester_email = None
-                                # PIC may store requester id or name; try resolve
-                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision(
-                                    "inventory",
-                                    title=r['name'],
-                                    decision="finance_reviewed",
-                                    entity_id=r['id'],
-                                    recipients_roles=("director",),
-                                    recipients_users=[requester_email] if requester_email else None,
-                                    tag_suffix="finance",
-                                    decision_note=note,
-                                    acted_by_role="finance",
-                                    decision_kind="finance_decision",
-                                )
-                            except Exception:
-                                pass
-                            st.success("Finance reviewed. Menunggu persetujuan Director.")
-                    with colf2:
-                        st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
-            # Section: items waiting for Director approval with resend option
-            st.markdown("---")
-            st.subheader("Menunggu Approval Director (Kirim Ulang Notifikasi)")
-            cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0 ORDER BY updated_at DESC")
-            waiting = cur.fetchall()
-            if not waiting:
-                st.caption("Tidak ada item yang menunggu.")
-            else:
-                for jdx, w in enumerate(waiting):
-                    col1, col2, col3 = st.columns([3,3,2])
-                    with col1:
-                        st.write(f"{w['name']} ({w['id']})")
-                    with col2:
-                        st.write(f"PIC: {w['pic']}")
-                    with col3:
-                        if st.button("Kirim Ulang Notifikasi", key=f"resend_dir_{w['id']}"):
-                            try:
-                                requester_email = _resolve_user_email_by_id_or_name(w.get('pic')) if isinstance(w, sqlite3.Row) else None
-                                notify_decision(
-                                    "inventory",
-                                    title=w['name'],
-                                    decision="finance_reviewed",
-                                    entity_id=w['id'],
-                                    recipients_roles=("director",),
-                                    recipients_users=[requester_email] if requester_email else None,
-                                    tag_suffix="finance-resend",
-                                    acted_by_role="finance",
-                                    decision_kind="finance_decision",
-                                )
-                                st.success("Notifikasi dikirim.")
-                            except Exception:
-                                st.warning("Gagal mengirim notifikasi.")
-        tab_contents.append(finance_tab)
-    if user["role"] in ["director", "superuser"]:
-        tab_labels.append("✅ Approval Director")
-        def director_tab():
-            st.info("Approve/Tolak item yang sudah di-approve Finance.")
-            cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0")
-            rows = cur.fetchall()
-            for idx, r in enumerate(rows):
-                updated_str = format_datetime_wib(r['updated_at'])
-                with st.expander(f"[Menunggu Approval Director] {r['name']} ({r['id']})"):
-                    st.markdown(f"""
-                    <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
-                        <b>Nama:</b> {r['name']}<br>
-                        <b>ID:</b> {r['id']}<br>
-                        <b>Lokasi:</b> {r['location']}<br>
-                        <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r['status']}</span><br>
-                        <b>PIC:</b> {r['pic']}<br>
-                        <b>Update Terakhir:</b> {updated_str}<br>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    # Download file jika ada
-                    if r['file_blob'] and r['file_name']:
-                        show_file_download(r['file_blob'], r['file_name'])
-                    st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
-                    note2 = st.text_area("", value=r["director_note"] or "", key=f"dir_note_{r['id']}_director_{idx}", placeholder="Tulis catatan atau alasan jika perlu...", height=80)
-                    colA, colB = st.columns([1,1])
-                    with colA:
-                        if st.button("✅ Approve", key=f"ap_dir_{r['id']}_director_{idx}"):
-                            cur.execute("UPDATE inventory SET director_note=?, director_approved=1 WHERE id=?", (note2, r["id"]))
-                            conn.commit()
-                            try:
-                                audit_log("inventory", "director_approval", target=r["id"], details=f"approve=1; note={note2}")
-                            except Exception:
-                                pass
-                            # Notify requester + Finance
-                            try:
-                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision(
-                                    "inventory",
-                                    title=r['name'],
-                                    decision="director_approved",
-                                    entity_id=r['id'],
-                                    recipients_roles=("finance",),
-                                    recipients_users=[requester_email] if requester_email else None,
-                                    tag_suffix="director",
-                                    decision_note=note2,
-                                    acted_by_role="director",
-                                    decision_kind="director_decision",
-                                )
-                            except Exception:
-                                pass
-                            st.success("Item telah di-approve Director.")
-                    with colB:
-                        if st.button("❌ Tolak", key=f"reject_dir_{r['id']}_director_{idx}"):
-                            cur.execute("UPDATE inventory SET director_note=?, director_approved=-1 WHERE id=?", (note2, r["id"]))
-                            conn.commit()
-                            try:
-                                audit_log("inventory", "director_approval", target=r["id"], details=f"approve=0; note={note2}")
-                            except Exception:
-                                pass
-                            try:
-                                requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
-                                notify_decision(
-                                    "inventory",
-                                    title=r['name'],
-                                    decision="director_rejected",
-                                    entity_id=r['id'],
-                                    recipients_roles=("finance",),
-                                    recipients_users=[requester_email] if requester_email else None,
-                                    tag_suffix="director",
-                                    decision_note=note2,
-                                    acted_by_role="director",
-                                    decision_kind="director_decision",
-                                )
-                            except Exception:
-                                pass
-        tab_contents.append(director_tab)
+                # Download file jika ada, but check for missing keys
+                file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
+                file_name = r['file_name'] if 'file_name' in r.keys() else None
+                if file_blob and file_name:
+                    show_file_download(file_blob, file_name)
+                st.markdown("**Catatan Finance:**")
+                note = st.text_area(
+                    "Tulis catatan atau alasan jika perlu",
+                    value=r["finance_note"] or "",
+                    key=f"fin_note_{r['id']}_finance_{idx}",
+                    disabled=not allowed,
+                )
+                colf1, colf2 = st.columns([1,2])
+                with colf1:
+                    if allowed and st.button("🔎 Review", key=f"ap_fin_{r['id']}_finance_{idx}"):
+                        cur.execute("UPDATE inventory SET finance_note=?, finance_approved=1 WHERE id=?", (note, r["id"]))
+                        conn.commit()
+                        try:
+                            audit_log("inventory", "finance_review", target=r["id"], details=note)
+                        except Exception:
+                            pass
+                        # Notify Director + requester (if resolvable from PIC)
+                        try:
+                            requester_email = None
+                            # PIC may store requester id or name; try resolve
+                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            notify_decision(
+                                "inventory",
+                                title=r['name'],
+                                decision="finance_reviewed",
+                                entity_id=r['id'],
+                                recipients_roles=("director",),
+                                recipients_users=[requester_email] if requester_email else None,
+                                tag_suffix="finance",
+                                decision_note=note,
+                                acted_by_role="finance",
+                                decision_kind="finance_decision",
+                            )
+                        except Exception:
+                            pass
+                        st.success("Finance reviewed. Menunggu persetujuan Director.")
+                with colf2:
+                    st.caption("Klik Review jika sudah sesuai. Catatan akan tersimpan di database.")
+        # Section: items waiting for Director approval with resend option
+        st.markdown("---")
+        st.subheader("Menunggu Approval Director" + (" (Kirim Ulang Notifikasi)" if allowed else ""))
+        cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0 ORDER BY updated_at DESC")
+        waiting = cur.fetchall()
+        if not waiting:
+            st.caption("Tidak ada item yang menunggu.")
+        else:
+            for jdx, w in enumerate(waiting):
+                col1, col2, col3 = st.columns([3,3,2])
+                with col1:
+                    st.write(f"{w['name']} ({w['id']})")
+                with col2:
+                    st.write(f"PIC: {w['pic']}")
+                with col3:
+                    if allowed and st.button("Kirim Ulang Notifikasi", key=f"resend_dir_{w['id']}"):
+                        try:
+                            requester_email = _resolve_user_email_by_id_or_name(w.get('pic')) if isinstance(w, sqlite3.Row) else None
+                            notify_decision(
+                                "inventory",
+                                title=w['name'],
+                                decision="finance_reviewed",
+                                entity_id=w['id'],
+                                recipients_roles=("director",),
+                                recipients_users=[requester_email] if requester_email else None,
+                                tag_suffix="finance-resend",
+                                acted_by_role="finance",
+                                decision_kind="finance_decision",
+                            )
+                            st.success("Notifikasi dikirim.")
+                        except Exception:
+                            st.warning("Gagal mengirim notifikasi.")
 
-    # Tab Daftar Inventaris dan Pinjam Barang (selalu tambahkan labelnya)
-    tab_labels.append("📦 Daftar Inventaris")
+    # Tab 3: Approval Director (aksi hanya untuk Director/Superuser; lainnya read-only)
+    def director_tab():
+        allowed = user["role"] in ["director", "superuser"]
+        if not allowed:
+            st.info("Hanya Director atau Superuser yang dapat memberikan persetujuan. Anda dapat melihat daftar yang menunggu persetujuan.")
+        cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0")
+        rows = cur.fetchall()
+        for idx, r in enumerate(rows):
+            updated_str = format_datetime_wib(r['updated_at'])
+            with st.expander(f"[Menunggu Approval Director] {r['name']} ({r['id']})"):
+                st.markdown(f"""
+                <div style='background:#f8fafc;border-radius:12px;padding:1.2em 1.5em 1em 1.5em;margin-bottom:1em;'>
+                    <b>Nama:</b> {r['name']}<br>
+                    <b>ID:</b> {r['id']}<br>
+                    <b>Lokasi:</b> {r['location']}<br>
+                    <b>Status:</b> <span style='color:#2563eb;font-weight:600'>{r['status']}</span><br>
+                    <b>PIC:</b> {r['pic']}<br>
+                    <b>Update Terakhir:</b> {updated_str}<br>
+                </div>
+                """, unsafe_allow_html=True)
+                # Download file jika ada
+                if r['file_blob'] and r['file_name']:
+                    show_file_download(r['file_blob'], r['file_name'])
+                st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
+                note2 = st.text_area(
+                    "",
+                    value=r["director_note"] or "",
+                    key=f"dir_note_{r['id']}_director_{idx}",
+                    placeholder="Tulis catatan atau alasan jika perlu...",
+                    height=80,
+                    disabled=not allowed,
+                )
+                colA, colB = st.columns([1,1])
+                with colA:
+                    if allowed and st.button("✅ Approve", key=f"ap_dir_{r['id']}_director_{idx}"):
+                        cur.execute("UPDATE inventory SET director_note=?, director_approved=1 WHERE id=?", (note2, r["id"]))
+                        conn.commit()
+                        try:
+                            audit_log("inventory", "director_approval", target=r["id"], details=f"approve=1; note={note2}")
+                        except Exception:
+                            pass
+                        # Notify requester + Finance
+                        try:
+                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            notify_decision(
+                                "inventory",
+                                title=r['name'],
+                                decision="director_approved",
+                                entity_id=r['id'],
+                                recipients_roles=("finance",),
+                                recipients_users=[requester_email] if requester_email else None,
+                                tag_suffix="director",
+                                decision_note=note2,
+                                acted_by_role="director",
+                                decision_kind="director_decision",
+                            )
+                        except Exception:
+                            pass
+                        st.success("Item telah di-approve Director.")
+                with colB:
+                    if allowed and st.button("❌ Tolak", key=f"reject_dir_{r['id']}_director_{idx}"):
+                        cur.execute("UPDATE inventory SET director_note=?, director_approved=-1 WHERE id=?", (note2, r["id"]))
+                        conn.commit()
+                        try:
+                            audit_log("inventory", "director_approval", target=r["id"], details=f"approve=0; note={note2}")
+                        except Exception:
+                            pass
+                        try:
+                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            notify_decision(
+                                "inventory",
+                                title=r['name'],
+                                decision="director_rejected",
+                                entity_id=r['id'],
+                                recipients_roles=("finance",),
+                                recipients_users=[requester_email] if requester_email else None,
+                                tag_suffix="director",
+                                decision_note=note2,
+                                acted_by_role="director",
+                                decision_kind="director_decision",
+                            )
+                        except Exception:
+                            pass
+
+    # Tab 4: Daftar Inventaris (tetap tanpa batasan)
     def data_tab():
         st.subheader("Daftar Inventaris & Pinjam Barang")
         left_col, right_col = st.columns([2, 1])
@@ -2472,36 +2493,8 @@ def inventory_module():
                                 pass
                             st.success("Pengajuan pinjam barang berhasil. Menunggu ACC Finance & Director.")
 
-    # Tab Pinjam Barang terpisah (definisi dan penambahan tab di dalam scope agar variabel filter_* tersedia)
-
-
-    # Update tab_labels dan tab_contents
-    # Ganti label tab dengan icon/emoji yang lebih menarik
-    for i, lbl in enumerate(tab_labels):
-        if lbl.lower().startswith("tambah barang") or lbl.lower().startswith("➕ tambah barang"):
-            tab_labels[i] = "➕ Tambah Barang"
-        elif lbl.lower().startswith("review finance") or lbl.lower().startswith("💰 review finance"):
-            tab_labels[i] = "💰 Review Finance"
-        elif lbl.lower().startswith("approval director") or lbl.lower().startswith("✅ approval director"):
-            tab_labels[i] = "✅ Approval Director"
-        elif lbl.lower().startswith("daftar inventaris") or lbl.lower().startswith("📦 daftar inventaris"):
-            tab_labels[i] = "📦 Daftar Inventaris"
-    tab_contents[:] = [tab for tab in tab_contents if tab.__name__ != "download_tab"]
-    # Pastikan urutan tab: ... , 📦 Daftar Inventaris
-    # Hapus data_tab jika sudah ada agar tidak dobel
-    tab_contents = [tab for tab in tab_contents if tab.__name__ != "data_tab"]
-    # Tambahkan sesuai urutan label
-    for lbl in tab_labels:
-        if lbl == "📦 Daftar Inventaris":
-            tab_contents.append(data_tab)
-
-    # Sinkronisasi jumlah tab_labels dan tab_contents
-    if len(tab_labels) > len(tab_contents):
-        tab_labels = tab_labels[:len(tab_contents)]
-    elif len(tab_contents) > len(tab_labels):
-        tab_contents = tab_contents[:len(tab_labels)]
-
-    # Render the tabs dan panggil fungsi sesuai urutan
+    # Render tabs dalam urutan tetap dan jalankan fungsi masing-masing
+    tab_contents = [staff_tab, finance_tab, director_tab, data_tab]
     selected = st.tabs(tab_labels)
     for i, tab_func in enumerate(tab_contents):
         with selected[i]:
@@ -3744,6 +3737,7 @@ def flex_module():
     # --- Tab 2: Review Finance ---
     with tabs[1]:
         st.subheader(":money_with_wings: Review Finance")
+        allowed_finance = user["role"] in ["finance", "superuser"]
         df_fin = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=0 ORDER BY tanggal DESC", conn)
         if df_fin.empty:
             st.info("Tidak ada pengajuan flex time yang perlu direview.")
@@ -3751,31 +3745,40 @@ def flex_module():
             for idx, row in df_fin.iterrows():
                 with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
                     st.write(f"Alasan: {row['alasan']}")
-                    catatan = st.text_area("Catatan Finance", value=row['catatan_finance'] or "", key=f"catatan_fin_{row['id']}")
-                    approve = st.button("Approve", key=f"approve_fin_{row['id']}")
-                    reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
-                    if approve or reject:
-                        cur.execute("UPDATE flex SET catatan_finance=?, approval_finance=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
-                        conn.commit()
-                        try:
-                            audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
-                        except Exception:
-                            pass
-                        # Notify Director + applicant
-                        try:
-                            applicant_email = _get_user_email_by_name(row['nama'])
-                            decision = "finance_approved" if approve else "finance_rejected"
-                            notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
-                                            entity_id=row['id'], recipients_roles=("director",),
-                                            recipients_users=[applicant_email] if applicant_email else None, tag_suffix="finance")
-                        except Exception:
-                            pass
-                        st.success("Status review finance diperbarui.")
-                        st.rerun()
+                    catatan = st.text_area(
+                        "Catatan Finance",
+                        value=row['catatan_finance'] or "",
+                        key=f"catatan_fin_{row['id']}",
+                        disabled=not allowed_finance,
+                    )
+                    if allowed_finance:
+                        approve = st.button("Approve", key=f"approve_fin_{row['id']}")
+                        reject = st.button("Tolak", key=f"reject_fin_{row['id']}")
+                        if approve or reject:
+                            cur.execute("UPDATE flex SET catatan_finance=?, approval_finance=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                            conn.commit()
+                            try:
+                                audit_log("flex", "finance_review", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                            except Exception:
+                                pass
+                            # Notify Director + applicant
+                            try:
+                                applicant_email = _get_user_email_by_name(row['nama'])
+                                decision = "finance_approved" if approve else "finance_rejected"
+                                notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
+                                                entity_id=row['id'], recipients_roles=("director",),
+                                                recipients_users=[applicant_email] if applicant_email else None, tag_suffix="finance")
+                            except Exception:
+                                pass
+                            st.success("Status review finance diperbarui.")
+                            st.rerun()
+                    else:
+                        st.info("Hanya Finance/Superuser yang dapat melakukan review di tab ini.")
 
     # --- Tab 3: Approval Director ---
     with tabs[2]:
         st.subheader("👨‍💼 Approval Director")
+        allowed_dir = user["role"] in ["director", "superuser"]
         df_dir = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=1 AND approval_director=0 ORDER BY tanggal DESC", conn)
         if df_dir.empty:
             st.info("Tidak ada pengajuan flex time yang menunggu approval director.")
@@ -3784,27 +3787,35 @@ def flex_module():
                 with st.expander(f"{row['nama']} | {row['tanggal']} | {row['jam_mulai']} - {row['jam_selesai']}"):
                     st.write(f"Alasan: {row['alasan']}")
                     st.write(f"Catatan Finance: {row['catatan_finance']}")
-                    catatan = st.text_area("Catatan Director", value=row['catatan_director'] or "", key=f"catatan_dir_{row['id']}")
-                    approve = st.button("Approve", key=f"approve_dir_{row['id']}")
-                    reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
-                    if approve or reject:
-                        cur.execute("UPDATE flex SET catatan_director=?, approval_director=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
-                        conn.commit()
-                        try:
-                            audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
-                        except Exception:
-                            pass
-                        # Notify applicant + Finance
-                        try:
-                            applicant_email = _get_user_email_by_name(row['nama'])
-                            decision = "director_approved" if approve else "director_rejected"
-                            notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
-                                            entity_id=row['id'], recipients_roles=("finance",),
-                                            recipients_users=[applicant_email] if applicant_email else None, tag_suffix="director")
-                        except Exception:
-                            pass
-                        st.success("Status approval director diperbarui.")
-                        st.rerun()
+                    catatan = st.text_area(
+                        "Catatan Director",
+                        value=row['catatan_director'] or "",
+                        key=f"catatan_dir_{row['id']}",
+                        disabled=not allowed_dir,
+                    )
+                    if allowed_dir:
+                        approve = st.button("Approve", key=f"approve_dir_{row['id']}")
+                        reject = st.button("Tolak", key=f"reject_dir_{row['id']}")
+                        if approve or reject:
+                            cur.execute("UPDATE flex SET catatan_director=?, approval_director=? WHERE id=?", (catatan, 1 if approve else -1, row['id']))
+                            conn.commit()
+                            try:
+                                audit_log("flex", "director_approval", target=row['id'], details=f"approve={1 if approve else 0}; note={catatan}")
+                            except Exception:
+                                pass
+                            # Notify applicant + Finance
+                            try:
+                                applicant_email = _get_user_email_by_name(row['nama'])
+                                decision = "director_approved" if approve else "director_rejected"
+                                notify_decision("flex", title=f"{row['nama']} • {row['tanggal']} {row['jam_mulai']}-{row['jam_selesai']}", decision=decision,
+                                                entity_id=row['id'], recipients_roles=("finance",),
+                                                recipients_users=[applicant_email] if applicant_email else None, tag_suffix="director")
+                            except Exception:
+                                pass
+                            st.success("Status approval director diperbarui.")
+                            st.rerun()
+                    else:
+                        st.info("Hanya Director/Superuser yang dapat memberikan approval di tab ini.")
 
     # --- Tab 4: Daftar Flex ---
     with tabs[3]:
