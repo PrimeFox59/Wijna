@@ -922,6 +922,8 @@ def login_user(email, password):
         # set session
         st.session_state["user"] = {"id": row["id"], "email": row["email"], "role": row["role"], "full_name": row["full_name"]}
         cur.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
+        # Commit before calling audit_log to prevent cross-connection SQLite lock
+        conn.commit()
         audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
         # Best-effort backup on successful login (any user)
         try:
