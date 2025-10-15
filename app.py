@@ -4079,12 +4079,18 @@ def calendar_module():
             if filter_judul:
                 dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
 
-            # Sub-tabs: Kalender dan Rekap (sesuai permintaan)
+            # Sub-view switcher to avoid hidden-tab mount issues for the calendar component
             st.markdown("### 📆 Kalender & 📊 Rekap")
-            tkal, trekap = st.tabs(["Kalender", "Rekap"])
+            view_choice = st.radio(
+                "",
+                ["Kalender", "Rekap"],
+                horizontal=True,
+                key="kalender_rekap_switch",
+                label_visibility="collapsed",
+            )
 
-            # --- Tab Kalender (FullCalendar) ---
-            with tkal:
+            # --- View: Kalender (FullCalendar) ---
+            if view_choice == "Kalender":
                 # Build events for FullCalendar
                 if not dff.empty:
                     dff = dff.sort_values("tgl_mulai")
@@ -4142,6 +4148,9 @@ def calendar_module():
                             "contentHeight": 640,
                             "expandRows": True,
                             "displayEventTime": False,
+                            # Reduce layout shifts inside dynamic containers
+                            "handleWindowResize": False,
+                            "lazyFetching": True,
                         }
                         custom_css = """
                             .fc .fc-toolbar-title { font-size: 1.3rem; }
@@ -4164,16 +4173,11 @@ def calendar_module():
                         show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
                         st.dataframe(dff[show_cols], use_container_width=True)
 
-                    # Legend warna
-                    with st.expander("Legenda Warna Jenis Event"):
-                        lg_cols = st.columns(len(COLOR_MAP))
-                        for i, (k, v) in enumerate(COLOR_MAP.items()):
-                            lg_cols[i].markdown(f"<div style='padding:6px 10px;border-radius:6px;background:{v};color:#000;font-weight:700;text-align:center'>{k}</div>", unsafe_allow_html=True)
                 else:
                     st.info("Tidak ada event sesuai filter.")
 
-            # --- Tab Rekap ---
-            with trekap:
+            # --- View: Rekap ---
+            if view_choice == "Rekap":
                 st.subheader("📊 Rekap Bulanan dari Hasil Filter")
                 this_month = date.today().strftime("%Y-%m")
                 df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
@@ -4195,6 +4199,20 @@ def calendar_module():
                     st.dataframe(by_div, use_container_width=True)
                 else:
                     st.info("Tidak ada event pada bulan berjalan untuk rekap.")
+
+            # Legend warna (di luar pilihan view agar selalu tersedia di bawah)
+            with st.expander("Legenda Warna Jenis Event"):
+                COLOR_MAP = {
+                    "Cuti": "#FF6C6C",
+                    "Flex Time": "#FFA500",
+                    "Delegasi": "#8E44AD",
+                    "Rapat": "#3498DB",
+                    "Mobil Kantor": "#27AE60",
+                    "Libur Nasional": "#F1C40F",
+                }
+                lg_cols = st.columns(len(COLOR_MAP))
+                for i, (k, v) in enumerate(COLOR_MAP.items()):
+                    lg_cols[i].markdown(f"<div style='padding:6px 10px;border-radius:6px;background:{v};color:#000;font-weight:700;text-align:center'>{k}</div>", unsafe_allow_html=True)
         else:
             st.info("Belum ada event pada kalender.")
 
