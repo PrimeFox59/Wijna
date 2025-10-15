@@ -557,6 +557,14 @@ def ensure_db():
             cur.execute("ALTER TABLE cash_advance ADD COLUMN requested_by TEXT")
         except Exception:
             pass
+        # Migration: mark director reviewed (so rejected items don't reappear)
+        try:
+            cur.execute("PRAGMA table_info(cash_advance)")
+            ca_cols = {row[1] for row in cur.fetchall()}
+            if "director_reviewed" not in ca_cols:
+                cur.execute("ALTER TABLE cash_advance ADD COLUMN director_reviewed INTEGER DEFAULT 0")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pmr (
             id TEXT PRIMARY KEY,
@@ -3128,7 +3136,12 @@ def cash_advance_module():
     with tab2:
         st.markdown("### Review & Approval Finance")
         if user["role"] in ["finance", "superuser"]:
-            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved, COALESCE(requested_by,'') as requested_by FROM cash_advance ORDER BY tanggal DESC", conn)
+            # Show only items that are still awaiting Finance review (not approved to director yet)
+            df = pd.read_sql_query(
+                "SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved, COALESCE(requested_by,'') as requested_by "
+                "FROM cash_advance WHERE finance_approved=0 ORDER BY tanggal DESC",
+                conn
+            )
             for idx, row in df.iterrows():
                 with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: {format_rp(row['totals'])}"):
                     items = json.loads(row['items_json']) if row['items_json'] else []
@@ -3199,7 +3212,12 @@ def cash_advance_module():
     with tab3:
         st.markdown("### Approval Director Cash Advance")
         if user["role"] in ["director", "superuser"]:
-            df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved, COALESCE(requested_by,'') as requested_by FROM cash_advance ORDER BY tanggal DESC", conn)
+            # Only show items already approved by Finance and not yet reviewed by Director
+            df = pd.read_sql_query(
+                "SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_note, director_approved, COALESCE(requested_by,'') as requested_by, COALESCE(director_reviewed,0) as director_reviewed "
+                "FROM cash_advance WHERE finance_approved=1 AND COALESCE(director_reviewed,0)=0 ORDER BY tanggal DESC",
+                conn
+            )
             for idx, row in df.iterrows():
                 with st.expander(f"{row['divisi']} | {row['tanggal']} | Total: Rp {row['totals']:,.0f}"):
                     items = json.loads(row['items_json']) if row['items_json'] else []
@@ -3209,7 +3227,7 @@ def cash_advance_module():
                     note = st.text_area("Catatan Director", value=row['director_note'], key=f"dir_note_{row['id']}")
                     approve = st.checkbox("Approve Director", value=bool(row['director_approved']), key=f"dir_approved_{row['id']}")
                     if st.button("Simpan Approval Director", key=f"save_dir_{row['id']}"):
-                        cur.execute("UPDATE cash_advance SET director_note=?, director_approved=? WHERE id=?", (note, int(approve), row['id']))
+                        cur.execute("UPDATE cash_advance SET director_note=?, director_approved=?, director_reviewed=1 WHERE id=?", (note, int(approve), row['id']))
                         conn.commit()
                         try:
                             audit_log("cash_advance", "director_approval", target=row['id'], details=f"approve={bool(approve)}; note={note}")
@@ -3233,8 +3251,16 @@ def cash_advance_module():
     # --- Tab 4: Daftar & Rekap ---
     with tab4:
         st.markdown("### Daftar & Rekap Cash Advance")
-        df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_approved FROM cash_advance ORDER BY tanggal DESC", conn)
-        df['status'] = df.apply(lambda x: 'Cair' if x['finance_approved'] and x['director_approved'] else 'Proses', axis=1)
+        df = pd.read_sql_query("SELECT id, divisi, items_json, totals, tanggal, finance_approved, director_approved, COALESCE(director_reviewed,0) as director_reviewed FROM cash_advance ORDER BY tanggal DESC", conn)
+        def _map_status(x):
+            if x['finance_approved'] and x['director_approved']:
+                return 'Cair'
+            if x.get('director_reviewed', 0) == 1 and not x['director_approved']:
+                return 'Ditolak Director'
+            if x['finance_approved'] and not x['director_approved']:
+                return 'Menunggu Director'
+            return 'Menunggu Finance'
+        df['status'] = df.apply(_map_status, axis=1)
         # --- FILTER UI ---
         with st.container():
             col_div, col_status, col_tgl = st.columns([2,2,3])
