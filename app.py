@@ -4040,25 +4040,82 @@ def calendar_module():
             df_all["tgl_mulai_dt"] = pd.to_datetime(df_all["tgl_mulai"], errors="coerce")
             df_all["tgl_selesai_dt"] = pd.to_datetime(df_all["tgl_selesai"], errors="coerce")
 
-            # Sub-view switcher to avoid hidden-tab mount issues for the calendar component
+            # Layout dua kolom: kiri untuk kontrol/rekap, kanan untuk kalender
             st.markdown("### 📆 Kalender & 📊 Rekap")
-            view_choice = st.radio(
-                "",
-                ["Kalender", "Rekap"],
-                horizontal=True,
-                key="kalender_rekap_switch",
-                label_visibility="collapsed",
-            )
+            # Pastikan default pilihan adalah 'Rekap'
+            if "kalender_rekap_switch" not in st.session_state:
+                st.session_state["kalender_rekap_switch"] = "Rekap"
+            col_left, col_right = st.columns([1, 1.6])
 
-            # --- View: Kalender (FullCalendar) ---
-            if view_choice == "Kalender":
-                # One-time rerun to stabilize layout on first open, preventing blank calendar
-                if not st.session_state.get("__calendar_boot", False):
-                    st.session_state["__calendar_boot"] = True
-                    st.rerun()
-                # Build events for FullCalendar
-                dff = df_all.sort_values("tgl_mulai") if not df_all.empty else pd.DataFrame()
-                if not dff.empty:
+            with col_left:
+                view_choice = st.radio(
+                    "Mode",
+                    ["Rekap", "Kalender"],
+                    index=0,
+                    key="kalender_rekap_switch",
+                    horizontal=False,
+                )
+
+                if view_choice == "Rekap":
+                    st.subheader("🔎 Filter Kalender")
+                    # Default rentang: bulan ini
+                    today = date.today()
+                    month_start = today.replace(day=1)
+                    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+                    month_end = next_month - timedelta(days=1)
+                    default_start = month_start
+                    default_end = month_end
+
+                    col_a, col_b = st.columns([1, 1])
+                    with col_a:
+                        jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
+                        jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options, key="kalender_filter_jenis")
+                    with col_b:
+                        date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end), key="kalender_filter_range")
+
+                    col_c, col_d = st.columns([1, 1])
+                    with col_c:
+                        filter_div = st.text_input("Filter Divisi (nama_divisi)", "", key="kalender_filter_div")
+                    with col_d:
+                        filter_judul = st.text_input("Cari Judul", "", key="kalender_filter_judul")
+
+                    # Terapkan filter untuk Rekap
+                    dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
+                    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                        start_d, end_d = date_range
+                        if start_d and end_d:
+                            dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
+                    if filter_div:
+                        dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
+                    if filter_judul:
+                        dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
+
+                    st.subheader("📊 Rekap Bulanan dari Hasil Filter")
+                    this_month = date.today().strftime("%Y-%m")
+                    df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
+                    c1, c2, c3 = st.columns(3)
+                    total_ev = int(len(df_month)) if not df_month.empty else 0
+                    uniq_div = int(df_month['nama_divisi'].nunique()) if not df_month.empty else 0
+                    uniq_jenis = int(df_month['jenis'].nunique()) if not df_month.empty else 0
+                    c1.metric("Event bulan ini", total_ev)
+                    c2.metric("Divisi terlibat", uniq_div)
+                    c3.metric("Jenis event", uniq_jenis)
+
+                    if not df_month.empty:
+                        by_jenis = df_month['jenis'].value_counts().rename_axis('Jenis').reset_index(name='Jumlah')
+                        st.markdown("#### Rekap per Jenis Event")
+                        st.dataframe(by_jenis, use_container_width=True)
+
+                        by_div = df_month.groupby('nama_divisi').size().sort_values(ascending=False).rename_axis('Divisi').reset_index(name='Jumlah')
+                        st.markdown("#### Rekap per Divisi")
+                        st.dataframe(by_div, use_container_width=True)
+                    else:
+                        st.info("Tidak ada event pada bulan berjalan untuk rekap.")
+
+            # Kalender selalu ditampilkan di kanan
+            with col_right:
+                dff_cal = df_all.sort_values("tgl_mulai") if not df_all.empty else pd.DataFrame()
+                if not dff_cal.empty:
                     COLOR_MAP = {
                         "Cuti": "#FF6C6C",
                         "Flex Time": "#FFA500",
@@ -4068,13 +4125,12 @@ def calendar_module():
                         "Libur Nasional": "#F1C40F",
                     }
                     events = []
-                    for _, r in dff.iterrows():
+                    for _, r in dff_cal.iterrows():
                         try:
                             start_dt = pd.to_datetime(r.get("tgl_mulai"))
                             end_dt = pd.to_datetime(r.get("tgl_selesai"))
                             if pd.isna(start_dt):
                                 continue
-                            # FullCalendar all-day end is exclusive; tambah 1 hari agar inklusif
                             end_dt = (end_dt if pd.notna(end_dt) else start_dt) + pd.Timedelta(days=1)
                             color = COLOR_MAP.get(str(r.get("jenis")), "#4f8cff")
                             title = f"[{r.get('jenis','-')}] {r.get('judul','-')} — {r.get('nama_divisi','-')}"
@@ -4089,7 +4145,6 @@ def calendar_module():
                         except Exception:
                             continue
 
-                    # Try to import component. Fall back to table if not available.
                     cal_available = False
                     try:
                         from streamlit_calendar import calendar as st_calendar  # type: ignore
@@ -4108,12 +4163,10 @@ def calendar_module():
                             },
                             "initialView": "dayGridMonth",
                             "dayMaxEvents": True,
-                            # Fixed heights avoid collapsing when rendered inside hidden tabs/containers
                             "height": 680,
                             "contentHeight": 640,
                             "expandRows": True,
                             "displayEventTime": False,
-                            # Reduce layout shifts inside dynamic containers
                             "handleWindowResize": False,
                             "lazyFetching": True,
                         }
@@ -4128,75 +4181,15 @@ def calendar_module():
                             custom_css=custom_css,
                             key="wijna_calendar_main",
                         )
-
-                        # Optional: simple event click preview
                         if isinstance(cal_state, dict) and cal_state.get("callback") == "eventClick":
                             ev = (cal_state.get("eventClick") or {}).get("event") or {}
                             st.info(f"{ev.get('title','Event')} — {ev.get('start','')} s/d {ev.get('end','')}")
                     else:
                         st.info("Komponen 'streamlit-calendar' belum terpasang. Menampilkan tabel sebagai fallback.")
                         show_cols = ["judul", "jenis", "nama_divisi", "tgl_mulai", "tgl_selesai"]
-                        st.dataframe(dff[show_cols], use_container_width=True)
-
+                        st.dataframe(dff_cal[show_cols], use_container_width=True)
                 else:
                     st.info("Tidak ada event untuk ditampilkan.")
-
-            # --- View: Rekap ---
-            if view_choice == "Rekap":
-                # Tampilkan filter hanya di mode Rekap
-                st.subheader("🔎 Filter Kalender")
-                # Default rentang: bulan ini
-                today = date.today()
-                month_start = today.replace(day=1)
-                next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
-                month_end = next_month - timedelta(days=1)
-                default_start = month_start
-                default_end = month_end
-
-                col_a, col_b = st.columns([2, 2])
-                with col_a:
-                    jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
-                    jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options, key="kalender_filter_jenis")
-                with col_b:
-                    date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end), key="kalender_filter_range")
-
-                col_c, col_d = st.columns([2, 2])
-                with col_c:
-                    filter_div = st.text_input("Filter Divisi (nama_divisi)", "", key="kalender_filter_div")
-                with col_d:
-                    filter_judul = st.text_input("Cari Judul", "", key="kalender_filter_judul")
-
-                # Terapkan filter untuk Rekap
-                dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
-                if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-                    start_d, end_d = date_range
-                    if start_d and end_d:
-                        dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
-                if filter_div:
-                    dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
-                if filter_judul:
-                    dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
-                st.subheader("📊 Rekap Bulanan dari Hasil Filter")
-                this_month = date.today().strftime("%Y-%m")
-                df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
-                c1, c2, c3 = st.columns(3)
-                total_ev = int(len(df_month)) if not df_month.empty else 0
-                uniq_div = int(df_month['nama_divisi'].nunique()) if not df_month.empty else 0
-                uniq_jenis = int(df_month['jenis'].nunique()) if not df_month.empty else 0
-                c1.metric("Event bulan ini", total_ev)
-                c2.metric("Divisi terlibat", uniq_div)
-                c3.metric("Jenis event", uniq_jenis)
-
-                if not df_month.empty:
-                    by_jenis = df_month['jenis'].value_counts().rename_axis('Jenis').reset_index(name='Jumlah')
-                    st.markdown("#### Rekap per Jenis Event")
-                    st.dataframe(by_jenis, use_container_width=True)
-
-                    by_div = df_month.groupby('nama_divisi').size().sort_values(ascending=False).rename_axis('Divisi').reset_index(name='Jumlah')
-                    st.markdown("#### Rekap per Divisi")
-                    st.dataframe(by_div, use_container_width=True)
-                else:
-                    st.info("Tidak ada event pada bulan berjalan untuk rekap.")
 
             # Legend warna (di luar pilihan view agar selalu tersedia di bawah)
             with st.expander("Legenda Warna Jenis Event"):
