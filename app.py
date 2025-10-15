@@ -3035,8 +3035,12 @@ def cash_advance_module():
     with tab1:
         st.markdown("### Pengajuan Cash Advance (Staff)")
         # --- Dynamic items with default 3 rows and 'Tambah Item' button ---
+        # Use stable row IDs so deleting doesn't shift existing inputs unexpectedly
         if 'ca_items_count' not in st.session_state:
             st.session_state['ca_items_count'] = 3
+        if 'ca_rows' not in st.session_state:
+            st.session_state['ca_rows'] = list(range(1, st.session_state['ca_items_count'] + 1))
+
         items = []
         nama_program = st.text_input("Nama Program")
         import re
@@ -3051,23 +3055,36 @@ def cash_advance_module():
 
         # Action button to add more item rows
         if st.button("Tambah Item"):
-            st.session_state['ca_items_count'] = st.session_state.get('ca_items_count', 3) + 1
+            next_id = (max(st.session_state['ca_rows']) + 1) if st.session_state['ca_rows'] else 1
+            st.session_state['ca_rows'].append(next_id)
+            st.session_state['ca_items_count'] = len(st.session_state['ca_rows'])
+            st.rerun()
 
         total = 0.0
-        for i in range(1, st.session_state['ca_items_count'] + 1):
-            col1, col2, col3 = st.columns([3,3,2])
-            with col1:
-                item = st.text_input(f"Item {i}", key=f"ca_item_{i}")
-            with col2:
-                aktivitas = st.text_input(f"Aktivitas {i}", key=f"ca_aktivitas_{i}")
-            with col3:
-                key_nom = f"ca_nom_{i}"
+        # Build rows in display order 1..N but map to stable keys using row_id
+        for display_idx, row_id in enumerate(list(st.session_state['ca_rows']), start=1):
+            col_item, col_nom, col_akt, col_act = st.columns([3,2,3,1])
+            with col_item:
+                item = st.text_input(f"Item {display_idx}", key=f"ca_item_{row_id}")
+            with col_nom:
+                key_nom = f"ca_nom_{row_id}"
                 val = st.session_state.get(key_nom, "")
                 val_disp = format_ribuan(val)
-                nominal_str = st.text_input(f"Nominal {i}", value=val_disp, key=key_nom)
+                nominal_str = st.text_input(f"Nominal {display_idx}", value=val_disp, key=key_nom)
                 clean_nom = re.sub(r'[^\d]', '', nominal_str)
                 nominal_val = float(clean_nom) if clean_nom else 0.0
                 total += nominal_val
+            with col_akt:
+                aktivitas = st.text_input(f"Aktivitas {display_idx}", key=f"ca_aktivitas_{row_id}")
+            with col_act:
+                if st.button("Hapus", key=f"ca_del_{row_id}"):
+                    # Clear keys for this row and remove from list
+                    for key in (f"ca_item_{row_id}", f"ca_aktivitas_{row_id}", f"ca_nom_{row_id}"):
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.session_state['ca_rows'] = [rid for rid in st.session_state['ca_rows'] if rid != row_id]
+                    st.session_state['ca_items_count'] = len(st.session_state['ca_rows'])
+                    st.rerun()
             if (item or aktivitas or nominal_val > 0):
                 items.append({"item": item or "", "aktivitas": aktivitas or "", "nominal": nominal_val})
         tanggal = st.date_input("Tanggal", value=date.today())
@@ -3099,10 +3116,12 @@ def cash_advance_module():
                     pass
                 st.success("Cash advance diajukan.")
                 # Reset inputs to default 3 rows
-                for i in range(1, st.session_state.get('ca_items_count', 3) + 1):
-                    for key in (f"ca_item_{i}", f"ca_aktivitas_{i}", f"ca_nom_{i}"):
+                # Clear any existing per-row keys
+                for rid in list(st.session_state.get('ca_rows', [])):
+                    for key in (f"ca_item_{rid}", f"ca_aktivitas_{rid}", f"ca_nom_{rid}"):
                         if key in st.session_state:
                             del st.session_state[key]
+                st.session_state['ca_rows'] = [1,2,3]
                 st.session_state['ca_items_count'] = 3
 
     # --- Tab 2: Review Finance ---
