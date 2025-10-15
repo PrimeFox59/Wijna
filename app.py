@@ -99,8 +99,7 @@ def format_date_wib(d: Optional[str]) -> str:
                 dt = datetime.fromisoformat(d.split('Z')[0].replace('Z',''))
                 # Assume stored as WIB-naive
                 return dt.strftime('%d-%m-%Y')
-            # else:  # Removed due to missing corresponding if or code block
-                pass
+            else:
                 y, m, dd = d[:4], d[5:7], d[8:10]
                 return f"{dd}-{m}-{y}"
     except Exception:
@@ -142,36 +141,9 @@ class _AuditCursor:
                 # parse table and col list
                 after_into = sql_l.split("insert into",1)[1].strip()
                 table = after_into.split("(",1)[0].strip().split()[0]
-                if "(" in after_into:
-                    cols_part = after_into.split("(",1)[1].split(")",1)[0]
-                    cols = [c.strip().strip('`"') for c in cols_part.split(",")]
-                    if "id" in cols:
-                        idx = cols.index("id")
-                        if isinstance(params, (list, tuple)) and len(params) > idx:
-                            target_id = params[idx]
             except Exception:
                 pass
-        elif sql_l.startswith("update"):
-            op = "update"
-            try:
-                table = sql_l.split()[1]
-                if (" where " in sql_l) and (" id = ?" in sql_l or " id=?" in sql_l):
-                    # assume last param is id
-                    if isinstance(params, (list, tuple)) and len(params) >= 1:
-                        target_id = params[-1]
-            except Exception:
-                pass
-        elif sql_l.startswith("delete from"):
-            op = "delete"
-            try:
-                table = sql_l.split()[2]
-                # assume last param is id
-                if isinstance(params, (list, tuple)) and len(params) >= 1:
-                    target_id = params[-1]
-            except Exception:
-                pass
-        # Only log DML and skip logging file_log table itself
-        if op and table and table != "file_log":
+
             try:
                 audit_log(table, op, target=str(target_id) if target_id is not None else None, details=(sql[:180] + ("..." if len(sql) > 180 else "")))
             except Exception:
@@ -211,7 +183,6 @@ def sop_module():
                 if not judul or not f:
                     st.warning("Judul dan file wajib diisi.")
                 else:
-                    pass
                     sid = gen_id("sop")
                     blob, fname, _ = upload_file_and_store(f)
                     cols = ["id", "judul", "file_blob", "file_name"]
@@ -234,10 +205,11 @@ def sop_module():
                     except Exception:
                         pass
                     st.success("SOP berhasil diupload. Menunggu approval Director.")
-                _sop_title = st.text_input("Judul SOP/Kebijakan", key="sop_title_stub")
-                _sop_submit = st.form_submit_button("Simpan (stub)")
-                if _sop_submit:
-                    st.info("Form SOP sedang disederhanakan; gunakan modul SOP pada versi lengkap untuk upload.")
+        # Optional stub inputs (kept for compatibility)
+        _sop_title = st.text_input("Judul SOP/Kebijakan", key="sop_title_stub")
+        _sop_submit = st.form_submit_button("Simpan (stub)")
+        if _sop_submit:
+            st.info("Form SOP sedang disederhanakan; gunakan modul SOP pada versi lengkap untuk upload.")
 
     # --- Tab 2: Daftar & Rekap ---
     with tab_daftar:
@@ -3062,9 +3034,9 @@ def cash_advance_module():
     # --- Tab 1: Input Staf ---
     with tab1:
         st.markdown("### Pengajuan Cash Advance (Staff)")
-        # --- Real-time total calculation ---
-        if 'ca_nominals' not in st.session_state:
-            st.session_state['ca_nominals'] = [0.0]*10
+        # --- Dynamic items with default 3 rows and 'Tambah Item' button ---
+        if 'ca_items_count' not in st.session_state:
+            st.session_state['ca_items_count'] = 3
         items = []
         nama_program = st.text_input("Nama Program")
         import re
@@ -3077,21 +3049,27 @@ def cash_advance_module():
                 return ""
             return f"{int(val_str):,}".replace(",", ".")
 
-        for i in range(1, 11):
-            col1, col2 = st.columns([3,2])
+        # Action button to add more item rows
+        if st.button("Tambah Item"):
+            st.session_state['ca_items_count'] = st.session_state.get('ca_items_count', 3) + 1
+
+        total = 0.0
+        for i in range(1, st.session_state['ca_items_count'] + 1):
+            col1, col2, col3 = st.columns([3,3,2])
             with col1:
                 item = st.text_input(f"Item {i}", key=f"ca_item_{i}")
             with col2:
+                aktivitas = st.text_input(f"Aktivitas {i}", key=f"ca_aktivitas_{i}")
+            with col3:
                 key_nom = f"ca_nom_{i}"
                 val = st.session_state.get(key_nom, "")
                 val_disp = format_ribuan(val)
                 nominal_str = st.text_input(f"Nominal {i}", value=val_disp, key=key_nom)
-                # Remove non-digit and update session state
                 clean_nom = re.sub(r'[^\d]', '', nominal_str)
-                st.session_state['ca_nominals'][i-1] = float(clean_nom) if clean_nom else 0.0
-            if item:
-                items.append({"item": item, "nominal": float(st.session_state['ca_nominals'][i-1])})
-        total = sum(st.session_state['ca_nominals'])
+                nominal_val = float(clean_nom) if clean_nom else 0.0
+                total += nominal_val
+            if (item or aktivitas or nominal_val > 0):
+                items.append({"item": item or "", "aktivitas": aktivitas or "", "nominal": nominal_val})
         tanggal = st.date_input("Tanggal", value=date.today())
         # Format total as Rp with thousand separator
         def format_rp(val):
@@ -3120,7 +3098,12 @@ def cash_advance_module():
                 except Exception:
                     pass
                 st.success("Cash advance diajukan.")
-                st.session_state['ca_nominals'] = [0.0]*10
+                # Reset inputs to default 3 rows
+                for i in range(1, st.session_state.get('ca_items_count', 3) + 1):
+                    for key in (f"ca_item_{i}", f"ca_aktivitas_{i}", f"ca_nom_{i}"):
+                        if key in st.session_state:
+                            del st.session_state[key]
+                st.session_state['ca_items_count'] = 3
 
     # --- Tab 2: Review Finance ---
     with tab2:
