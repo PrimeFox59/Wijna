@@ -4933,10 +4933,9 @@ def dashboard():
     # --------------------------------------------------
     c1, c2, c3 = st.columns([1.05, 1.05, 1.1])
     with c1:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>🛎️ Approval Menunggu</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>Limit 5 per modul / ringkas.</div>", unsafe_allow_html=True)
-        pending_specs = [
+        with st.expander("🛎️ Approval Menunggu", expanded=True):
+            st.caption("Limit 5 per modul / ringkas.")
+            pending_specs = [
             ("inventory", "SELECT id,name as info,status FROM inventory WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
             ("cash_advance", "SELECT id,divisi as info, totals as status FROM cash_advance WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
             ("pmr", "SELECT id,nama as info, bulan as status FROM pmr WHERE (finance_approved=0 OR director_approved=0) LIMIT 5"),
@@ -4946,89 +4945,84 @@ def dashboard():
             ("sop", "SELECT id,judul as info,'pending' as status FROM sop WHERE director_approved=0 LIMIT 5"),
             ("notulen", "SELECT id,judul as info,'pending' as status FROM notulen WHERE director_approved=0 LIMIT 5"),
             ("flex", "SELECT id,nama as info, CASE WHEN approval_finance=0 THEN 'Finance' ELSE 'Director' END as status FROM flex WHERE (approval_finance=0 OR approval_director=0) LIMIT 5"),
-        ]
-        rows = []
-        for modul, q in pending_specs:
-            try:
-                dtemp = pd.read_sql_query(q, raw_conn)
-                if not dtemp.empty:
-                    for _, r in dtemp.iterrows():
-                        rows.append({"Modul": modul, "Info": r.get("info"), "Status": r.get("status")})
-            except Exception:
-                continue
-        if rows:
-            dfp = pd.DataFrame(rows)
-            st.dataframe(dfp, width='stretch', hide_index=True)
-        else:
-            st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+            ]
+            rows = []
+            for modul, q in pending_specs:
+                try:
+                    dtemp = pd.read_sql_query(q, raw_conn)
+                    if not dtemp.empty:
+                        for _, r in dtemp.iterrows():
+                            rows.append({"Modul": modul, "Info": r.get("info"), "Status": r.get("status")})
+                except Exception:
+                    continue
+            if rows:
+                dfp = pd.DataFrame(rows)
+                st.dataframe(dfp, width='stretch', hide_index=True)
+            else:
+                st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
     with c2:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>📄 Surat & MoU</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>Surat belum dibahas & MoU ≤30 hari jatuh tempo.</div>", unsafe_allow_html=True)
-        try:
-            df_surat_pending = pd.read_sql_query("SELECT nomor, perihal, tanggal FROM surat_masuk WHERE status='Belum Dibahas' ORDER BY tanggal DESC LIMIT 6", raw_conn)
-        except Exception:
-            df_surat_pending = pd.DataFrame()
-        try:
-            df_mou_due = pd.read_sql_query("SELECT nomor, nama, tgl_selesai FROM mou WHERE date(tgl_selesai) BETWEEN date('now') AND date('now','+30 day') ORDER BY tgl_selesai ASC LIMIT 6", raw_conn)
-        except Exception:
-            df_mou_due = pd.DataFrame()
-        left, right = st.columns(2)
-        with left:
-            st.caption("Surat Belum Dibahas")
-            if df_surat_pending.empty:
-                st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
-            else:
-                st.dataframe(df_surat_pending, width='stretch', hide_index=True)
-        with right:
-            st.caption("MoU Due")
-            if df_mou_due.empty:
-                st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
-            else:
-                st.dataframe(df_mou_due, width='stretch', hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>📊 Rekap Bulanan Multi-Modul</div>", unsafe_allow_html=True)
-        this_month = date.today().strftime('%Y-%m')
-        rekap_rows = []
-        def safe_read(query, params=None):
+        with st.expander("📄 Surat & MoU", expanded=True):
+            st.caption("Surat belum dibahas & MoU ≤30 hari jatuh tempo.")
             try:
-                return pd.read_sql_query(query, raw_conn, params=params)
+                df_surat_pending = pd.read_sql_query("SELECT nomor, perihal, tanggal FROM surat_masuk WHERE status='Belum Dibahas' ORDER BY tanggal DESC LIMIT 6", raw_conn)
             except Exception:
-                return pd.DataFrame()
-        df_ca = safe_read("SELECT totals, finance_approved, director_approved, tanggal FROM cash_advance WHERE substr(tanggal,1,7)=?", (this_month,))
-        if not df_ca.empty:
-            rekap_rows.append({"Modul":"Cash Advance","Jumlah":len(df_ca),"Selesai":len(df_ca[(df_ca.finance_approved==1)&(df_ca.director_approved==1)]),"Nominal":float(df_ca.totals.sum())})
-        df_pmr = safe_read("SELECT finance_approved,director_approved, bulan FROM pmr WHERE substr(bulan,1,7)=?", (this_month,))
-        if not df_pmr.empty:
-            rekap_rows.append({"Modul":"PMR","Jumlah":len(df_pmr),"Selesai":len(df_pmr[(df_pmr.finance_approved==1)&(df_pmr.director_approved==1)]),"Nominal":"-"})
-        inv_cnt_df = safe_read("SELECT COUNT(*) c FROM inventory WHERE substr(updated_at,1,7)=?", (this_month,))
-        if not inv_cnt_df.empty:
-            rekap_rows.append({"Modul":"Inventory Updated","Jumlah":int(inv_cnt_df.iloc[0]['c']),"Selesai":"-","Nominal":"-"})
-        sm_df = safe_read("SELECT status,tanggal FROM surat_masuk WHERE substr(tanggal,1,7)=?", (this_month,))
-        if not sm_df.empty:
-            selesai_sm = (sm_df.status.str.lower()!='belum dibahas').sum()
-            rekap_rows.append({"Modul":"Surat Masuk","Jumlah":len(sm_df),"Selesai":int(selesai_sm),"Nominal":"-"})
-        sk_df = safe_read("SELECT status,tanggal FROM surat_keluar WHERE substr(tanggal,1,7)=?", (this_month,))
-        if not sk_df.empty:
-            final_cnt = (sk_df.status.str.lower()=="final").sum()
-            rekap_rows.append({"Modul":"Surat Keluar","Jumlah":len(sk_df),"Selesai":int(final_cnt),"Nominal":"-"})
-        mou_df = safe_read("SELECT id,tgl_mulai,tgl_selesai FROM mou WHERE substr(tgl_mulai,1,7)=? OR substr(tgl_selesai,1,7)=?", (this_month,this_month))
-        if not mou_df.empty:
-            rekap_rows.append({"Modul":"MoU","Jumlah":len(mou_df),"Selesai":"-","Nominal":"-"})
-        if rekap_rows:
-            dr = pd.DataFrame(rekap_rows)
-            if 'Nominal' in dr.columns:
-                dr['Nominal'] = dr['Nominal'].apply(lambda v: (f"Rp {v:,.0f}".replace(",",".")) if isinstance(v,(int,float)) else v)
-            # Normalisasi kolom 'Selesai' agar tidak campur int/string (hindari ArrowTypeError)
-            if 'Selesai' in dr.columns:
-                dr['Selesai'] = dr['Selesai'].apply(lambda v: '-' if (isinstance(v,str) and v.strip()== '-') else str(v))
-            st.dataframe(dr, width='stretch', hide_index=True)
-        else:
-            st.markdown("<div class='empty-hint'>Tidak ada data bulan ini.</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+                df_surat_pending = pd.DataFrame()
+            try:
+                df_mou_due = pd.read_sql_query("SELECT nomor, nama, tgl_selesai FROM mou WHERE date(tgl_selesai) BETWEEN date('now') AND date('now','+30 day') ORDER BY tgl_selesai ASC LIMIT 6", raw_conn)
+            except Exception:
+                df_mou_due = pd.DataFrame()
+            left, right = st.columns(2)
+            with left:
+                st.caption("Surat Belum Dibahas")
+                if df_surat_pending.empty:
+                    st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
+                else:
+                    st.dataframe(df_surat_pending, width='stretch', hide_index=True)
+            with right:
+                st.caption("MoU Due")
+                if df_mou_due.empty:
+                    st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
+                else:
+                    st.dataframe(df_mou_due, width='stretch', hide_index=True)
+    with c3:
+        with st.expander("📊 Rekap Bulanan Multi-Modul", expanded=True):
+            this_month = date.today().strftime('%Y-%m')
+            rekap_rows = []
+            def safe_read(query, params=None):
+                try:
+                    return pd.read_sql_query(query, raw_conn, params=params)
+                except Exception:
+                    return pd.DataFrame()
+            df_ca = safe_read("SELECT totals, finance_approved, director_approved, tanggal FROM cash_advance WHERE substr(tanggal,1,7)=?", (this_month,))
+            if not df_ca.empty:
+                rekap_rows.append({"Modul":"Cash Advance","Jumlah":len(df_ca),"Selesai":len(df_ca[(df_ca.finance_approved==1)&(df_ca.director_approved==1)]),"Nominal":float(df_ca.totals.sum())})
+            df_pmr = safe_read("SELECT finance_approved,director_approved, bulan FROM pmr WHERE substr(bulan,1,7)=?", (this_month,))
+            if not df_pmr.empty:
+                rekap_rows.append({"Modul":"PMR","Jumlah":len(df_pmr),"Selesai":len(df_pmr[(df_pmr.finance_approved==1)&(df_pmr.director_approved==1)]),"Nominal":"-"})
+            inv_cnt_df = safe_read("SELECT COUNT(*) c FROM inventory WHERE substr(updated_at,1,7)=?", (this_month,))
+            if not inv_cnt_df.empty:
+                rekap_rows.append({"Modul":"Inventory Updated","Jumlah":int(inv_cnt_df.iloc[0]['c']),"Selesai":"-","Nominal":"-"})
+            sm_df = safe_read("SELECT status,tanggal FROM surat_masuk WHERE substr(tanggal,1,7)=?", (this_month,))
+            if not sm_df.empty:
+                selesai_sm = (sm_df.status.str.lower()!='belum dibahas').sum()
+                rekap_rows.append({"Modul":"Surat Masuk","Jumlah":len(sm_df),"Selesai":int(selesai_sm),"Nominal":"-"})
+            sk_df = safe_read("SELECT status,tanggal FROM surat_keluar WHERE substr(tanggal,1,7)=?", (this_month,))
+            if not sk_df.empty:
+                final_cnt = (sk_df.status.str.lower()=="final").sum()
+                rekap_rows.append({"Modul":"Surat Keluar","Jumlah":len(sk_df),"Selesai":int(final_cnt),"Nominal":"-"})
+            mou_df = safe_read("SELECT id,tgl_mulai,tgl_selesai FROM mou WHERE substr(tgl_mulai,1,7)=? OR substr(tgl_selesai,1,7)=?", (this_month,this_month))
+            if not mou_df.empty:
+                rekap_rows.append({"Modul":"MoU","Jumlah":len(mou_df),"Selesai":"-","Nominal":"-"})
+            if rekap_rows:
+                dr = pd.DataFrame(rekap_rows)
+                if 'Nominal' in dr.columns:
+                    dr['Nominal'] = dr['Nominal'].apply(lambda v: (f"Rp {v:,.0f}".replace(",",".")) if isinstance(v,(int,float)) else v)
+                # Normalisasi kolom 'Selesai' agar tidak campur int/string (hindari ArrowTypeError)
+                if 'Selesai' in dr.columns:
+                    dr['Selesai'] = dr['Selesai'].apply(lambda v: '-' if (isinstance(v,str) and v.strip()== '-') else str(v))
+                st.dataframe(dr, width='stretch', hide_index=True)
+            else:
+                st.markdown("<div class='empty-hint'>Tidak ada data bulan ini.</div>", unsafe_allow_html=True)
 
     # --------------------------------------------------
     # ROW 2: Cuti & Flex | Delegasi Aktif | Kalender 30 Hari | Rekap (Cash Advance historis)
@@ -5036,185 +5030,177 @@ def dashboard():
     # --------------------------------------------------
     c4, c5 = st.columns([1.1, 1])
     with c4:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>🌴 Cuti & ⏰ Flex</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>Ringkas total cuti per nama & flex disetujui terbaru.</div>", unsafe_allow_html=True)
-        try:
-            df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) total_pengajuan, SUM(durasi) total_durasi FROM cuti GROUP BY nama ORDER BY total_durasi DESC", raw_conn)
-        except Exception:
-            df_cuti = pd.DataFrame(columns=["nama","total_pengajuan","total_durasi"])
-        if df_cuti.empty:
-            st.markdown("<div class='empty-hint'>Belum ada data cuti.</div>", unsafe_allow_html=True)
-        else:
-            st.dataframe(df_cuti, width='stretch', hide_index=True)
+        with st.expander("🌴 Cuti & ⏰ Flex", expanded=True):
+            st.caption("Ringkas total cuti per nama & flex disetujui terbaru.")
+            try:
+                df_cuti = pd.read_sql_query("SELECT nama, COUNT(*) total_pengajuan, SUM(durasi) total_durasi FROM cuti GROUP BY nama ORDER BY total_durasi DESC", raw_conn)
+            except Exception:
+                df_cuti = pd.DataFrame(columns=["nama","total_pengajuan","total_durasi"])
+            if df_cuti.empty:
+                st.markdown("<div class='empty-hint'>Belum ada data cuti.</div>", unsafe_allow_html=True)
+            else:
+                st.dataframe(df_cuti, width='stretch', hide_index=True)
 
-        # Sisa Kuota per Pegawai (ambil baris terakhir per nama)
-        st.caption("Sisa Kuota per Pegawai (berdasarkan pengajuan terakhir)")
-        try:
-            df_sisa = pd.read_sql_query(
-                """
-                SELECT c1.nama, c1.kuota_tahunan, c1.cuti_terpakai, c1.sisa_kuota
-                FROM cuti c1
-                JOIN (
-                    SELECT nama, MAX(tgl_mulai) AS last_tgl
-                    FROM cuti
-                    GROUP BY nama
-                ) last ON last.nama = c1.nama AND last.last_tgl = c1.tgl_mulai
-                ORDER BY c1.sisa_kuota ASC
-                """,
-                raw_conn,
-            )
-        except Exception:
-            df_sisa = pd.DataFrame(columns=["nama","kuota_tahunan","cuti_terpakai","sisa_kuota"])
-        if df_sisa.empty:
-            st.markdown("<div class='empty-hint'>Belum ada data sisa kuota.</div>", unsafe_allow_html=True)
-        else:
-            st.dataframe(df_sisa, width='stretch', hide_index=True)
-        try:
-            df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 8", raw_conn)
-        except Exception:
-            df_flex_ok = pd.DataFrame()
-        st.caption("Flex Disetujui (8 terbaru)")
-        if df_flex_ok.empty:
-            st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
-        else:
-            st.dataframe(df_flex_ok, width='stretch', hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+            # Sisa Kuota per Pegawai (ambil baris terakhir per nama)
+            st.caption("Sisa Kuota per Pegawai (berdasarkan pengajuan terakhir)")
+            try:
+                df_sisa = pd.read_sql_query(
+                    """
+                    SELECT c1.nama, c1.kuota_tahunan, c1.cuti_terpakai, c1.sisa_kuota
+                    FROM cuti c1
+                    JOIN (
+                        SELECT nama, MAX(tgl_mulai) AS last_tgl
+                        FROM cuti
+                        GROUP BY nama
+                    ) last ON last.nama = c1.nama AND last.last_tgl = c1.tgl_mulai
+                    ORDER BY c1.sisa_kuota ASC
+                    """,
+                    raw_conn,
+                )
+            except Exception:
+                df_sisa = pd.DataFrame(columns=["nama","kuota_tahunan","cuti_terpakai","sisa_kuota"])
+            if df_sisa.empty:
+                st.markdown("<div class='empty-hint'>Belum ada data sisa kuota.</div>", unsafe_allow_html=True)
+            else:
+                st.dataframe(df_sisa, width='stretch', hide_index=True)
+            try:
+                df_flex_ok = pd.read_sql_query("SELECT nama, tanggal, jam_mulai, jam_selesai FROM flex WHERE approval_finance=1 AND approval_director=1 ORDER BY tanggal DESC LIMIT 8", raw_conn)
+            except Exception:
+                df_flex_ok = pd.DataFrame()
+            st.caption("Flex Disetujui (8 terbaru)")
+            if df_flex_ok.empty:
+                st.markdown("<div class='empty-hint'>-</div>", unsafe_allow_html=True)
+            else:
+                st.dataframe(df_flex_ok, width='stretch', hide_index=True)
     with c5:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>🗂️ Delegasi Aktif</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>10 tugas mendekati/berjalan (urut tgl selesai).</div>", unsafe_allow_html=True)
-        try:
-            df_del = pd.read_sql_query("SELECT judul, pic, tgl_mulai, tgl_selesai, status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", raw_conn)
-        except Exception:
-            df_del = pd.DataFrame()
-        if df_del.empty:
-            st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
-        else:
-            st.dataframe(df_del, width='stretch', hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.expander("🗂️ Delegasi Aktif", expanded=True):
+            st.caption("10 tugas mendekati/berjalan (urut tgl selesai).")
+            try:
+                df_del = pd.read_sql_query("SELECT judul, pic, tgl_mulai, tgl_selesai, status FROM delegasi ORDER BY tgl_selesai ASC LIMIT 10", raw_conn)
+            except Exception:
+                df_del = pd.DataFrame()
+            if df_del.empty:
+                st.markdown("<div class='empty-hint'>Tidak ada.</div>", unsafe_allow_html=True)
+            else:
+                st.dataframe(df_del, width='stretch', hide_index=True)
 
     c6, c7 = st.columns([1.1, 1])
     with c6:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>📅 Kalender 30 Hari</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>Event lintas modul (cuti, flex, delegasi, rapat, mobil, libur).</div>", unsafe_allow_html=True)
-        today = date.today(); end_30 = today + timedelta(days=30)
-        def safe_df(q):
-            try: return pd.read_sql_query(q, raw_conn)
-            except Exception: return pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
-        df_cuti = safe_df("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1")
-        df_flex = safe_df("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1")
-        # Sertakan status untuk delegasi agar bisa diwarnai selesai/overdue/dll
-        df_delegasi = safe_df("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai, status FROM delegasi")
-        # Tambahkan MoU untuk pewarnaan jatuh tempo
-        df_mou = safe_df("SELECT nama as judul, 'MoU' as jenis, divisi as nama_divisi, tgl_mulai, tgl_selesai FROM mou")
-        df_rapat = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'")
-        df_mobil = safe_df("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'")
-        df_libur = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1")
-        df_all = pd.concat([df_cuti, df_flex, df_delegasi, df_mou, df_rapat, df_mobil, df_libur], ignore_index=True)
-        if df_all.empty:
-            st.markdown("<div class='empty-hint'>Tidak ada event.</div>", unsafe_allow_html=True)
-        else:
-            for c in ("tgl_mulai","tgl_selesai"):
-                df_all[c] = pd.to_datetime(df_all[c])
-            mask = (df_all['tgl_selesai'] >= pd.to_datetime(today)) & (df_all['tgl_mulai'] <= pd.to_datetime(end_30))
-            df_30 = df_all.loc[mask].sort_values('tgl_mulai')
-            if df_30.empty:
-                st.markdown("<div class='empty-hint'>Tidak ada event periode ini.</div>", unsafe_allow_html=True)
+        with st.expander("📅 Kalender 30 Hari", expanded=True):
+            st.caption("Event lintas modul (cuti, flex, delegasi, rapat, mobil, libur).")
+            today = date.today(); end_30 = today + timedelta(days=30)
+            def safe_df(q):
+                try: return pd.read_sql_query(q, raw_conn)
+                except Exception: return pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
+            df_cuti = safe_df("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1")
+            df_flex = safe_df("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1")
+            # Sertakan status untuk delegasi agar bisa diwarnai selesai/overdue/dll
+            df_delegasi = safe_df("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai, status FROM delegasi")
+            # Tambahkan MoU untuk pewarnaan jatuh tempo
+            df_mou = safe_df("SELECT nama as judul, 'MoU' as jenis, divisi as nama_divisi, tgl_mulai, tgl_selesai FROM mou")
+            df_rapat = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'")
+            df_mobil = safe_df("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai FROM mobil WHERE status='Disetujui'")
+            df_libur = safe_df("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1")
+            df_all = pd.concat([df_cuti, df_flex, df_delegasi, df_mou, df_rapat, df_mobil, df_libur], ignore_index=True)
+            if df_all.empty:
+                st.markdown("<div class='empty-hint'>Tidak ada event.</div>", unsafe_allow_html=True)
             else:
-                # Legend sesuai permintaan
-                st.markdown(
-                    """
-                    <div style='font-size:.72rem;margin-bottom:.35rem;display:flex;flex-wrap:wrap;gap:.5rem 1rem;'>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:2px;margin-right:6px'></span>Merah: overdue/kritikal</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#facc15;border-radius:2px;margin-right:6px'></span>Kuning: ≤7 hari ke due</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#fb923c;border-radius:2px;margin-right:6px'></span>Oranye: ≤3 hari (peringatan)</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;margin-right:6px'></span>Biru: Cuti</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#a855f7;border-radius:2px;margin-right:6px'></span>Ungu: Flex</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px;margin-right:6px'></span>Hijau: Tugas selesai</span>
-                        <span><span style='display:inline-block;width:10px;height:10px;background:#111827;border-radius:2px;margin-right:6px'></span>Abu/Hitam: Mobil kantor</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                for c in ("tgl_mulai","tgl_selesai"):
+                    df_all[c] = pd.to_datetime(df_all[c])
+                mask = (df_all['tgl_selesai'] >= pd.to_datetime(today)) & (df_all['tgl_mulai'] <= pd.to_datetime(end_30))
+                df_30 = df_all.loc[mask].sort_values('tgl_mulai')
+                if df_30.empty:
+                    st.markdown("<div class='empty-hint'>Tidak ada event periode ini.</div>", unsafe_allow_html=True)
+                else:
+                    # Legend sesuai permintaan
+                    st.markdown(
+                        """
+                        <div style='font-size:.72rem;margin-bottom:.35rem;display:flex;flex-wrap:wrap;gap:.5rem 1rem;'>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:2px;margin-right:6px'></span>Merah: overdue/kritikal</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#facc15;border-radius:2px;margin-right:6px'></span>Kuning: ≤7 hari ke due</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#fb923c;border-radius:2px;margin-right:6px'></span>Oranye: ≤3 hari (peringatan)</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;margin-right:6px'></span>Biru: Cuti</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#a855f7;border-radius:2px;margin-right:6px'></span>Ungu: Flex</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px;margin-right:6px'></span>Hijau: Tugas selesai</span>
+                            <span><span style='display:inline-block;width:10px;height:10px;background:#111827;border-radius:2px;margin-right:6px'></span>Abu/Hitam: Mobil kantor</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-                def _badge_color(row) -> str:
-                    j = (row.get('jenis') or '').strip()
-                    # Default gray for unspecified
-                    default = '#64748b'
-                    today_dt = pd.to_datetime(date.today())
-                    # Delegasi: selesai -> hijau; overdue -> merah; <=3 hari -> oranye; <=7 hari -> kuning
-                    if j == 'Delegasi':
-                        status = str(row.get('status') or '').strip().lower()
-                        if status in ('selesai','done','completed','finish','finished'):
-                            return '#22c55e'  # hijau
-                        try:
-                            end = pd.to_datetime(row.get('tgl_selesai'))
-                            if pd.isna(end):
+                    def _badge_color(row) -> str:
+                        j = (row.get('jenis') or '').strip()
+                        # Default gray for unspecified
+                        default = '#64748b'
+                        today_dt = pd.to_datetime(date.today())
+                        # Delegasi: selesai -> hijau; overdue -> merah; <=3 hari -> oranye; <=7 hari -> kuning
+                        if j == 'Delegasi':
+                            status = str(row.get('status') or '').strip().lower()
+                            if status in ('selesai','done','completed','finish','finished'):
+                                return '#22c55e'  # hijau
+                            try:
+                                end = pd.to_datetime(row.get('tgl_selesai'))
+                                if pd.isna(end):
+                                    return default
+                                if end.date() < today_dt.date():
+                                    return '#ef4444'  # merah overdue
+                                days = (end.date() - today_dt.date()).days
+                                if days <= 3:
+                                    return '#fb923c'  # oranye ≤3
+                                if days <= 7:
+                                    return '#facc15'  # kuning ≤7
+                            except Exception:
                                 return default
-                            if end.date() < today_dt.date():
-                                return '#ef4444'  # merah overdue
-                            days = (end.date() - today_dt.date()).days
-                            if days <= 3:
-                                return '#fb923c'  # oranye ≤3
-                            if days <= 7:
-                                return '#facc15'  # kuning ≤7
-                        except Exception:
                             return default
-                        return default
-                    # MoU: overdue -> merah; ≤7 hari -> kuning
-                    if j == 'MoU':
-                        try:
-                            end = pd.to_datetime(row.get('tgl_selesai'))
-                            if pd.isna(end):
+                        # MoU: overdue -> merah; ≤7 hari -> kuning
+                        if j == 'MoU':
+                            try:
+                                end = pd.to_datetime(row.get('tgl_selesai'))
+                                if pd.isna(end):
+                                    return default
+                                if end.date() < today_dt.date():
+                                    return '#ef4444'
+                                days = (end.date() - today_dt.date()).days
+                                if days <= 7:
+                                    return '#facc15'
+                            except Exception:
                                 return default
-                            if end.date() < today_dt.date():
-                                return '#ef4444'
-                            days = (end.date() - today_dt.date()).days
-                            if days <= 7:
-                                return '#facc15'
-                        except Exception:
                             return default
+                        # Cuti: biru
+                        if j == 'Cuti':
+                            return '#3b82f6'
+                        # Flex: ungu
+                        if j == 'Flex Time':
+                            return '#a855f7'
+                        # Mobil kantor: abu-abu/hitam
+                        if j == 'Mobil Kantor':
+                            return '#111827'
+                        # Rapat/Libur dan lainnya
                         return default
-                    # Cuti: biru
-                    if j == 'Cuti':
-                        return '#3b82f6'
-                    # Flex: ungu
-                    if j == 'Flex Time':
-                        return '#a855f7'
-                    # Mobil kantor: abu-abu/hitam
-                    if j == 'Mobil Kantor':
-                        return '#111827'
-                    # Rapat/Libur dan lainnya
-                    return default
 
-                st.markdown("<ul style='padding-left:1.05em;margin:0;'>", unsafe_allow_html=True)
-                for _, r in df_30.iterrows():
-                    t1 = r['tgl_mulai'].strftime('%d - %m - %Y')
-                    t2 = r['tgl_selesai'].strftime('%d - %m - %Y')
-                    rng = t1 if t1==t2 else f"{t1} / {t2}"
-                    badge_color = _badge_color(r)
-                    badge = f"<span style='background:{badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:.63rem'>{r['jenis']}</span>"
-                    st.markdown(f"<li style='margin-bottom:2px;font-size:.72rem'><b>{r['judul']}</b> {badge} <span style='color:#2563eb'>({rng})</span></li>", unsafe_allow_html=True)
-                st.markdown("</ul>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown("<ul style='padding-left:1.05em;margin:0;'>", unsafe_allow_html=True)
+                    for _, r in df_30.iterrows():
+                        t1 = r['tgl_mulai'].strftime('%d - %m - %Y')
+                        t2 = r['tgl_selesai'].strftime('%d - %m - %Y')
+                        rng = t1 if t1==t2 else f"{t1} / {t2}"
+                        badge_color = _badge_color(r)
+                        badge = f"<span style='background:{badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:.63rem'>{r['jenis']}</span>"
+                        st.markdown(f"<li style='margin-bottom:2px;font-size:.72rem'><b>{r['judul']}</b> {badge} <span style='color:#2563eb'>({rng})</span></li>", unsafe_allow_html=True)
+                    st.markdown("</ul>", unsafe_allow_html=True)
     with c7:
-        st.markdown("<div class='wijna-section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-title'>🧾 Rekap Cash Advance (Histori)</div>", unsafe_allow_html=True)
-        st.markdown("<div class='wijna-section-desc'>Sumber tabel rekap_monthly_cashadvance (maks 12 terakhir).</div>", unsafe_allow_html=True)
-        try:
-            df_hist = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", raw_conn)
-        except Exception:
-            df_hist = pd.DataFrame()
-        if df_hist.empty:
-            st.markdown("<div class='empty-hint'>Belum ada data / belum digenerate.</div>", unsafe_allow_html=True)
-        else:
-            for col in ["total_nominal","total_nominal_cair"]:
-                if col in df_hist.columns:
-                    df_hist[col] = df_hist[col].apply(lambda v: f"Rp {v:,.0f}".replace(",","."))
-            st.dataframe(df_hist, width='stretch', hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.expander("🧾 Rekap Cash Advance (Histori)", expanded=True):
+            st.caption("Sumber tabel rekap_monthly_cashadvance (maks 12 terakhir).")
+            try:
+                df_hist = pd.read_sql_query("SELECT * FROM rekap_monthly_cashadvance ORDER BY bulan DESC LIMIT 12", raw_conn)
+            except Exception:
+                df_hist = pd.DataFrame()
+            if df_hist.empty:
+                st.markdown("<div class='empty-hint'>Belum ada data / belum digenerate.</div>", unsafe_allow_html=True)
+            else:
+                for col in ["total_nominal","total_nominal_cair"]:
+                    if col in df_hist.columns:
+                        df_hist[col] = df_hist[col].apply(lambda v: f"Rp {v:,.0f}".replace(",","."))
+                st.dataframe(df_hist, width='stretch', hide_index=True)
 
 def audit_trail_module():
     user = require_login()
