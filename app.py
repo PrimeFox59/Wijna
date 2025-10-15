@@ -4042,6 +4042,8 @@ def calendar_module():
 
             # Sub-view switcher to avoid hidden-tab mount issues for the calendar component
             st.markdown("### 📆 Kalender & 📊 Rekap")
+            # Default ke 'Kalender' pada load pertama
+            default_view = st.session_state.get("kalender_rekap_switch", "Kalender")
             view_choice = st.radio(
                 "",
                 ["Kalender", "Rekap"],
@@ -4052,6 +4054,10 @@ def calendar_module():
 
             # --- View: Kalender (FullCalendar) ---
             if view_choice == "Kalender":
+                # One-time rerun on first open to avoid hidden-mount sizing issues
+                if not st.session_state.get("__wijna_calendar_initialized", False):
+                    st.session_state["__wijna_calendar_initialized"] = True
+                    st.rerun()
                 # Build events for FullCalendar
                 dff = df_all.sort_values("tgl_mulai") if not df_all.empty else pd.DataFrame()
                 if not dff.empty:
@@ -4094,6 +4100,8 @@ def calendar_module():
                         cal_available = False
 
                     if cal_available:
+                        # Wrap with fixed-height container to avoid collapse
+                        st.markdown("<div id='wijna-cal-wrap' style='min-height:700px'></div>", unsafe_allow_html=True)
                         calendar_options = {
                             "editable": False,
                             "selectable": False,
