@@ -4057,15 +4057,15 @@ def calendar_module():
             col_a, col_b = st.columns([2, 2])
             with col_a:
                 jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
-                jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options)
+                jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options, key="kalender_filter_jenis")
             with col_b:
-                date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end))
+                date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end), key="kalender_filter_range")
 
             col_c, col_d = st.columns([2, 2])
             with col_c:
-                filter_div = st.text_input("Filter Divisi (nama_divisi)", "")
+                filter_div = st.text_input("Filter Divisi (nama_divisi)", "", key="kalender_filter_div")
             with col_d:
-                filter_judul = st.text_input("Cari Judul", "")
+                filter_judul = st.text_input("Cari Judul", "", key="kalender_filter_judul")
 
             # Terapkan filter
             dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
@@ -4137,7 +4137,10 @@ def calendar_module():
                             },
                             "initialView": "dayGridMonth",
                             "dayMaxEvents": True,
-                            "height": "auto",
+                            # Fixed heights avoid collapsing when rendered inside hidden tabs/containers
+                            "height": 680,
+                            "contentHeight": 640,
+                            "expandRows": True,
                             "displayEventTime": False,
                         }
                         custom_css = """
@@ -4149,7 +4152,7 @@ def calendar_module():
                             events=events,
                             options=calendar_options,
                             custom_css=custom_css,
-                            key="wijna_calendar",
+                            key="wijna_calendar_main",
                         )
 
                         # Optional: simple event click preview
