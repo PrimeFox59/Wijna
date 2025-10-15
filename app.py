@@ -158,185 +158,6 @@ class _AuditConnection:
     def cursor(self, *args, **kwargs):
         return _AuditCursor(self, self._conn.cursor(*args, **kwargs))
 
-def sop_module():
-    user = require_login()
-    st.header("📚 Kebijakan & SOP")
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Introspeksi kolom untuk fleksibilitas skema
-    cur.execute("PRAGMA table_info(sop)")
-    sop_cols = [row[1] for row in cur.fetchall()]
-    sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
-
-    tab_upload, tab_daftar, tab_approve, tab_board = st.tabs(["🆕 Upload SOP", "📋 Daftar & Rekap", "✅ Approval Director", "👥 Review Board"])
-
-    # --- Tab 1: Upload SOP ---
-    with tab_upload:
-        st.subheader("Upload SOP / Kebijakan")
-        with st.form("sop_add", clear_on_submit=True):
-            judul = st.text_input("Judul Kebijakan / SOP")
-            tgl = st.date_input("Tanggal Terbit" if sop_date_col == "tanggal_terbit" else "Tanggal", value=date.today())
-            f = st.file_uploader("Upload File SOP (PDF/DOC)")
-            submit = st.form_submit_button("💾 Simpan")
-            if submit:
-                if not judul or not f:
-                    st.warning("Judul dan file wajib diisi.")
-                else:
-                    sid = gen_id("sop")
-                    blob, fname, _ = upload_file_and_store(f)
-                    cols = ["id", "judul", "file_blob", "file_name"]
-                    vals = [sid, judul, blob, fname]
-                    if sop_date_col == "tanggal_terbit":
-                        cols.append("tanggal_terbit"); vals.append(tgl.isoformat())
-                    elif sop_date_col == "tanggal_upload":
-                        cols.append("tanggal_upload"); vals.append(now_wib_iso())
-                    if "director_approved" in sop_cols:
-                        cols.append("director_approved"); vals.append(0)
-                    for opt in ("memo", "board_note"):
-                        if opt in sop_cols:
-                            cols.append(opt); vals.append("")
-                    placeholders = ", ".join(["?" for _ in cols])
-                    cur.execute(f"INSERT INTO sop ({', '.join(cols)}) VALUES ({placeholders})", vals)
-                    conn.commit()
-                    try:
-                        audit_log("sop", "upload", target=sid, details=f"{judul}; file={fname}")
-                        notify_review_request("sop", title=judul, entity_id=sid, recipients_roles=("director",))
-                    except Exception:
-                        pass
-                    st.success("SOP berhasil diupload. Menunggu approval Director.")
-        # Optional stub inputs (kept for compatibility)
-        _sop_title = st.text_input("Judul SOP/Kebijakan", key="sop_title_stub")
-        _sop_submit = st.form_submit_button("Simpan (stub)")
-        if _sop_submit:
-            st.info("Form SOP sedang disederhanakan; gunakan modul SOP pada versi lengkap untuk upload.")
-
-    # --- Tab 2: Daftar & Rekap ---
-    with tab_daftar:
-        st.subheader("Daftar SOP")
-        # Build SELECT dinamis
-        cur.execute("PRAGMA table_info(sop)")
-        sop_cols = [row[1] for row in cur.fetchall()]
-        sop_date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
-        select_cols = ["id", "judul"]
-        if sop_date_col: select_cols.append(sop_date_col)
-        if "director_approved" in sop_cols: select_cols.append("director_approved")
-        if "file_name" in sop_cols: select_cols.append("file_name")
-        df = pd.read_sql_query(f"SELECT {', '.join(select_cols)} FROM sop ORDER BY " + (sop_date_col or "id") + " DESC", conn)
-
-        # Filter UI
-        col1, col2, col3 = st.columns([2,2,2])
-        with col1:
-            q = st.text_input("Cari Judul", "")
-        with col2:
-            status_opt = ["Semua", "Approved", "Belum"] if "director_approved" in df.columns else ["Semua"]
-            status_sel = st.selectbox("Status", status_opt)
-        with col3:
-            if sop_date_col and not df.empty:
-                min_d = pd.to_datetime(df[sop_date_col]).min().date()
-                max_d = pd.to_datetime(df[sop_date_col]).max().date()
-                dr = st.date_input("Rentang Tanggal", value=(min_d, max_d))
-            else:
-                dr = None
-
-        dff = df.copy()
-        if q:
-            dff = dff[dff["judul"].astype(str).str.contains(q, case=False, na=False)]
-        if status_sel != "Semua" and "director_approved" in dff.columns:
-            dff = dff[dff["director_approved"] == (1 if status_sel == "Approved" else 0)]
-        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and sop_date_col and sop_date_col in dff.columns:
-            s, e = dr
-            dff = dff[(pd.to_datetime(dff[sop_date_col]) >= pd.to_datetime(s)) & (pd.to_datetime(dff[sop_date_col]) <= pd.to_datetime(e))]
-
-        # Tampilan tabel ramah pengguna
-        if not dff.empty:
-            show = dff.copy()
-            if "director_approved" in show.columns:
-                show["Status"] = show["director_approved"].map({1: "✅ Approved", 0: "🕒 Proses"})
-            cols_show = [c for c in ["judul", sop_date_col, "file_name", "Status"] if (c and c in show.columns)]
-            st.dataframe(show[cols_show], width='stretch')
-            # Download file per item (opsional pilih)
-
-        # --- Tab 4: Review Board (Opsional) ---
-        with tab_board:
-            if user["role"] in ["board", "superuser"]:
-                try:
-                    dfb = pd.read_sql_query("SELECT id, judul, tanggal_upload, board_note FROM sop ORDER BY COALESCE(tanggal_upload, id) DESC", conn)
-                except Exception:
-                    dfb = pd.DataFrame()
-                if dfb.empty:
-                    st.info("Belum ada SOP untuk direview.")
-                else:
-                    for _, row in dfb.iterrows():
-                        st.markdown(f"**{row['judul']}**")
-                        cur_note = row.get('board_note') or ""
-                        note = st.text_area("Catatan Board", value=cur_note, key=f"sop_board_note_{row['id']}")
-                        if st.button("Simpan Catatan", key=f"sop_board_save_{row['id']}"):
-                            try:
-                                cur.execute("UPDATE sop SET board_note=? WHERE id=?", (note, row['id']))
-                                conn.commit()
-                                st.success("Catatan Board disimpan.")
-                                try:
-                                    audit_log("sop", "board_review", target=row['id'], details=f"note={note}")
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                st.error(f"Gagal simpan: {e}")
-            else:
-                st.info("Hanya Board yang dapat review di sini.")
-            if "id" in show.columns and "file_name" in show.columns:
-                opsi = {f"{r['judul']} — {r.get(sop_date_col, '')} ({r['file_name'] or '-'})": r['id'] for _, r in show.iterrows()}
-                if opsi:
-                    pilih = st.selectbox("Unduh file SOP", [""] + list(opsi.keys()))
-                    if pilih:
-                        sid = opsi[pilih]
-                        row = pd.read_sql_query("SELECT file_blob, file_name FROM sop WHERE id=?", conn, params=(sid,)).iloc[0]
-                        if row["file_blob"] is not None and row["file_name"]:
-                            st.download_button("⬇️ Download File", data=row["file_blob"], file_name=row["file_name"], mime="application/octet-stream")
-            else:
-                st.info("Belum ada SOP.")
-
-        # Rekap Bulanan SOP
-        st.markdown("#### 📅 Rekap Bulanan SOP (Otomatis)")
-        this_month = date.today().strftime("%Y-%m")
-        if not dff.empty and sop_date_col and sop_date_col in dff.columns:
-            df_month = dff[dff[sop_date_col].astype(str).str[:7] == this_month]
-        else:
-            df_month = pd.DataFrame()
-        st.write(f"Total SOP/Kebijakan bulan ini: {len(df_month)}")
-
-    # --- Tab 3: Approval Director ---
-    with tab_approve:
-        if user["role"] not in ["director", "superuser"]:
-            st.info("Hanya Director/Superuser yang dapat meng-approve.")
-        elif "director_approved" not in sop_cols:
-            st.info("Kolom director_approved belum tersedia pada tabel SOP. Approval tidak bisa dilakukan.")
-        else:
-            df_pend = pd.read_sql_query(
-                f"SELECT id, judul" + (f", {sop_date_col}" if sop_date_col else "") + ", file_name FROM sop WHERE director_approved=0 ORDER BY " + (sop_date_col or "id") + " DESC",
-                conn
-            )
-            if df_pend.empty:
-                st.success("Tidak ada item menunggu approval.")
-            else:
-                for _, row in df_pend.iterrows():
-                    title = f"{row['judul']}" + (f" | {row[sop_date_col]}" if sop_date_col and row.get(sop_date_col) else "")
-                    with st.expander(title):
-                        st.write(f"File: {row.get('file_name') or '-'}")
-                        note = st.text_area("Catatan Director (opsional)", key=f"sop_note_{row['id']}")
-                        if st.button("✅ Approve", key=f"sop_approve_{row['id']}"):
-                            if "memo" in sop_cols:
-                                cur.execute("UPDATE sop SET director_approved=1, memo=? WHERE id=?", (note, row['id']))
-                            else:
-                                cur.execute("UPDATE sop SET director_approved=1 WHERE id=?", (row['id'],))
-                            conn.commit()
-                            try:
-                                audit_log("sop", "director_approval", target=row['id'], details=f"note={note}")
-                            except Exception:
-                                pass
-                            st.success("SOP approved.")
-                            st.rerun()
-
 def get_db() -> sqlite3.Connection:
     db_path = DB_PATH if os.path.isabs(DB_PATH) else os.path.join(os.path.dirname(__file__), DB_PATH)
     conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
@@ -3441,7 +3262,182 @@ def pmr_module():
         else:
             st.info("Hanya Finance/Director yang dapat melihat rekap PMR.")
 
- 
+def cuti_module():
+    user = require_login()
+    st.header("🌴 Pengajuan & Approval Cuti")
+    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
+    conn = get_db()
+    cur = conn.cursor()
+    tab1, tab2, tab3, tab4 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director", "📋 Rekap Cuti"])
+
+    # Tab 1: Ajukan Cuti
+    with tab1:
+        st.markdown("### 📝 Ajukan Cuti")
+        nama = user["full_name"]
+        tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
+        tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
+        alasan = st.text_area("Alasan Cuti")
+        # Durasi tidak menghitung Libur Nasional (non-working days)
+        durasi = _count_days_excluding_holidays(tgl_mulai, tgl_selesai) if tgl_selesai >= tgl_mulai else 0
+        cur.execute("SELECT kuota_tahunan, cuti_terpakai FROM cuti WHERE nama=? ORDER BY tgl_mulai DESC LIMIT 1", (nama,))
+        last = cur.fetchone()
+        kuota_tahunan = last["kuota_tahunan"] if last else 12
+        cuti_terpakai = last["cuti_terpakai"] if last else 0
+        sisa_kuota = kuota_tahunan - cuti_terpakai
+        st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
+        st.write(f"Durasi cuti diajukan (tidak termasuk Libur Nasional): {durasi} hari")
+        if durasi > 0 and sisa_kuota < durasi:
+            st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
+        st.caption("Pengajuan akan ditolak otomatis bila Sisa Kuota < Durasi pengajuan.")
+        if st.button("Ajukan Cuti"):
+            if not alasan or durasi <= 0:
+                st.warning("Lengkapi data dan pastikan tanggal benar.")
+            elif sisa_kuota < durasi:
+                st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
+            else:
+                cid = gen_id("cuti")
+                # Update running totals at time of submission
+                new_cuti_terpakai = cuti_terpakai + durasi
+                new_sisa = max(0, kuota_tahunan - new_cuti_terpakai)
+                cur.execute(
+                    """
+                    INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
+                    """,
+                    (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, new_cuti_terpakai, new_sisa, "Menunggu Review Finance"),
+                )
+                conn.commit()
+                try:
+                    notify_review_request("cuti", title=f"{nama} — {durasi} hari", entity_id=cid, recipients_roles=("finance","director"))
+                except Exception:
+                    pass
+                st.success("Pengajuan cuti berhasil diajukan.")
+                # Audit trail
+                try:
+                    audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
+                except Exception:
+                    pass
+
+    # Tab 2: Review Finance
+    with tab2:
+        st.markdown("### Review & Approval Finance")
+        if user["role"] in ["finance", "superuser"]:
+            df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=0 ORDER BY tgl_mulai DESC", conn)
+            for _, row in df.iterrows():
+                with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                    st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                    st.write(f"Alasan: {row['status']}")
+                    note = st.text_area("Catatan Finance", value=row["finance_note"] or "", key=f"fin_note_{row['id']}")
+                    approve = st.checkbox("Approve", value=bool(row["finance_approved"]), key=f"fin_appr_{row['id']}")
+                    if st.button("Simpan Review", key=f"fin_save_{row['id']}"):
+                        status = "Menunggu Approval Director" if approve else "Ditolak Finance"
+                        cur.execute("UPDATE cuti SET finance_note=?, finance_approved=?, status=? WHERE id=?", (note, int(approve), status, row["id"]))
+                        conn.commit()
+                        st.success("Review Finance disimpan.")
+                        # Audit trail
+                        try:
+                            audit_log("cuti", "finance_review", target=row["id"], details=f"approve={bool(approve)}; status={status}")
+                        except Exception:
+                            pass
+                        # Notify Director + applicant
+                        try:
+                            pemohon_email = _get_user_email_by_name(row['nama'])
+                            decision = "finance_approved" if approve else "finance_rejected"
+                            notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
+                                            entity_id=row['id'], recipients_roles=("director",),
+                                            recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="finance")
+                        except Exception:
+                            pass
+                        st.rerun()
+        else:
+            st.info("Hanya Finance/Superuser yang dapat review di sini.")
+
+    # Tab 3: Approval Director
+    with tab3:
+        st.markdown("### Approval Director")
+        if user["role"] in ["director", "superuser"]:
+            # Tampilkan hanya yang masih menunggu persetujuan Director
+            df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 AND director_approved=0 ORDER BY tgl_mulai DESC", conn)
+            for _, row in df.iterrows():
+                with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
+                    st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
+                    st.write(f"Alasan: {row['status']}")
+                    note = st.text_area("Catatan Director", value=row["director_note"] or "", key=f"dir_note_{row['id']}")
+                    approve = st.checkbox("Approve", value=bool(row["director_approved"]), key=f"dir_appr_{row['id']}")
+                    if st.button("Simpan Approval", key=f"dir_save_{row['id']}"):
+                        if approve:
+                            cur.execute("SELECT cuti_terpakai, durasi, kuota_tahunan FROM cuti WHERE id= ?", (row["id"],))
+                            r = cur.fetchone()
+                            baru_terpakai = (r["cuti_terpakai"] or 0) + (r["durasi"] or 0)
+                            sisa = (r["kuota_tahunan"] or 12) - baru_terpakai
+                            cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=?, cuti_terpakai=?, sisa_kuota=? WHERE id= ?",
+                                (note, int(approve), "Disetujui Director", baru_terpakai, sisa, row["id"]))
+                        else:
+                            cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=? WHERE id= ?",
+                                (note, int(approve), "Ditolak Director", row["id"]))
+                        conn.commit()
+                        st.success("Approval Director disimpan.")
+                        # Audit trail
+                        try:
+                            audit_log("cuti", "director_approval", target=row["id"], details=f"approve={bool(approve)}")
+                        except Exception:
+                            pass
+                        # Notify applicant + Finance
+                        try:
+                            pemohon_email = _get_user_email_by_name(row['nama'])
+                            decision = "director_approved" if approve else "director_rejected"
+                            notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
+                                            entity_id=row['id'], recipients_roles=("finance",),
+                                            recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="director")
+                        except Exception:
+                            pass
+                        st.rerun()
+
+    # Tab 4: Rekap (dengan filter)
+    with tab4:
+        st.markdown("### 📋 Rekap Pengajuan Cuti")
+        df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
+        # Filter UI
+        c1, c2, c3 = st.columns([2,2,3])
+        with c1:
+            q = st.text_input("Cari Nama/Status", "")
+        with c2:
+            opt_status = ["Semua"]
+            if not df.empty and "status" in df.columns:
+                try:
+                    unique_status = sorted([s for s in df["status"].dropna().unique().tolist() if str(s).strip() != ""])
+                    opt_status += unique_status
+                except Exception:
+                    pass
+            status_sel = st.selectbox("Status", opt_status)
+        with c3:
+            if not df.empty and "tgl_mulai" in df.columns:
+                try:
+                    min_d = pd.to_datetime(df["tgl_mulai"]).min().date()
+                    max_d = pd.to_datetime(df["tgl_mulai"]).max().date()
+                    dr = st.date_input("Rentang Tanggal (Mulai)", value=(min_d, max_d))
+                except Exception:
+                    dr = None
+            else:
+                dr = None
+
+        dff = df.copy()
+        if q:
+            ql = q.lower()
+            dff = dff[
+                dff.get("nama", "").astype(str).str.lower().str.contains(ql, na=False)
+                | dff.get("status", "").astype(str).str.lower().str.contains(ql, na=False)
+            ]
+        if status_sel and status_sel != "Semua" and "status" in dff.columns:
+            dff = dff[dff["status"] == status_sel]
+        if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and "tgl_mulai" in dff.columns:
+            try:
+                s, e = dr
+                dff = dff[(pd.to_datetime(dff["tgl_mulai"]) >= pd.to_datetime(s)) & (pd.to_datetime(dff["tgl_mulai"]) <= pd.to_datetime(e))]
+            except Exception:
+                pass
+
+        st.dataframe(dff, width='stretch', hide_index=True)
 
 def delegasi_module():
     user = require_login()
@@ -4239,6 +4235,20 @@ def calendar_module():
             st.info("Belum ada event pada kalender.")
 
  
+
+def sop_module():
+    user = require_login()
+    st.header("📚 Kebijakan & SOP")
+    conn = get_db()
+    try:
+        # Show simple list of SOPs; minimize features to restore functionality
+        df = pd.read_sql_query("SELECT id, judul, file_name, COALESCE(tanggal_terbit, tanggal_upload) AS tanggal, director_approved FROM sop ORDER BY tanggal DESC", conn)
+    except Exception:
+        df = pd.DataFrame()
+    if df.empty:
+        st.info("Belum ada data SOP.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 def notulen_module():
     user = require_login()
@@ -5438,178 +5448,7 @@ def main():
     elif choice == "PMR":
         pmr_module()
     elif choice == "Cuti":
-        user = require_login()
-        st.header("🌴 Pengajuan & Approval Cuti")
-        st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
-        conn = get_db()
-        cur = conn.cursor()
-        tab1, tab2, tab3, tab4 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director", "📋 Rekap Cuti"])
-        # Tab 1: Ajukan Cuti
-        with tab1:
-            st.markdown("### 📝 Ajukan Cuti")
-            nama = user["full_name"]
-            tgl_mulai = st.date_input("Tanggal Mulai", value=date.today())
-            tgl_selesai = st.date_input("Tanggal Selesai", value=date.today())
-            alasan = st.text_area("Alasan Cuti")
-            # Durasi tidak menghitung Libur Nasional (non-working days)
-            durasi = _count_days_excluding_holidays(tgl_mulai, tgl_selesai) if tgl_selesai >= tgl_mulai else 0
-            cur.execute("SELECT kuota_tahunan, cuti_terpakai FROM cuti WHERE nama=? ORDER BY tgl_mulai DESC LIMIT 1", (nama,))
-            row = cur.fetchone()
-            kuota_tahunan = row["kuota_tahunan"] if row else 12
-            cuti_terpakai = row["cuti_terpakai"] if row else 0
-            sisa_kuota = kuota_tahunan - cuti_terpakai
-            st.info(f"Sisa kuota cuti: {sisa_kuota} hari dari {kuota_tahunan} hari")
-            st.write(f"Durasi cuti diajukan (tidak termasuk Libur Nasional): {durasi} hari")
-            if durasi > 0 and sisa_kuota < durasi:
-                st.error("Sisa kuota tidak cukup, pengajuan cuti otomatis ditolak.")
-            st.caption("Pengajuan akan ditolak otomatis bila Sisa Kuota < Durasi pengajuan.")
-            if st.button("Ajukan Cuti"):
-                if not alasan or durasi <= 0:
-                    st.warning("Lengkapi data dan pastikan tanggal benar.")
-                elif sisa_kuota < durasi:
-                    st.error("Sisa kuota tidak cukup, pengajuan cuti ditolak.")
-                else:
-                    cid = gen_id("cuti")
-                    now = now_wib_iso()
-                    # Update running totals at time of submission
-                    new_cuti_terpakai = cuti_terpakai + durasi
-                    new_sisa = max(0, kuota_tahunan - new_cuti_terpakai)
-                    cur.execute(
-                        """
-                        INSERT INTO cuti (id, nama, tgl_mulai, tgl_selesai, durasi, kuota_tahunan, cuti_terpakai, sisa_kuota, status, finance_note, finance_approved, director_note, director_approved)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, '', 0)
-                        """,
-                        (cid, nama, tgl_mulai.isoformat(), tgl_selesai.isoformat(), durasi, kuota_tahunan, new_cuti_terpakai, new_sisa, "Menunggu Review Finance"),
-                    )
-                    conn.commit()
-                    try:
-                        notify_review_request("cuti", title=f"{nama} — {durasi} hari", entity_id=cid, recipients_roles=("finance","director"))
-                    except Exception:
-                        pass
-                    st.success("Pengajuan cuti berhasil diajukan.")
-                    # Audit trail
-                    try:
-                        audit_log("cuti", "create", target=cid, details=f"{nama} ajukan cuti {tgl_mulai} s/d {tgl_selesai} ({durasi} hari)")
-                    except Exception:
-                        pass
-        # Tab 2: Review Finance
-        with tab2:
-            st.markdown("### Review & Approval Finance")
-            if user["role"] in ["finance", "superuser"]:
-                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=0 ORDER BY tgl_mulai DESC", conn)
-                for idx, row in df.iterrows():
-                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
-                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
-                        st.write(f"Alasan: {row['status']}")
-                        note = st.text_area("Catatan Finance", value=row["finance_note"] or "", key=f"fin_note_{row['id']}")
-                        approve = st.checkbox("Approve", value=bool(row["finance_approved"]), key=f"fin_appr_{row['id']}")
-                        if st.button("Simpan Review", key=f"fin_save_{row['id']}"):
-                            status = "Menunggu Approval Director" if approve else "Ditolak Finance"
-                            cur.execute("UPDATE cuti SET finance_note=?, finance_approved=?, status=? WHERE id=?", (note, int(approve), status, row["id"]))
-                            conn.commit()
-                            st.success("Review Finance disimpan.")
-                            # Audit trail
-                            try:
-                                audit_log("cuti", "finance_review", target=row["id"], details=f"approve={bool(approve)}; status={status}")
-                            except Exception:
-                                pass
-                            # Notify Director + applicant
-                            try:
-                                pemohon_email = _get_user_email_by_name(row['nama'])
-                                decision = "finance_approved" if approve else "finance_rejected"
-                                notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
-                                                entity_id=row['id'], recipients_roles=("director",),
-                                                recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="finance")
-                            except Exception:
-                                pass
-                            st.rerun()
-            else:
-                st.info("Hanya Finance/Superuser yang dapat review di sini.")
-        # Tab 3: Approval Director
-        with tab3:
-            st.markdown("### Approval Director")
-            if user["role"] in ["director", "superuser"]:
-                # Tampilkan hanya yang masih menunggu persetujuan Director
-                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 AND director_approved=0 ORDER BY tgl_mulai DESC", conn)
-                for idx, row in df.iterrows():
-                    with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
-                        st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
-                        st.write(f"Alasan: {row['status']}")
-                        note = st.text_area("Catatan Director", value=row["director_note"] or "", key=f"dir_note_{row['id']}")
-                        approve = st.checkbox("Approve", value=bool(row["director_approved"]), key=f"dir_appr_{row['id']}")
-                        if st.button("Simpan Approval", key=f"dir_save_{row['id']}"):
-                            if approve:
-                                cur.execute("SELECT cuti_terpakai, durasi, kuota_tahunan FROM cuti WHERE id=?", (row["id"],))
-                                r = cur.fetchone()
-                                baru_terpakai = (r["cuti_terpakai"] or 0) + (r["durasi"] or 0)
-                                sisa = (r["kuota_tahunan"] or 12) - baru_terpakai
-                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=?, cuti_terpakai=?, sisa_kuota=? WHERE id=?",
-                                    (note, int(approve), "Disetujui Director", baru_terpakai, sisa, row["id"]))
-                            else:
-                                cur.execute("UPDATE cuti SET director_note=?, director_approved=?, status=? WHERE id=?",
-                                    (note, int(approve), "Ditolak Director", row["id"]))
-                            conn.commit()
-                            st.success("Approval Director disimpan.")
-                            # Audit trail
-                            try:
-                                audit_log("cuti", "director_approval", target=row["id"], details=f"approve={bool(approve)}")
-                            except Exception:
-                                pass
-                            # Notify applicant + Finance
-                            try:
-                                pemohon_email = _get_user_email_by_name(row['nama'])
-                                decision = "director_approved" if approve else "director_rejected"
-                                notify_decision("cuti", title=f"{row['nama']} — {row['tgl_mulai']} s/d {row['tgl_selesai']}", decision=decision,
-                                                entity_id=row['id'], recipients_roles=("finance",),
-                                                recipients_users=[pemohon_email] if pemohon_email else None, tag_suffix="director")
-                            except Exception:
-                                pass
-                            st.rerun()
-        # Tab 4: Rekap (dengan filter)
-        with tab4:
-            st.markdown("### 📋 Rekap Pengajuan Cuti")
-            df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
-            # Filter UI
-            c1, c2, c3 = st.columns([2,2,3])
-            with c1:
-                q = st.text_input("Cari Nama/Status", "")
-            with c2:
-                opt_status = ["Semua"]
-                if not df.empty and "status" in df.columns:
-                    try:
-                        unique_status = sorted([s for s in df["status"].dropna().unique().tolist() if str(s).strip() != ""])
-                        opt_status += unique_status
-                    except Exception:
-                        pass
-                status_sel = st.selectbox("Status", opt_status)
-            with c3:
-                if not df.empty and "tgl_mulai" in df.columns:
-                    try:
-                        min_d = pd.to_datetime(df["tgl_mulai"]).min().date()
-                        max_d = pd.to_datetime(df["tgl_mulai"]).max().date()
-                        dr = st.date_input("Rentang Tanggal (Mulai)", value=(min_d, max_d))
-                    except Exception:
-                        dr = None
-                else:
-                    dr = None
-
-            dff = df.copy()
-            if q:
-                ql = q.lower()
-                dff = dff[
-                    dff.get("nama", "").astype(str).str.lower().str.contains(ql, na=False)
-                    | dff.get("status", "").astype(str).str.lower().str.contains(ql, na=False)
-                ]
-            if status_sel and status_sel != "Semua" and "status" in dff.columns:
-                dff = dff[dff["status"] == status_sel]
-            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and "tgl_mulai" in dff.columns:
-                try:
-                    s, e = dr
-                    dff = dff[(pd.to_datetime(dff["tgl_mulai"]) >= pd.to_datetime(s)) & (pd.to_datetime(dff["tgl_mulai"]) <= pd.to_datetime(e))]
-                except Exception:
-                    pass
-
-            st.dataframe(dff, width='stretch', hide_index=True)
+        cuti_module()
     elif choice == "Flex Time":
         flex_module()
     elif choice == "Delegasi":
