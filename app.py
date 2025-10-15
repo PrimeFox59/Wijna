@@ -4034,50 +4034,11 @@ def calendar_module():
             if overlaps:
                 st.warning(f"Terdapat overlap jadwal Mobil Kantor untuk kendaraan yang sama: {overlaps}")
 
-        # -------------------------
-        # Filter UI
-        # -------------------------
-        st.subheader("🔎 Filter Kalender")
+        # Prepare helper columns once
         if not df_all.empty:
-            # Siapkan kolom bantu untuk filter tanggal overlap
             df_all = df_all.copy()
             df_all["tgl_mulai_dt"] = pd.to_datetime(df_all["tgl_mulai"], errors="coerce")
             df_all["tgl_selesai_dt"] = pd.to_datetime(df_all["tgl_selesai"], errors="coerce")
-
-            min_date = df_all["tgl_mulai_dt"].min()
-            max_date = df_all["tgl_selesai_dt"].max()
-            # Default rentang: bulan ini jika ada, fallback ke min/max
-            today = date.today()
-            month_start = today.replace(day=1)
-            next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
-            month_end = next_month - timedelta(days=1)
-            default_start = month_start if pd.notna(min_date) else today
-            default_end = month_end if pd.notna(max_date) else today
-
-            col_a, col_b = st.columns([2, 2])
-            with col_a:
-                jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
-                jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options, key="kalender_filter_jenis")
-            with col_b:
-                date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end), key="kalender_filter_range")
-
-            col_c, col_d = st.columns([2, 2])
-            with col_c:
-                filter_div = st.text_input("Filter Divisi (nama_divisi)", "", key="kalender_filter_div")
-            with col_d:
-                filter_judul = st.text_input("Cari Judul", "", key="kalender_filter_judul")
-
-            # Terapkan filter
-            dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
-            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-                start_d, end_d = date_range
-                if start_d and end_d:
-                    # Event overlap jika mulai <= end_d dan selesai >= start_d
-                    dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
-            if filter_div:
-                dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
-            if filter_judul:
-                dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
 
             # Sub-view switcher to avoid hidden-tab mount issues for the calendar component
             st.markdown("### 📆 Kalender & 📊 Rekap")
@@ -4092,8 +4053,8 @@ def calendar_module():
             # --- View: Kalender (FullCalendar) ---
             if view_choice == "Kalender":
                 # Build events for FullCalendar
+                dff = df_all.sort_values("tgl_mulai") if not df_all.empty else pd.DataFrame()
                 if not dff.empty:
-                    dff = dff.sort_values("tgl_mulai")
                     COLOR_MAP = {
                         "Cuti": "#FF6C6C",
                         "Flex Time": "#FFA500",
@@ -4174,10 +4135,43 @@ def calendar_module():
                         st.dataframe(dff[show_cols], use_container_width=True)
 
                 else:
-                    st.info("Tidak ada event sesuai filter.")
+                    st.info("Tidak ada event untuk ditampilkan.")
 
             # --- View: Rekap ---
             if view_choice == "Rekap":
+                # Tampilkan filter hanya di mode Rekap
+                st.subheader("🔎 Filter Kalender")
+                # Default rentang: bulan ini
+                today = date.today()
+                month_start = today.replace(day=1)
+                next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+                month_end = next_month - timedelta(days=1)
+                default_start = month_start
+                default_end = month_end
+
+                col_a, col_b = st.columns([2, 2])
+                with col_a:
+                    jenis_options = sorted([x for x in df_all["jenis"].dropna().unique().tolist()])
+                    jenis_selected = st.multiselect("Jenis Event", jenis_options, default=jenis_options, key="kalender_filter_jenis")
+                with col_b:
+                    date_range = st.date_input("Rentang Tanggal (overlap)", value=(default_start, default_end), key="kalender_filter_range")
+
+                col_c, col_d = st.columns([2, 2])
+                with col_c:
+                    filter_div = st.text_input("Filter Divisi (nama_divisi)", "", key="kalender_filter_div")
+                with col_d:
+                    filter_judul = st.text_input("Cari Judul", "", key="kalender_filter_judul")
+
+                # Terapkan filter untuk Rekap
+                dff = df_all[(df_all["jenis"].isin(jenis_selected))] if jenis_selected else df_all.copy()
+                if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                    start_d, end_d = date_range
+                    if start_d and end_d:
+                        dff = dff[(dff["tgl_mulai_dt"] <= pd.to_datetime(end_d)) & (dff["tgl_selesai_dt"] >= pd.to_datetime(start_d))]
+                if filter_div:
+                    dff = dff[dff["nama_divisi"].astype(str).str.contains(filter_div, case=False, na=False)]
+                if filter_judul:
+                    dff = dff[dff["judul"].astype(str).str.contains(filter_judul, case=False, na=False)]
                 st.subheader("📊 Rekap Bulanan dari Hasil Filter")
                 this_month = date.today().strftime("%Y-%m")
                 df_month = dff[dff['tgl_mulai'].astype(str).str[:7] == this_month] if not dff.empty else pd.DataFrame()
@@ -5521,7 +5515,8 @@ def main():
         with tab3:
             st.markdown("### Approval Director & Rekap Cuti")
             if user["role"] in ["director", "superuser"]:
-                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 ORDER BY tgl_mulai DESC", conn)
+                # Tampilkan hanya yang masih menunggu persetujuan Director
+                df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 AND director_approved=0 ORDER BY tgl_mulai DESC", conn)
                 for idx, row in df.iterrows():
                     with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
                         st.write(f"Durasi: {row['durasi']} hari, Sisa kuota: {row['sisa_kuota']} hari")
@@ -5556,7 +5551,7 @@ def main():
                             except Exception:
                                 pass
                             st.rerun()
-            # Rekap semua pengajuan cuti
+            # Rekap semua pengajuan cuti (termasuk yang sudah diputuskan)
             st.markdown("#### Rekap Pengajuan Cuti")
             df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
             st.dataframe(df, width='stretch', hide_index=True)
