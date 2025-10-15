@@ -601,28 +601,31 @@ def ensure_db():
             tanggal_submit TEXT
         )
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS cuti (
-            id TEXT PRIMARY KEY,
-            nama TEXT,
-        # Migration: track creator for MoU
+        # Cuti table (fix malformed DDL and ensure required columns exist)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cuti (
+                id TEXT PRIMARY KEY,
+                nama TEXT,
+                tgl_mulai TEXT,
+                tgl_selesai TEXT,
+                durasi INTEGER,
+                kuota_tahunan INTEGER,
+                cuti_terpakai INTEGER,
+                sisa_kuota INTEGER,
+                status TEXT,
+                finance_note TEXT,
+                finance_approved INTEGER DEFAULT 0,
+                director_note TEXT,
+                director_approved INTEGER DEFAULT 0
+            )
+            """
+        )
+        # Migration: track creator for MoU (moved outside of Cuti DDL)
         try:
             cur.execute("ALTER TABLE mou ADD COLUMN created_by TEXT")
         except Exception:
             pass
-            tgl_mulai TEXT,
-            tgl_selesai TEXT,
-            durasi INTEGER,
-            kuota_tahunan INTEGER,
-            cuti_terpakai INTEGER,
-            sisa_kuota INTEGER,
-            status TEXT,
-            finance_note TEXT,
-            finance_approved INTEGER DEFAULT 0,
-            director_note TEXT,
-            director_approved INTEGER DEFAULT 0
-        )
-        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS flex (
             id TEXT PRIMARY KEY,
@@ -3987,21 +3990,23 @@ def calendar_module():
 
     # Tab 2: Kalender Gabungan & Rekap
     with tab2:
+        # Use raw sqlite connection for pandas compatibility
+        raw_conn = conn._conn if hasattr(conn, "_conn") else conn
         # --- AUTO INTEGRASI EVENT ---
-        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", conn)
+        df_cuti = pd.read_sql_query("SELECT nama as judul, 'Cuti' as jenis, nama as nama_divisi, tgl_mulai, tgl_selesai FROM cuti WHERE director_approved=1", raw_conn)
         # Flex table uses approval_director (not director_approved). Fallback if column missing.
         try:
-            df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1", conn)
+            df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex WHERE approval_director=1", raw_conn)
         except Exception:
             # fallback without filter
             try:
-                df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex", conn)
+                df_flex = pd.read_sql_query("SELECT nama as judul, 'Flex Time' as jenis, nama as nama_divisi, tanggal as tgl_mulai, tanggal as tgl_selesai FROM flex", raw_conn)
             except Exception:
                 df_flex = pd.DataFrame(columns=["judul","jenis","nama_divisi","tgl_mulai","tgl_selesai"])
-        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", conn)
-        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", conn)
-        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai, kendaraan FROM mobil WHERE status='Disetujui'", conn)
-        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", conn)
+        df_delegasi = pd.read_sql_query("SELECT judul, 'Delegasi' as jenis, pic as nama_divisi, tgl_mulai, tgl_selesai FROM delegasi", raw_conn)
+        df_rapat = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE jenis='Rapat'", raw_conn)
+        df_mobil = pd.read_sql_query("SELECT tujuan as judul, 'Mobil Kantor' as jenis, kendaraan as nama_divisi, tgl_mulai, tgl_selesai, kendaraan FROM mobil WHERE status='Disetujui'", raw_conn)
+        df_libur = pd.read_sql_query("SELECT judul, jenis, nama_divisi, tgl_mulai, tgl_selesai FROM calendar WHERE is_holiday=1", raw_conn)
 
         # Gabungkan semua event
         df_all = pd.concat([
