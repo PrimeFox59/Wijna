@@ -5431,7 +5431,7 @@ def main():
         st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
         conn = get_db()
         cur = conn.cursor()
-        tab1, tab2, tab3 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director & Rekap"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director", "📋 Rekap Cuti"])
         # Tab 1: Ajukan Cuti
         with tab1:
             st.markdown("### 📝 Ajukan Cuti")
@@ -5513,9 +5513,9 @@ def main():
                             st.rerun()
             else:
                 st.info("Hanya Finance/Superuser yang dapat review di sini.")
-        # Tab 3: Approval Director & Rekap
+        # Tab 3: Approval Director
         with tab3:
-            st.markdown("### Approval Director & Rekap Cuti")
+            st.markdown("### Approval Director")
             if user["role"] in ["director", "superuser"]:
                 # Tampilkan hanya yang masih menunggu persetujuan Director
                 df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=1 AND director_approved=0 ORDER BY tgl_mulai DESC", conn)
@@ -5553,10 +5553,51 @@ def main():
                             except Exception:
                                 pass
                             st.rerun()
-            # Rekap semua pengajuan cuti (termasuk yang sudah diputuskan)
-            st.markdown("#### Rekap Pengajuan Cuti")
+        # Tab 4: Rekap (dengan filter)
+        with tab4:
+            st.markdown("### 📋 Rekap Pengajuan Cuti")
             df = pd.read_sql_query("SELECT * FROM cuti ORDER BY tgl_mulai DESC", conn)
-            st.dataframe(df, width='stretch', hide_index=True)
+            # Filter UI
+            c1, c2, c3 = st.columns([2,2,3])
+            with c1:
+                q = st.text_input("Cari Nama/Status", "")
+            with c2:
+                opt_status = ["Semua"]
+                if not df.empty and "status" in df.columns:
+                    try:
+                        unique_status = sorted([s for s in df["status"].dropna().unique().tolist() if str(s).strip() != ""])
+                        opt_status += unique_status
+                    except Exception:
+                        pass
+                status_sel = st.selectbox("Status", opt_status)
+            with c3:
+                if not df.empty and "tgl_mulai" in df.columns:
+                    try:
+                        min_d = pd.to_datetime(df["tgl_mulai"]).min().date()
+                        max_d = pd.to_datetime(df["tgl_mulai"]).max().date()
+                        dr = st.date_input("Rentang Tanggal (Mulai)", value=(min_d, max_d))
+                    except Exception:
+                        dr = None
+                else:
+                    dr = None
+
+            dff = df.copy()
+            if q:
+                ql = q.lower()
+                dff = dff[
+                    dff.get("nama", "").astype(str).str.lower().str.contains(ql, na=False)
+                    | dff.get("status", "").astype(str).str.lower().str.contains(ql, na=False)
+                ]
+            if status_sel and status_sel != "Semua" and "status" in dff.columns:
+                dff = dff[dff["status"] == status_sel]
+            if dr and isinstance(dr, (list, tuple)) and len(dr) == 2 and "tgl_mulai" in dff.columns:
+                try:
+                    s, e = dr
+                    dff = dff[(pd.to_datetime(dff["tgl_mulai"]) >= pd.to_datetime(s)) & (pd.to_datetime(dff["tgl_mulai"]) <= pd.to_datetime(e))]
+                except Exception:
+                    pass
+
+            st.dataframe(dff, width='stretch', hide_index=True)
     elif choice == "Flex Time":
         flex_module()
     elif choice == "Delegasi":
