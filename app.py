@@ -257,6 +257,14 @@ def ensure_db():
                 cur.execute("ALTER TABLE sop ADD COLUMN board_note TEXT")
         except Exception:
             pass
+        # Ensure SOP has director_note column for Director approval notes
+        try:
+            cur.execute("PRAGMA table_info(sop)")
+            sop_cols_existing = {row[1] for row in cur.fetchall()}
+            if "director_note" not in sop_cols_existing:
+                cur.execute("ALTER TABLE sop ADD COLUMN director_note TEXT")
+        except Exception:
+            pass
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS notulen (
@@ -4247,38 +4255,132 @@ def sop_module():
     st.header("📚 Kebijakan & SOP")
     conn = get_db()
     cur = conn.cursor()
-    # Introspeksi kolom agar query kompatibel dengan skema yang berbeda (tanggal_terbit opsional)
-    try:
-        cur.execute("PRAGMA table_info(sop)")
-        sop_cols = [row[1] for row in cur.fetchall()]
-    except Exception:
-        sop_cols = []
 
-    # Tentukan kolom tanggal yang tersedia
-    date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
-    select_parts = []
-    for c in ("id", "judul", "file_name"):
-        if c in sop_cols:
-            select_parts.append(c)
-    if date_col:
-        select_parts.append(f"{date_col} AS tanggal")
-    if "director_approved" in sop_cols:
-        select_parts.append("director_approved")
+    # Normalize role
+    _role = (user.get("role") or "").strip().lower()
 
-    if select_parts:
-        order_by = date_col or ("tanggal_upload" if "tanggal_upload" in sop_cols else "id")
-        sql = f"SELECT {', '.join(select_parts)} FROM sop ORDER BY {order_by} DESC"
+    # Tabs: Upload (staff/superuser), Approval (director/superuser), List (all)
+    tab_upload, tab_approval, tab_list = st.tabs(["🆕 Upload SOP", "✅ Approval Director", "📋 Daftar SOP"])
+
+    # --- Tab Upload SOP ---
+    with tab_upload:
+        allowed = _role in ("staff", "superuser")
+        st.subheader("Upload SOP Baru")
+        if not allowed:
+            st.info("Hanya Staff atau Superuser yang dapat mengunggah SOP.")
+        else:
+            with st.form("sop_upload_form"):
+                judul = st.text_input("Judul SOP")
+                file = st.file_uploader("File SOP (PDF/DOCX)", type=["pdf", "doc", "docx"])
+                submitted = st.form_submit_button("Upload")
+                if submitted:
+                    if not (judul and file):
+                        st.error("Lengkapi judul dan file.")
+                    else:
+                        blob, fname, _ = upload_file_and_store(file)
+                        if not blob:
+                            st.error("Gagal membaca file.")
+                        else:
+                            try:
+                                sid = gen_id("sop")
+                                now = now_wib_iso()
+                                cur.execute(
+                                    "INSERT INTO sop (id, judul, file_blob, file_name, tanggal_upload, director_approved) VALUES (?,?,?,?,?,0)",
+                                    (sid, judul.strip(), blob, fname, now),
+                                )
+                                conn.commit()
+                                audit_log("sop", "create", target=sid, details=f"Upload SOP: {judul}")
+                                notify_review_request("sop", judul, entity_id=sid, recipients_roles=("director",))
+                                st.success("SOP berhasil diupload dan menunggu approval Director.")
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan SOP: {e}")
+
+    # --- Tab Approval Director ---
+    with tab_approval:
+        allowed = _role in ("director", "superuser")
+        st.subheader("Approval Director")
+        if not allowed:
+            st.info("Hanya Director atau Superuser yang dapat melakukan approval.")
+        else:
+            try:
+                cur.execute("PRAGMA table_info(sop)")
+                sop_cols = [row[1] for row in cur.fetchall()]
+            except Exception:
+                sop_cols = []
+            # pending list
+            try:
+                cur.execute("SELECT id, judul, file_name, tanggal_upload FROM sop WHERE director_approved=0 ORDER BY COALESCE(tanggal_upload, id) DESC")
+                pending = cur.fetchall()
+            except Exception:
+                pending = []
+            if not pending:
+                st.success("Tidak ada SOP menunggu approval.")
+            else:
+                for row in pending:
+                    with st.expander(f"{row['judul']} • {row['file_name']} • {format_datetime_wib(row['tanggal_upload'] or '')}"):
+                        # show download if available
+                        try:
+                            cur.execute("SELECT file_blob FROM sop WHERE id=?", (row["id"],))
+                            blob_row = cur.fetchone()
+                            if blob_row and blob_row[0]:
+                                show_file_download(blob_row[0], row["file_name"]) 
+                        except Exception:
+                            pass
+                        note = st.text_area("Catatan Director (opsional)", key=f"sop_note_{row['id']}")
+                        c1, c2 = st.columns(2)
+                        if c1.button("✅ Approve", key=f"sop_app_{row['id']}"):
+                            try:
+                                cur.execute("UPDATE sop SET director_approved=1, director_note=? WHERE id=?", (note or "", row["id"]))
+                                conn.commit()
+                                audit_log("sop", "approve", target=row["id"], details="Director approved")
+                                notify_decision("sop", row["judul"], decision="approved", entity_id=row["id"], decision_note=note, acted_by_role="director")
+                                st.success("Disetujui.")
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+                        if c2.button("❌ Tolak", key=f"sop_rej_{row['id']}"):
+                            try:
+                                cur.execute("UPDATE sop SET director_approved=0, director_note=? WHERE id=?", (note or "Ditolak", row["id"]))
+                                conn.commit()
+                                audit_log("sop", "reject", target=row["id"], details="Director rejected")
+                                notify_decision("sop", row["judul"], decision="rejected", entity_id=row["id"], decision_note=note, acted_by_role="director")
+                                st.warning("Ditolak.")
+                            except Exception as e:
+                                st.error(f"Gagal menyimpan: {e}")
+
+    # --- Tab Daftar SOP ---
+    with tab_list:
+        st.subheader("Daftar SOP")
+        # Introspeksi kolom agar query kompatibel
         try:
-            df = pd.read_sql_query(sql, conn)
+            cur.execute("PRAGMA table_info(sop)")
+            sop_cols = [row[1] for row in cur.fetchall()]
         except Exception:
-            df = pd.DataFrame()
-    else:
-        df = pd.DataFrame()
+            sop_cols = []
 
-    if df.empty:
-        st.info("Belum ada data SOP.")
-    else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
+        select_parts = []
+        for c in ("id", "judul", "file_name"):
+            if c in sop_cols:
+                select_parts.append(c)
+        if date_col:
+            select_parts.append(f"{date_col} AS tanggal")
+        if "director_approved" in sop_cols:
+            select_parts.append("director_approved")
+
+        if select_parts:
+            order_by = date_col or ("tanggal_upload" if "tanggal_upload" in sop_cols else "id")
+            sql = f"SELECT {', '.join(select_parts)} FROM sop ORDER BY {order_by} DESC"
+            try:
+                df = pd.read_sql_query(sql, conn)
+            except Exception:
+                df = pd.DataFrame()
+        else:
+            df = pd.DataFrame()
+
+        if df.empty:
+            st.info("Belum ada data SOP.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
 def notulen_module():
     user = require_login()
