@@ -2309,8 +2309,10 @@ def inventory_module():
 def surat_masuk_module():
     st.header("📥 Surat Masuk")
     user = get_current_user()
-    allowed_roles = ["staff", "finance", "director", "superuser"]
-    if not user or user["role"] not in allowed_roles:
+    # Normalize role to avoid casing/whitespace mismatches
+    _role = ((user or {}).get("role") or "").strip().lower()
+    allowed_roles = {"staff", "finance", "director", "superuser"}
+    if not user or _role not in allowed_roles:
         st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
         return
 
