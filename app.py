@@ -2529,7 +2529,7 @@ def surat_keluar_module():
 
     # --- Tab 1: Input Draft oleh Staff ---
     with tab1:
-        st.markdown("### Input Draft Surat Keluar (Staff)")
+        st.markdown("### Input Draft Surat Keluar ")
         draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True, key="draft_type_sk")
         with st.form("sk_add", clear_on_submit=True):
             col1, col2 = st.columns(2)
@@ -2685,7 +2685,7 @@ def mou_module():
 
     # --- Tab 1: Input Draft MoU ---
     with tab1:
-        st.markdown("### Input Draft MoU (Staff)")
+        st.markdown("### Input Draft MoU ")
         jenis_options = [
             "Programmatic MoU",
             "Funding MoU / Grant Agreement",
@@ -2858,7 +2858,7 @@ def cash_advance_module():
     conn = get_db()
     cur = conn.cursor()
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📝 Input Staff",
+        "📝 Input",
         "💰 Review Finance",
         "✅ Approval Director",
         "📋 Daftar & Rekap"
@@ -2866,7 +2866,7 @@ def cash_advance_module():
 
     # --- Tab 1: Input Staf ---
     with tab1:
-        st.markdown("### Pengajuan Cash Advance (Staff)")
+        st.markdown("### Pengajuan Cash Advance ")
         # --- Dynamic items with default 3 rows and 'Tambah Item' button ---
         # Use stable row IDs so deleting doesn't shift existing inputs unexpectedly
         if 'ca_items_count' not in st.session_state:
@@ -3128,15 +3128,17 @@ def pmr_module():
     st.header("📑 PMR")
     conn = get_db()
     cur = conn.cursor()
+    # Normalize role once to avoid casing/whitespace mismatches
+    _role = (user.get("role") or "").strip().lower()
     tab_upload, tab_finance, tab_director, tab_rekap = st.tabs([
-        "📝 Upload Laporan Bulanan (Staff)",
+        "📝 Upload Laporan Bulanan ",
         "💰 Review & Approval Finance",
         "✅ Approval Director PMR",
         "📋 Daftar & Rekap PMR"
     ])
 
     with tab_upload:
-        st.markdown("### Upload Laporan Bulanan (Staff)")
+        st.markdown("### Upload Laporan Bulanan ")
         with st.form("pmr_add", clear_on_submit=True):
             nama = st.text_input("Nama Pegawai")
             bulan = st.selectbox("Bulan (YYYY-MM)", options=[f"{y}-{m:02d}" for y in range(date.today().year-1, date.today().year+2) for m in range(1,13)])
@@ -3180,7 +3182,7 @@ def pmr_module():
     with tab_finance:
         st.markdown("### Review & Approval Finance")
         st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Superuser yang dapat mengakses.")
-        if user["role"] in ["finance", "superuser"]:
+        if _role in ["finance", "superuser"]:
             df_fin = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, finance_note, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
             for idx, row in df_fin.iterrows():
                 with st.expander(f"{row['nama']} | {row['bulan']}"):
@@ -3218,7 +3220,7 @@ def pmr_module():
     with tab_director:
         st.markdown("### Approval Director PMR")
         st.caption("Director melakukan approval akhir dan memberi catatan. Hanya Director/Superuser yang dapat mengakses.")
-        if user["role"] in ["director", "superuser"]:
+        if _role in ["director", "superuser"]:
             df_dir = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, director_note, director_approved, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
             for idx, row in df_dir.iterrows():
                 with st.expander(f"{row['nama']} | {row['bulan']}"):
@@ -3242,7 +3244,7 @@ def pmr_module():
             st.info("Hanya Director yang dapat approve di sini.")
 
     with tab_rekap:
-        if user["role"] in ["finance", "director", "superuser"]:
+        if _role in ["finance", "director", "superuser"]:
             st.markdown("### Daftar & Rekap PMR")
             df = pd.read_sql_query("SELECT id, nama, bulan, tanggal_submit, finance_approved, director_approved, file1_name, file2_name FROM pmr ORDER BY tanggal_submit DESC", conn)
             bulan_list = sorted(df['bulan'].unique(), reverse=True) if not df.empty else []
@@ -3722,7 +3724,7 @@ def flex_module():
         st.error(f"Struktur tabel flex belum sesuai. Kolom berikut belum ada: {', '.join(missing)}.\n\nSilakan backup data, drop tabel flex, lalu jalankan ulang aplikasi agar tabel otomatis dibuat ulang.")
         return
     tabs = st.tabs([
-        "📝 Input Staff",
+        "📝 Input",
         "💰 Review Finance",
         "✅ Approval Director",
         "📋 Daftar Flex"
