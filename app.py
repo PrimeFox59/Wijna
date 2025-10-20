@@ -1965,6 +1965,8 @@ def dunyim_security_module():
 def inventory_module():
     # Prepare monthly rekap at the top
     user = require_login()
+    # Normalize role once to avoid casing/whitespace mismatches
+    _role = (user.get("role") or "").strip().lower()
     conn = get_db()
     cur = conn.cursor()
     this_month = date.today().strftime("%Y-%m")
@@ -2005,7 +2007,7 @@ def inventory_module():
 
     # Tab 1: Tambah Barang (aksi hanya untuk Staff/Superuser)
     def staff_tab():
-        allowed = user["role"] in ["staff", "superuser"]
+        allowed = _role in ["staff", "superuser"]
         if not allowed:
             st.info("Hanya Staff atau Superuser yang dapat menambah barang. Tab ini ditampilkan untuk transparansi alur kerja.")
             return
@@ -2046,7 +2048,7 @@ def inventory_module():
 
     # Tab 2: Review Finance (aksi hanya untuk Finance/Superuser; lainnya read-only)
     def finance_tab():
-        allowed = user["role"] in ["finance", "superuser"]
+        allowed = _role in ["finance", "superuser"]
         if not allowed:
             st.info("Hanya Finance atau Superuser yang dapat melakukan review. Anda dapat melihat daftar yang menunggu review.")
         cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
@@ -2139,7 +2141,7 @@ def inventory_module():
 
     # Tab 3: Approval Director (aksi hanya untuk Director/Superuser; lainnya read-only)
     def director_tab():
-        allowed = user["role"] in ["director", "superuser"]
+        allowed = _role in ["director", "superuser"]
         if not allowed:
             st.info("Hanya Director atau Superuser yang dapat memberikan persetujuan. Anda dapat melihat daftar yang menunggu persetujuan.")
         cur.execute("SELECT * FROM inventory WHERE finance_approved=1 AND director_approved=0")
