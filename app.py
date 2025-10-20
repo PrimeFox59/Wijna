@@ -4246,11 +4246,35 @@ def sop_module():
     user = require_login()
     st.header("📚 Kebijakan & SOP")
     conn = get_db()
+    cur = conn.cursor()
+    # Introspeksi kolom agar query kompatibel dengan skema yang berbeda (tanggal_terbit opsional)
     try:
-        # Show simple list of SOPs; minimize features to restore functionality
-        df = pd.read_sql_query("SELECT id, judul, file_name, COALESCE(tanggal_terbit, tanggal_upload) AS tanggal, director_approved FROM sop ORDER BY tanggal DESC", conn)
+        cur.execute("PRAGMA table_info(sop)")
+        sop_cols = [row[1] for row in cur.fetchall()]
     except Exception:
+        sop_cols = []
+
+    # Tentukan kolom tanggal yang tersedia
+    date_col = "tanggal_terbit" if "tanggal_terbit" in sop_cols else ("tanggal_upload" if "tanggal_upload" in sop_cols else None)
+    select_parts = []
+    for c in ("id", "judul", "file_name"):
+        if c in sop_cols:
+            select_parts.append(c)
+    if date_col:
+        select_parts.append(f"{date_col} AS tanggal")
+    if "director_approved" in sop_cols:
+        select_parts.append("director_approved")
+
+    if select_parts:
+        order_by = date_col or ("tanggal_upload" if "tanggal_upload" in sop_cols else "id")
+        sql = f"SELECT {', '.join(select_parts)} FROM sop ORDER BY {order_by} DESC"
+        try:
+            df = pd.read_sql_query(sql, conn)
+        except Exception:
+            df = pd.DataFrame()
+    else:
         df = pd.DataFrame()
+
     if df.empty:
         st.info("Belum ada data SOP.")
     else:
@@ -4270,7 +4294,7 @@ def notulen_module():
 
     # --- Tab 1: Upload ---
     with tab_upload:
-        st.subheader("🆕 Upload Notulen (staff upload, Director approve final)")
+        st.subheader("🆕 Upload Notulen")
         with st.form("not_add", clear_on_submit=True):
             judul = st.text_input("Judul Rapat")
             if nt_date_col == "tanggal_rapat":
