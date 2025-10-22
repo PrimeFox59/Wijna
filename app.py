@@ -2270,7 +2270,11 @@ def inventory_module():
                         try:
                             requester_email = None
                             # PIC may store requester id or name; try resolve
-                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            if isinstance(r, sqlite3.Row):
+                                try:
+                                    requester_email = _resolve_user_email_by_id_or_name(r['pic'] if 'pic' in r.keys() else None)
+                                except Exception:
+                                    requester_email = None
                             notify_decision(
                                 "inventory",
                                 title=r['name'],
@@ -2305,7 +2309,12 @@ def inventory_module():
                 with col3:
                     if allowed and st.button("Kirim Ulang Notifikasi", key=f"resend_dir_{w['id']}"):
                         try:
-                            requester_email = _resolve_user_email_by_id_or_name(w.get('pic')) if isinstance(w, sqlite3.Row) else None
+                            requester_email = None
+                            if isinstance(w, sqlite3.Row):
+                                try:
+                                    requester_email = _resolve_user_email_by_id_or_name(w['pic'] if 'pic' in w.keys() else None)
+                                except Exception:
+                                    requester_email = None
                             notify_decision(
                                 "inventory",
                                 title=w['name'],
@@ -2347,7 +2356,11 @@ def inventory_module():
                 except Exception:
                     drive_url = None
                 if drive_url:
-                    show_file_download(drive_url, r.get('file_name'))
+                    try:
+                        _fname = r['file_name'] if 'file_name' in r.keys() else None
+                    except Exception:
+                        _fname = None
+                    show_file_download(drive_url, _fname)
                 elif r['file_blob'] and r['file_name']:
                     show_file_download(r['file_blob'], r['file_name'])
                 st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
@@ -2370,7 +2383,12 @@ def inventory_module():
                             pass
                         # Notify requester + Finance
                         try:
-                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            requester_email = None
+                            if isinstance(r, sqlite3.Row):
+                                try:
+                                    requester_email = _resolve_user_email_by_id_or_name(r['pic'] if 'pic' in r.keys() else None)
+                                except Exception:
+                                    requester_email = None
                             notify_decision(
                                 "inventory",
                                 title=r['name'],
@@ -2395,7 +2413,12 @@ def inventory_module():
                         except Exception:
                             pass
                         try:
-                            requester_email = _resolve_user_email_by_id_or_name(r.get('pic')) if isinstance(r, sqlite3.Row) else None
+                            requester_email = None
+                            if isinstance(r, sqlite3.Row):
+                                try:
+                                    requester_email = _resolve_user_email_by_id_or_name(r['pic'] if 'pic' in r.keys() else None)
+                                except Exception:
+                                    requester_email = None
                             notify_decision(
                                 "inventory",
                                 title=r['name'],
