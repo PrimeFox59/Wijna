@@ -4590,6 +4590,334 @@ def notulen_module():
             # CSV export removed as requested
 
 # -------------------------
+# User Guide Module
+# -------------------------
+def user_guide_module():
+    user = get_current_user()
+    # User Guide accessible for logged-in users for consistency with other modules
+    if not user:
+        st.warning("Silakan login untuk melihat panduan penggunaan.")
+        st.stop()
+
+    st.header("📘 User Guide WIJNA Manajemen System")
+    st.markdown("Versi panduan: 1.0 • Terakhir diperbarui: " + now_wib().strftime("%d-%m-%Y %H:%M WIB"))
+
+    # Ringkasan peran
+    with st.expander("🔑 Ringkasan Role & Akses", expanded=True):
+        st.markdown(
+            """
+            - staff: Input data awal (draft), upload berkas, melihat daftar dan status.
+            - board: Review opsional pada modul tertentu (MoU, Notulen) sebelum Director.
+            - finance: Review & verifikasi keuangan (Inventory, Cash Advance, PMR, Flex, dll.).
+            - director: Keputusan akhir (approve/reject) untuk modul yang memerlukan persetujuan.
+            - superuser: Akses penuh (semua modul & pengaturan).
+            """
+        )
+
+    # Daftar isi cepat
+    st.markdown("### 📑 Daftar Isi")
+    toc_cols = st.columns(2)
+    with toc_cols[0]:
+        st.markdown(
+            """
+            - [Dashboard](#dashboard)
+            - [Inventory](#inventory)
+            - [Surat Masuk](#surat-masuk)
+            - [Surat Keluar](#surat-keluar)
+            - [MoU](#mou)
+            - [Cash Advance](#cash-advance)
+            - [PMR](#pmr)
+            - [Cuti](#cuti)
+            """
+        )
+    with toc_cols[1]:
+        st.markdown(
+            """
+            - [Flex Time](#flex-time)
+            - [Delegasi](#delegasi)
+            - [Mobil Kantor](#mobil-kantor)
+            - [Kalender Bersama](#kalender-bersama)
+            - [SOP](#sop)
+            - [Notulen](#notulen)
+            - [User Setting](#user-setting)
+            - [Audit Trail](#audit-trail)
+            - [Dunyim Security](#dunyim-security)
+            """
+        )
+
+    # Helper untuk membuat seksi panduan
+    def section(title: str, anchor: str, who: str, langkah: list, tips: list):
+        st.markdown(f"## <a name='{anchor}'></a>{title}", unsafe_allow_html=True)
+        st.markdown(f"**Pengguna utama:** {who}")
+        with st.expander("Langkah penggunaan", expanded=False):
+            for i, step in enumerate(langkah, 1):
+                st.markdown(f"{i}. {step}")
+        if tips:
+            with st.expander("Tips & catatan", expanded=False):
+                for t in tips:
+                    st.markdown(f"- {t}")
+
+    # Konten per modul
+    section(
+        title="🏠 Dashboard",
+        anchor="dashboard",
+        who="Semua user",
+        langkah=[
+            "Pantau ringkasan approval pending, surat belum dibahas, MoU mendekati jatuh tempo, dan delegasi aktif.",
+            "Gunakan seksi Approval cepat untuk tindakan cepat sesuai role.",
+            "Lihat kalender 30 hari ke depan dan rekap historis untuk pengambilan keputusan.",
+        ],
+        tips=[
+            "Angka pending dihitung lintas modul: Inventory, Cash Advance, PMR, Cuti, Flex, SOP, Notulen, Surat.",
+            "Waktu berbasis WIB (UTC+7) untuk konsistensi laporan.",
+        ],
+    )
+
+    section(
+        title="📦 Inventory",
+        anchor="inventory",
+        who="staff (input), finance (review), director (approve)",
+        langkah=[
+            "Tab Tambah Barang: isi nama, lokasi, status, PIC; unggah file jika perlu; klik Simpan.",
+            "Tab Review Finance: periksa data, tambahkan catatan finance, setujui atau tolak.",
+            "Tab Approval Director: director memberi catatan dan keputusan akhir.",
+            "Tab Daftar Inventaris: filter dan unduh daftar untuk dokumentasi.",
+        ],
+        tips=[
+            "Status dan PIC penting untuk penelusuran barang.",
+            "Notifikasi email (jika diaktifkan) dikirim saat review/approval.",
+        ],
+    )
+
+    section(
+        title="📥 Surat Masuk",
+        anchor="surat-masuk",
+        who="staff (input), director (bahas/approve)",
+        langkah=[
+            "Input draft surat masuk: lengkap data (nomor, pengirim, perihal, tanggal), unggah berkas.",
+            "Direktur melakukan pembahasan/keputusan di tab Approval.",
+            "Gunakan tab Rekap untuk melihat status dan filter per bulan.",
+        ],
+        tips=[
+            "Status awal: Belum Dibahas. Ubah status saat proses berjalan.",
+            "Simpan alasan/notes agar jejak keputusan terdokumentasi.",
+        ],
+    )
+
+    section(
+        title="📤 Surat Keluar",
+        anchor="surat-keluar",
+        who="staff (draft), director (approve final)",
+        langkah=[
+            "Input draft surat keluar, unggah lampiran/draft.",
+            "Director memberi catatan dan persetujuan; unggah versi final bila disetujui.",
+            "Rekap & filter untuk pelacakan per bulan/per status.",
+        ],
+        tips=[
+            "Gunakan field 'draft_url' bila draf berupa tautan (opsional).",
+            "Catatan director akan ikut terkirim pada notifikasi jika diaktifkan.",
+        ],
+    )
+
+    section(
+        title="🤝 MoU",
+        anchor="mou",
+        who="staff (draft), board (review opsional), director (approve)",
+        langkah=[
+            "Input draft MoU beserta berkasnya.",
+            "(Opsional) Board mereview dan memberi catatan.",
+            "Director melakukan keputusan akhir dan unggah final bila ada.",
+            "Gunakan tab daftar & rekap untuk memonitor jatuh tempo (tgl_selesai).",
+        ],
+        tips=[
+            "Perhatikan masa berlaku MoU; dashboard menyorot yang ≤ 7 hari.",
+            "Board review tidak wajib namun disarankan untuk kualitas.",
+        ],
+    )
+
+    section(
+        title="💸 Cash Advance",
+        anchor="cash-advance",
+        who="staff (input), finance (review), director (approve)",
+        langkah=[
+            "Staf input item dan nominal; sistem akan rekap total otomatis.",
+            "Finance melakukan verifikasi; beri catatan; setujui/tolak.",
+            "Director mengambil keputusan akhir. Rekap bulanan terupdate otomatis.",
+        ],
+        tips=[
+            "Gunakan filter bulan di tab Rekap untuk laporan keuangan.",
+            "Notifikasi ke finance/director tersedia bila toggle diaktifkan.",
+        ],
+    )
+
+    section(
+        title="📑 PMR",
+        anchor="pmr",
+        who="staff (upload), finance (review), director (approve)",
+        langkah=[
+            "Upload laporan bulanan (hingga 2 file).",
+            "Finance review; beri catatan; setujui/tolak.",
+            "Director memberi keputusan akhir.",
+            "Gunakan Rekap untuk memantau kepatuhan bulanan (deadline umum s.d. tgl 5).",
+        ],
+        tips=[
+            "Otomasi email dapat mengingatkan staf yang belum upload PMR bulan berjalan.",
+        ],
+    )
+
+    section(
+        title="🌴 Cuti",
+        anchor="cuti",
+        who="staff (ajukan), finance (review kuota), director (approve)",
+        langkah=[
+            "Staf ajukan cuti dengan tanggal mulai/selesai; durasi dihitung otomatis (minus libur nasional).",
+            "Finance cek kuota & kebijakan; beri catatan; setujui/tolak.",
+            "Director ambil keputusan akhir. Rekap menampilkan statistik tahunan/bulanan.",
+        ],
+        tips=[
+            "Hari libur diambil dari modul Kalender Bersama (is_holiday=1).",
+            "Gunakan fitur rekap untuk audit kuota tahunan per karyawan.",
+        ],
+    )
+
+    section(
+        title="⏰ Flex Time",
+        anchor="flex-time",
+        who="staff (ajukan), finance (review), director (approve)",
+        langkah=[
+            "Staf ajukan flex dengan jam mulai/selesai dan alasan.",
+            "Finance review kebijakan & beban kerja; beri catatan; setujui/tolak.",
+            "Director memberi keputusan akhir.",
+        ],
+        tips=[
+            "Pastikan kolom wajib diisi (alasan, jam) agar pengajuan tidak ditolak.",
+        ],
+    )
+
+    section(
+        title="📝 Delegasi",
+        anchor="delegasi",
+        who="director/staff (buat tugas), PIC (update), director (monitor)",
+        langkah=[
+            "Buat tugas dengan PIC, rentang tanggal, dan deskripsi.",
+            "PIC update progres, unggah bukti, dan ubah status hingga selesai.",
+            "Director memonitor tugas aktif, overdue, dan statistik di rekap.",
+        ],
+        tips=[
+            "Simpan bukti pekerjaan untuk audit dan evaluasi.",
+        ],
+    )
+
+    section(
+        title="🚗 Mobil Kantor",
+        anchor="mobil-kantor",
+        who="finance (input), semua user (lihat daftar)",
+        langkah=[
+            "Finance membuat jadwal booking (tanggal, kendaraan, driver, tujuan).",
+            "Gunakan tab Daftar & Rekap untuk melihat bentrok dan pemakaian bulanan.",
+        ],
+        tips=[
+            "Cek bentrok pemakaian sebelum finalisasi booking.",
+        ],
+    )
+
+    section(
+        title="📅 Kalender Bersama",
+        anchor="kalender-bersama",
+        who="director/superuser (libur nasional), semua (lihat)",
+        langkah=[
+            "Tambahkan/ubah rentang libur nasional (is_holiday=1).",
+            "Kalender menampilkan gabungan event (surat, delegasi, libur).",
+            "Rekap membantu melihat total hari libur dan event penting.",
+        ],
+        tips=[
+            "Modul lain (mis. Cuti) menggunakan data ini untuk perhitungan durasi.",
+        ],
+    )
+
+    section(
+        title="📚 SOP",
+        anchor="sop",
+        who="staff (upload), director (approve)",
+        langkah=[
+            "Upload dokumen SOP versi terbaru di tab Upload.",
+            "Director review & approve; versi lama dapat ditandai di file log bila dihapus.",
+            "Daftar SOP memudahkan unduh dan distribusi ke karyawan.",
+        ],
+        tips=[
+            "Gunakan catatan director untuk konteks perubahan SOP.",
+        ],
+    )
+
+    section(
+        title="🗒️ Notulen",
+        anchor="notulen",
+        who="staff (upload), board (review opsional), director (approve)",
+        langkah=[
+            "Upload notulen rapat rutin; isi judul dan tanggal rapat.",
+            "(Opsional) Board review dan memberi catatan.",
+            "Director approve dan melengkapi catatan keputusan bila perlu.",
+            "Gunakan rekap bulanan untuk monitoring keterlambatan di periode tertentu.",
+        ],
+        tips=[
+            "Pastikan tanggal rapat diisi agar rekap akurat.",
+        ],
+    )
+
+    section(
+        title="⚙️ User Setting",
+        anchor="user-setting",
+        who="semua (profil), director/superuser (admin)",
+        langkah=[
+            "Tab Profil Saya: ubah nama, password; lihat role & status akun.",
+            "Tab Admin (Director): kelola user (aktif/nonaktif, ganti role).",
+            "Tab User Baru: setujui pengguna baru yang menunggu approval.",
+            "Tab Semua User: pantau daftar dan status pengguna.",
+        ],
+        tips=[
+            "Gunakan role 'board' untuk reviewer non-final pada modul tertentu.",
+        ],
+    )
+
+    section(
+        title="🕵️ Audit Trail",
+        anchor="audit-trail",
+        who="director/superuser",
+        langkah=[
+            "Gunakan filter tanggal dan pencarian untuk menelusuri aktivitas.",
+            "Klik kolom untuk menyortir dan temukan aktivitas spesifik lebih cepat.",
+        ],
+        tips=[
+            "Audit juga mencatat login/logout dan operasi file (hapus/unggah).",
+        ],
+    )
+
+    section(
+        title="🛡️ Dunyim Security",
+        anchor="dunyim-security",
+        who="superuser",
+        langkah=[
+            "Atur folder Google Drive, kapasitas proyek, dan jadwal backup.",
+            "Upload/Download/Delete file di Drive langsung dari aplikasi.",
+            "Sync DB: jalankan backup terjadwal atau restore bila diperlukan.",
+            "Lihat Audit Log internal dan catat record notes.",
+        ],
+        tips=[
+            "Pastikan kredensial service account valid dan folder_id benar.",
+            "Gunakan fitur auto-restore saat install baru (seed DB) untuk pemulihan cepat.",
+        ],
+    )
+
+    # Unduh panduan (Markdown)
+    guide_md = """
+    # User Guide WIJNA Manajemen System
+    Dokumen ini merangkum cara penggunaan setiap modul beserta peran yang terlibat.
+
+    (Lihat aplikasi untuk versi interaktif dengan ekspander per modul.)
+    """.strip()
+    st.download_button("⬇️ Download Panduan (Markdown)", data=guide_md.encode("utf-8"), file_name="user-guide-wijna.md", mime="text/markdown")
+
+# -------------------------
 # User Setting Module
 # -------------------------
 def user_setting_module():
@@ -5520,6 +5848,7 @@ def main():
         ("Notulen", "🗒️ Notulen"),
         ("User Setting", "⚙️ User Setting"),
         ("Audit Trail", "🕵️ Audit Trail"),
+        ("User Guide", "📘 User Guide"),
         ("Dunyim Security", "🛡️ Dunyim Security")
     ]
     if "page" not in st.session_state:
@@ -5597,6 +5926,8 @@ def main():
         user_setting_module()
     elif choice == "Audit Trail":
         audit_trail_module()
+    elif choice == "User Guide":
+        user_guide_module()
     elif choice == "Dunyim Security":
         # Check scheduled backup once on module enter (non-blocking)
         try:
