@@ -257,6 +257,16 @@ def ensure_db():
                 cur.execute("ALTER TABLE sop ADD COLUMN board_note TEXT")
         except Exception:
             pass
+        # Migration: add Drive columns to SOP
+        try:
+            cur.execute("PRAGMA table_info(sop)")
+            sop_cols_existing = {row[1] for row in cur.fetchall()}
+            if "file_drive_id" not in sop_cols_existing:
+                cur.execute("ALTER TABLE sop ADD COLUMN file_drive_id TEXT")
+            if "file_url" not in sop_cols_existing:
+                cur.execute("ALTER TABLE sop ADD COLUMN file_url TEXT")
+        except Exception:
+            pass
         # Ensure SOP has director_note column for Director approval notes
         try:
             cur.execute("PRAGMA table_info(sop)")
@@ -286,6 +296,16 @@ def ensure_db():
             nt_cols_existing = {row[1] for row in cur.fetchall()}
             if "board_note" not in nt_cols_existing:
                 cur.execute("ALTER TABLE notulen ADD COLUMN board_note TEXT")
+        except Exception:
+            pass
+        # Migration: add Drive columns to Notulen
+        try:
+            cur.execute("PRAGMA table_info(notulen)")
+            nt_cols_existing = {row[1] for row in cur.fetchall()}
+            if "file_drive_id" not in nt_cols_existing:
+                cur.execute("ALTER TABLE notulen ADD COLUMN file_drive_id TEXT")
+            if "file_url" not in nt_cols_existing:
+                cur.execute("ALTER TABLE notulen ADD COLUMN file_url TEXT")
         except Exception:
             pass
         # File Log for audit
@@ -319,6 +339,16 @@ def ensure_db():
             director_approved INTEGER DEFAULT 0
         )
         """)
+        # Migration: add Drive columns to surat_masuk
+        try:
+            cur.execute("PRAGMA table_info(surat_masuk)")
+            sm_cols = {row[1] for row in cur.fetchall()}
+            if "file_drive_id" not in sm_cols:
+                cur.execute("ALTER TABLE surat_masuk ADD COLUMN file_drive_id TEXT")
+            if "file_url" not in sm_cols:
+                cur.execute("ALTER TABLE surat_masuk ADD COLUMN file_url TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS surat_keluar (
             id TEXT PRIMARY KEY,
@@ -348,6 +378,22 @@ def ensure_db():
                 cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_url TEXT")
         except Exception:
             pass
+        # Migration: add Drive columns to surat_keluar (draft/final/lampiran)
+        try:
+            cur.execute("PRAGMA table_info(surat_keluar)")
+            sk_cols = {row[1] for row in cur.fetchall()}
+            if "draft_drive_id" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN draft_drive_id TEXT")
+            if "final_url" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_url TEXT")
+            if "final_drive_id" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN final_drive_id TEXT")
+            if "lampiran_url" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN lampiran_url TEXT")
+            if "lampiran_drive_id" not in sk_cols:
+                cur.execute("ALTER TABLE surat_keluar ADD COLUMN lampiran_drive_id TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS mou (
             id TEXT PRIMARY KEY,
@@ -368,6 +414,20 @@ def ensure_db():
             final_name TEXT
         )
         """)
+        # Migration: add Drive columns to MoU (initial/final)
+        try:
+            cur.execute("PRAGMA table_info(mou)")
+            mou_cols = {row[1] for row in cur.fetchall()}
+            if "file_drive_id" not in mou_cols:
+                cur.execute("ALTER TABLE mou ADD COLUMN file_drive_id TEXT")
+            if "file_url" not in mou_cols:
+                cur.execute("ALTER TABLE mou ADD COLUMN file_url TEXT")
+            if "final_drive_id" not in mou_cols:
+                cur.execute("ALTER TABLE mou ADD COLUMN final_drive_id TEXT")
+            if "final_url" not in mou_cols:
+                cur.execute("ALTER TABLE mou ADD COLUMN final_url TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS cash_advance (
             id TEXT PRIMARY KEY,
@@ -410,6 +470,20 @@ def ensure_db():
             tanggal_submit TEXT
         )
         """)
+        # Migration: add Drive columns to PMR (file1/file2)
+        try:
+            cur.execute("PRAGMA table_info(pmr)")
+            pmr_cols = {row[1] for row in cur.fetchall()}
+            if "file1_drive_id" not in pmr_cols:
+                cur.execute("ALTER TABLE pmr ADD COLUMN file1_drive_id TEXT")
+            if "file1_url" not in pmr_cols:
+                cur.execute("ALTER TABLE pmr ADD COLUMN file1_url TEXT")
+            if "file2_drive_id" not in pmr_cols:
+                cur.execute("ALTER TABLE pmr ADD COLUMN file2_drive_id TEXT")
+            if "file2_url" not in pmr_cols:
+                cur.execute("ALTER TABLE pmr ADD COLUMN file2_url TEXT")
+        except Exception:
+            pass
         # Cuti table (fix malformed DDL and ensure required columns exist)
         cur.execute(
             """
@@ -479,6 +553,16 @@ def ensure_db():
                 cur.execute("ALTER TABLE delegasi ADD COLUMN reviewed_by TEXT")
         except Exception:
             pass
+        # Migration: add Drive columns to Delegasi
+        try:
+            cur.execute("PRAGMA table_info(delegasi)")
+            del_cols = {row[1] for row in cur.fetchall()}
+            if "file_drive_id" not in del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN file_drive_id TEXT")
+            if "file_url" not in del_cols:
+                cur.execute("ALTER TABLE delegasi ADD COLUMN file_url TEXT")
+        except Exception:
+            pass
         cur.execute("""
         CREATE TABLE IF NOT EXISTS mobil (
             id TEXT PRIMARY KEY,
@@ -510,6 +594,16 @@ def ensure_db():
             file_name TEXT
         )
         """)
+        # Migration: add Drive columns to Inventory
+        try:
+            cur.execute("PRAGMA table_info(inventory)")
+            inv_cols = {row[1] for row in cur.fetchall()}
+            if "drive_file_id" not in inv_cols:
+                cur.execute("ALTER TABLE inventory ADD COLUMN drive_file_id TEXT")
+            if "drive_file_url" not in inv_cols:
+                cur.execute("ALTER TABLE inventory ADD COLUMN drive_file_url TEXT")
+        except Exception:
+            pass
         # Optional requester column for inventory (when loan requests reuse pic field already, so this is optional)
         try:
             cur.execute("ALTER TABLE inventory ADD COLUMN requested_by TEXT")
@@ -675,29 +769,22 @@ def audit_log(modul: str, action: str, target=None, details=None, actor=None):
         if not actor:
             u = st.session_state.get("user")
             actor = (u.get("email") or u.get("full_name")) if u else "-"
-        # Compose detail text
-        parts = []
-        if modul:
-            parts.append(f"[{modul}]")
-        if target:
-            parts.append(str(target))
-        if details:
-            parts.append(str(details))
-        detail_text = " ".join([p for p in parts if p]).strip() or "-"
-        # Insert into simplified audit table
+        # Compose details payload
+        prefix = f"[{modul}] " if modul else ""
+        target_txt = f" target={target}" if target is not None else ""
+        details_txt = details or ""
+        payload = f"{prefix}{action or '-'}{target_txt} {details_txt}".strip()
+        # Insert
         cur.execute(
-            """
-            INSERT INTO audit_logs (user_email, action, details, timestamp)
-            VALUES (?, ?, ?, ?)
-            """,
-            (actor or "-", action or "-", detail_text, now),
+            "INSERT INTO audit_logs (user_email, action, details, timestamp) VALUES (?,?,?,?)",
+            (actor, action or "-", payload, now)
         )
         conn.commit()
     except Exception:
         pass
     finally:
         try:
-            del st.session_state["__audit_disabled"]
+            st.session_state.pop("__audit_disabled", None)
         except Exception:
             pass
 
@@ -936,30 +1023,64 @@ def upload_file_and_store(file_uploader_obj):
     uploaded = file_uploader_obj
     if uploaded is None:
         return None, None, None
-    raw = uploaded.read()
-    blob = to_blob(raw)
+    # New behavior: upload directly to Google Drive and return URL (fallback to BLOB if Drive unavailable)
     name = uploaded.name
-    # Audit trail log upload
+    mime = getattr(uploaded, "type", None) or "application/octet-stream"
+    raw = uploaded.read()
+    if not _drive_available():
+        blob = to_blob(raw)
+        try:
+            user = get_current_user()
+            conn = get_db()
+            cur = conn.cursor()
+            log_id = gen_id("log")
+            now = now_wib_iso()
+            cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (log_id, "upload", name, 1, user["full_name"] if user else "-", now, "blob"))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return blob, name, None
     try:
-        user = get_current_user()
-        conn = get_db()
-        cur = conn.cursor()
-        log_id = gen_id("log")
-        now = now_wib_iso()
-        cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload) VALUES (?, ?, ?, ?, ?, ?)",
-            (log_id, "upload", name, 1, user["full_name"] if user else "-", now))
-        conn.commit()
-        conn.close()
+        service = _build_drive()
+        folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+        fid = _drive_upload_or_replace(service, folder_id, name, raw, mimetype=mime)
+        if fid:
+            url = f"https://drive.google.com/file/d/{fid}/view?usp=drive_link"
+            try:
+                user = get_current_user()
+                conn = get_db()
+                cur = conn.cursor()
+                log_id = gen_id("log")
+                now = now_wib_iso()
+                cur.execute("INSERT INTO file_log (id, modul, file_name, versi, uploaded_by, tanggal_upload, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (log_id, "upload", name, 1, user["full_name"] if user else "-", now, "drive"))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            return None, name, url
+        # Fallback if no fid returned
+        blob = to_blob(raw)
+        return blob, name, None
+    except Exception:
+        # Any error -> fallback to blob
+        blob = to_blob(raw)
+        return blob, name, None
+
+def show_file_download(blob_or_url, filename):
+    # If a URL is passed, render a clickable link; else use legacy BLOB download
+    try:
+        if isinstance(blob_or_url, str) and blob_or_url.startswith("http"):
+            label = f"⬇️ Download {filename}" if filename else "⬇️ Download File"
+            st.markdown(f"[{label}]({blob_or_url})")
+            return
     except Exception:
         pass
-    return blob, name, len(raw)
-
-def show_file_download(blob, filename):
-    data = from_blob(blob)
+    data = from_blob(blob_or_url)
     if data:
-        b64 = base64.b64encode(data).decode()
-        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">Download {filename}</a>'
-        st.markdown(href, unsafe_allow_html=True)
+        st.download_button(label=f"⬇️ Download {filename or 'file'}", data=data, file_name=filename or "file", mime="application/octet-stream")
 
 # -------------------------
 # Modules Implementation (concise)
@@ -1051,6 +1172,22 @@ def _bytes_fmt(n: int) -> str:
         if size < 1024 or u == units[-1]:
             return (f"{int(size)} {u}" if u == "B" else f"{size:.2f} {u}")
         size /= 1024
+
+def _drive_id_from_url(url: Optional[str]) -> Optional[str]:
+    """Extract Google Drive file ID from a typical share/view URL."""
+    if not url:
+        return None
+    try:
+        # common format: https://drive.google.com/file/d/<ID>/view?...
+        if "/file/d/" in url:
+            part = url.split("/file/d/")[-1]
+            return part.split("/")[0]
+        # ?id=<ID>
+        if "id=" in url:
+            return url.split("id=")[-1].split("&")[0]
+    except Exception:
+        return None
+    return None
 
 # --- Email helpers (Dunyim) ---
 def _email_enabled() -> bool:
@@ -2045,12 +2182,24 @@ def inventory_module():
                         full_nama += f" ({keterangan_opsi})"
                     iid = gen_id("inv")
                     now = now_wib_iso()
-                    blob, fname, _ = upload_file_and_store(f) if f else (None, None, None)
+                    blob, fname, furl = upload_file_and_store(f) if f else (None, None, None)
                     # PIC dihapus, set kosong
                     pic = ""
-                    cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (iid, full_nama, loc, status, pic, now, '', 0, '', 0, blob, fname))
+                    # Store Drive URL when available; keep legacy columns for compatibility
+                    try:
+                        drive_id = _drive_id_from_url(furl) if furl else None
+                        cur.execute("PRAGMA table_info(inventory)")
+                        inv_cols = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        inv_cols = set()
+                    if {'drive_file_url','drive_file_id'}.issubset(inv_cols):
+                        cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name,drive_file_id,drive_file_url)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (iid, full_nama, loc, status, pic, now, '', 0, '', 0, None if furl else blob, fname, drive_id, furl))
+                    else:
+                        cur.execute("""INSERT INTO inventory (id,name,location,status,pic,updated_at,finance_note,finance_approved,director_note,director_approved,file_blob,file_name)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (iid, full_nama, loc, status, pic, now, '', 0, '', 0, blob, fname))
                     conn.commit()
                     try:
                         audit_log("inventory", "create", target=iid, details=f"{full_nama} @ {loc} status={status}")
@@ -2080,11 +2229,15 @@ def inventory_module():
 <b>Penanggung Jawab:</b> {r['pic']}<br>
 <b>Terakhir Update:</b> {r['updated_at']}<br>
 """, unsafe_allow_html=True)
-                # Download file jika ada, but check for missing keys
-                file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
+                # Download file/link jika ada
                 file_name = r['file_name'] if 'file_name' in r.keys() else None
-                if file_blob and file_name:
-                    show_file_download(file_blob, file_name)
+                drive_url = r['drive_file_url'] if 'drive_file_url' in r.keys() else None
+                if drive_url:
+                    show_file_download(drive_url, file_name or 'Lampiran')
+                else:
+                    file_blob = r['file_blob'] if 'file_blob' in r.keys() else None
+                    if file_blob and file_name:
+                        show_file_download(file_blob, file_name)
                 st.markdown("**Catatan Finance:**")
                 note = st.text_area(
                     "Tulis catatan atau alasan jika perlu",
@@ -2176,8 +2329,14 @@ def inventory_module():
                     <b>Update Terakhir:</b> {updated_str}<br>
                 </div>
                 """, unsafe_allow_html=True)
-                # Download file jika ada
-                if r['file_blob'] and r['file_name']:
+                # Download file/link jika ada
+                try:
+                    drive_url = r['drive_file_url'] if 'drive_file_url' in r.keys() else None
+                except Exception:
+                    drive_url = None
+                if drive_url:
+                    show_file_download(drive_url, r.get('file_name'))
+                elif r['file_blob'] and r['file_name']:
                     show_file_download(r['file_blob'], r['file_name'])
                 st.markdown("<b>Catatan Director</b>", unsafe_allow_html=True)
                 note2 = st.text_area(
@@ -2357,24 +2516,46 @@ def surat_masuk_module():
                 else:
                     conn = get_db()
                     cur = conn.cursor()
-                    file_blob = file_upload.read()
-                    file_name = file_upload.name
+                    b, file_name, furl = upload_file_and_store(file_upload)
                     # Simpan data ke DB (indeks otomatis di rekap)
                     sid = str(uuid.uuid4())
-                    cur.execute("""
-                        INSERT INTO surat_masuk (id, nomor, tanggal, pengirim, perihal, file_blob, file_name, status, follow_up)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        sid,
-                        nomor,
-                        tanggal.isoformat(),
-                        pengirim,
-                        perihal,
-                        file_blob,
-                        file_name,
-                        status,
-                        follow_up
-                    ))
+                    try:
+                        cur.execute("PRAGMA table_info(surat_masuk)")
+                        sm_cols = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        sm_cols = set()
+                    if 'file_url' in sm_cols:
+                        cur.execute("""
+                            INSERT INTO surat_masuk (id, nomor, tanggal, pengirim, perihal, file_blob, file_name, file_drive_id, file_url, status, follow_up)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            sid,
+                            nomor,
+                            tanggal.isoformat(),
+                            pengirim,
+                            perihal,
+                            None if furl else b,
+                            file_name,
+                            _drive_id_from_url(furl) if furl else None,
+                            furl,
+                            status,
+                            follow_up
+                        ))
+                    else:
+                        cur.execute("""
+                            INSERT INTO surat_masuk (id, nomor, tanggal, pengirim, perihal, file_blob, file_name, status, follow_up)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            sid,
+                            nomor,
+                            tanggal.isoformat(),
+                            pengirim,
+                            perihal,
+                            b,
+                            file_name,
+                            status,
+                            follow_up
+                        ))
                     conn.commit()
                     try:
                         audit_log("surat_masuk", "create", target=sid, details=f"{nomor} - {perihal} ({pengirim})")
@@ -2396,19 +2577,16 @@ def surat_masuk_module():
                         st.write(f"Status: {row['status']}")
                         st.write(f"Follow Up: {row['follow_up']}")
                         if row['file_name']:
-                            if str(row['file_name']).startswith('http'):
-                                st.markdown(f"[Link Surat]({row['file_name']})")
-                            else:
-                                lihat = st.button(f"Lihat File Surat", key=f"dl_{row['id']}")
-                                if lihat:
-                                    try:
-                                        audit_log("surat_masuk", "view_file", target=row['id'], details=row['file_name'])
-                                    except Exception:
-                                        pass
-                                    cur.execute("SELECT file_blob, file_name FROM surat_masuk WHERE id= ?", (row['id'],))
-                                    f = cur.fetchone()
-                                    if f and f['file_blob']:
-                                        st.download_button("Lihat File Surat", data=f['file_blob'], file_name=f['file_name'])
+                            # Prefer Drive URL if present
+                            try:
+                                cur.execute("SELECT file_url, file_blob, file_name FROM surat_masuk WHERE id= ?", (row['id'],))
+                                f = cur.fetchone()
+                            except Exception:
+                                f = None
+                            if f and (isinstance(f, sqlite3.Row) and f.get('file_url')):
+                                show_file_download(f.get('file_url'), f.get('file_name'))
+                            elif f and f['file_blob']:
+                                show_file_download(f['file_blob'], f['file_name'])
                         colA, colB = st.columns(2)
                         with colA:
                             if st.button("Approve Surat Masuk", key=f"approve_{row['id']}"):
@@ -2572,7 +2750,7 @@ def surat_keluar_module():
                 else:
                     sid = gen_id("sk")
                     if draft_type == "Upload File":
-                        draft_blob, draft_name, _ = upload_file_and_store(draft)
+                        draft_blob, draft_name, draft_url = upload_file_and_store(draft)
                     cur.execute("""INSERT INTO surat_keluar (id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,draft_blob,draft_name,status,follow_up, draft_url)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (sid, '', nomor, tanggal.isoformat(), ditujukan, perihal, user['full_name'], draft_blob, draft_name, "Draft", follow_up, draft_url))
@@ -2613,9 +2791,19 @@ def surat_keluar_module():
                         if not final:
                             st.error("File final wajib diupload agar surat keluar tercatat resmi.")
                         else:
-                            blob, fname, _ = upload_file_and_store(final)
-                            cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
-                                        (blob, fname, note, row['id']))
+                            blob, fname, furl = upload_file_and_store(final)
+                            # Prefer Drive URL when available
+                            try:
+                                cur.execute("PRAGMA table_info(surat_keluar)")
+                                _cols = {r[1] for r in cur.fetchall()}
+                            except Exception:
+                                _cols = set()
+                            if 'final_url' in _cols:
+                                cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, final_url=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
+                                            (None if furl else blob, fname, furl, note, row['id']))
+                            else:
+                                cur.execute("UPDATE surat_keluar SET final_blob=?, final_name=?, director_note=?, director_approved=1, status='Final' WHERE id=?",
+                                            (blob, fname, note, row['id']))
                             conn.commit()
                             try:
                                 audit_log("surat_keluar", "director_approval", target=row['id'], details=f"final={fname}; note={note}")
@@ -2638,7 +2826,7 @@ def surat_keluar_module():
     # --- Tab 3: Daftar & Rekap Surat Keluar ---
     with tab3:
         st.markdown("### Daftar & Rekap Surat Keluar")
-        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, draft_name, draft_url, final_blob FROM surat_keluar ORDER BY tanggal DESC", conn)
+        df = pd.read_sql_query("SELECT id,indeks,nomor,tanggal,ditujukan,perihal,pengirim,status,follow_up, director_approved, final_name, final_url, draft_name, draft_url, final_blob FROM surat_keluar ORDER BY tanggal DESC", conn)
         # Indeks otomatis: urutan
         if not df.empty:
             df = df.copy()
@@ -2650,7 +2838,10 @@ def surat_keluar_module():
         st.markdown("#### Download File Final Surat Keluar")
         if not df.empty:
             for idx, row in df.iterrows():
-                if row['final_blob'] and row['final_name']:
+                if row.get('final_url') and row.get('final_name'):
+                    st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
+                    show_file_download(row['final_url'], row['final_name'])
+                elif row.get('final_blob') and row.get('final_name'):
                     st.write(f"{row['nomor']} | {row['perihal']} | {row['tanggal']}")
                     show_file_download(row['final_blob'], row['final_name'])
 
@@ -2732,11 +2923,22 @@ def mou_module():
                     st.error("Tanggal selesai tidak boleh sebelum tanggal mulai.")
                 else:
                     mid = gen_id("mou")
-                    blob, fname, _ = upload_file_and_store(f)
+                    blob, fname, furl = upload_file_and_store(f)
                     created_by = (user.get('id') if isinstance(user, dict) else None)
-                    cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,board_note,board_approved,final_blob,final_name,created_by)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, "", 0, None, None, created_by))
+                    # Prefer Drive URL when available
+                    try:
+                        cur.execute("PRAGMA table_info(mou)")
+                        mou_cols = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        mou_cols = set()
+                    if 'file_url' in mou_cols:
+                        cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,file_drive_id,file_url,board_note,board_approved,final_blob,final_name,created_by)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), None if furl else blob, fname, _drive_id_from_url(furl) if furl else None, furl, "", 0, None, None, created_by))
+                    else:
+                        cur.execute("""INSERT INTO mou (id,nomor,nama,pihak,jenis,tgl_mulai,tgl_selesai,file_blob,file_name,board_note,board_approved,final_blob,final_name,created_by)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (mid, nomor, nama, pihak, jenis, tgl_mulai.isoformat(), tgl_selesai.isoformat(), blob, fname, "", 0, None, None, created_by))
                     conn.commit()
                     try:
                         audit_log("mou", "create", target=mid, details=f"{nomor} - {nama} ({jenis})")
@@ -2842,17 +3044,17 @@ def mou_module():
                 pilihan = st.selectbox("Pilih MoU", [""] + list(opt_map.keys()))
                 if pilihan:
                     mid = opt_map[pilihan]
-                    row = pd.read_sql_query("SELECT file_blob, file_name FROM mou WHERE id=?", conn, params=(mid,))
-                    if not row.empty and row.iloc[0]["file_blob"] is not None and row.iloc[0]["file_name"]:
-                        data_bytes = from_blob(row.iloc[0]["file_blob"])  # decode if base64
-                        st.download_button(
-                            label=f"Download {row.iloc[0]['file_name']}",
-                            data=data_bytes,
-                            file_name=row.iloc[0]['file_name'],
-                            mime="application/octet-stream"
-                        )
-                    else:
-                        st.info("File tidak tersedia untuk MoU terpilih.")
+                    row = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM mou WHERE id=?", conn, params=(mid,))
+                    if not row.empty:
+                        fname = row.iloc[0].get("file_name")
+                        furl = row.iloc[0].get("file_url") if "file_url" in row.columns else None
+                        if furl:
+                            show_file_download(furl, fname)
+                        elif row.iloc[0].get("file_blob") is not None and fname:
+                            data_bytes = from_blob(row.iloc[0]["file_blob"])  # decode if base64
+                            st.download_button(label=f"Download {fname}", data=data_bytes, file_name=fname, mime="application/octet-stream")
+                        else:
+                            st.info("File tidak tersedia untuk MoU terpilih.")
             else:
                 st.info("Belum ada data MoU.")
 
@@ -3176,15 +3378,25 @@ def pmr_module():
                     st.error("Minimal 1 file wajib diupload.")
                 else:
                     pid = gen_id("pmr")
-                    b1, n1, _ = upload_file_and_store(f1)
+                    b1, n1, u1 = upload_file_and_store(f1)
                     if f2:
-                        b2, n2, _ = upload_file_and_store(f2)
+                        b2, n2, u2 = upload_file_and_store(f2)
                     else:
-                        b2, n2 = None, None
+                        b2, n2, u2 = None, None, None
                     now = now_wib_iso()
-                    cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file2_blob,file2_name,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (pid, nama, b1, n1, b2, n2, bulan, "", 0, "", 0, now))
+                    try:
+                        cur.execute("PRAGMA table_info(pmr)")
+                        pmr_cols = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        pmr_cols = set()
+                    if {'file1_url','file2_url'}.issubset(pmr_cols):
+                        cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file1_drive_id,file1_url,file2_blob,file2_name,file2_drive_id,file2_url,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (pid, nama, None if u1 else b1, n1, _drive_id_from_url(u1) if u1 else None, u1, None if u2 else b2, n2, _drive_id_from_url(u2) if u2 else None, u2, bulan, "", 0, "", 0, now))
+                    else:
+                        cur.execute("""INSERT INTO pmr (id,nama,file1_blob,file1_name,file2_blob,file2_name,bulan,finance_note,finance_approved,director_note,director_approved,tanggal_submit)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (pid, nama, b1, n1, b2, n2, bulan, "", 0, "", 0, now))
                     conn.commit()
                     try:
                         audit_log("pmr", "upload", target=pid, details=f"{nama} {bulan}; file1={n1}; file2={n2 or '-'}")
@@ -3584,11 +3796,21 @@ def delegasi_module():
                     if status == "Selesai" and not file_bukti:
                         st.error("Status 'Selesai' wajib upload file dokumentasi!")
                     else:
-                        blob, fname, _ = upload_file_and_store(file_bukti) if file_bukti else (None, None, None)
+                        blob, fname, furl = upload_file_and_store(file_bukti) if file_bukti else (None, None, None)
                         now = now_wib_iso()
                         if status == "Selesai":
-                            cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, tanggal_update=? WHERE id=?",
-                                (status, blob, fname, now, row["id"]))
+                            # Prefer Drive URL when available
+                            try:
+                                cur.execute("PRAGMA table_info(delegasi)")
+                                dcols = {r[1] for r in cur.fetchall()}
+                            except Exception:
+                                dcols = set()
+                            if 'file_url' in dcols:
+                                cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, file_drive_id=?, file_url=?, tanggal_update=? WHERE id=?",
+                                            (status, None if furl else blob, fname, _drive_id_from_url(furl) if furl else None, furl, now, row["id"]))
+                            else:
+                                cur.execute("UPDATE delegasi SET status=?, file_blob=?, file_name=?, tanggal_update=? WHERE id=?",
+                                            (status, blob, fname, now, row["id"]))
                         else:
                             cur.execute("UPDATE delegasi SET status=?, tanggal_update=? WHERE id=?",
                                 (status, now, row["id"]))
@@ -4286,23 +4508,29 @@ def sop_module():
                     if not (judul and file):
                         st.error("Lengkapi judul dan file.")
                     else:
-                        blob, fname, _ = upload_file_and_store(file)
-                        if not blob:
-                            st.error("Gagal membaca file.")
-                        else:
-                            try:
-                                sid = gen_id("sop")
-                                now = now_wib_iso()
+                        blob, fname, furl = upload_file_and_store(file)
+                        try:
+                            sid = gen_id("sop")
+                            now = now_wib_iso()
+                            # Prefer Drive URL when available
+                            cur.execute("PRAGMA table_info(sop)")
+                            sop_cols = {row[1] for row in cur.fetchall()}
+                            if 'file_url' in sop_cols:
+                                cur.execute(
+                                    "INSERT INTO sop (id, judul, file_blob, file_name, file_drive_id, file_url, tanggal_upload, director_approved) VALUES (?,?,?,?,?,?,?,0)",
+                                    (sid, judul.strip(), None if furl else blob, fname, _drive_id_from_url(furl) if furl else None, furl, now),
+                                )
+                            else:
                                 cur.execute(
                                     "INSERT INTO sop (id, judul, file_blob, file_name, tanggal_upload, director_approved) VALUES (?,?,?,?,?,0)",
                                     (sid, judul.strip(), blob, fname, now),
                                 )
-                                conn.commit()
-                                audit_log("sop", "create", target=sid, details=f"Upload SOP: {judul}")
-                                notify_review_request("sop", judul, entity_id=sid, recipients_roles=("director",))
-                                st.success("SOP berhasil diupload dan menunggu approval Director.")
-                            except Exception as e:
-                                st.error(f"Gagal menyimpan SOP: {e}")
+                            conn.commit()
+                            audit_log("sop", "create", target=sid, details=f"Upload SOP: {judul}")
+                            notify_review_request("sop", judul, entity_id=sid, recipients_roles=("director",))
+                            st.success("SOP berhasil diupload dan menunggu approval Director.")
+                        except Exception as e:
+                            st.error(f"Gagal menyimpan SOP: {e}")
 
     # --- Tab Approval Director ---
     with tab_approval:
@@ -4327,12 +4555,20 @@ def sop_module():
             else:
                 for row in pending:
                     with st.expander(f"{row['judul']} • {row['file_name']} • {format_datetime_wib(row['tanggal_upload'] or '')}"):
-                        # show download if available
+                        # show download/link if available
                         try:
-                            cur.execute("SELECT file_blob FROM sop WHERE id=?", (row["id"],))
-                            blob_row = cur.fetchone()
-                            if blob_row and blob_row[0]:
-                                show_file_download(blob_row[0], row["file_name"]) 
+                            cur.execute("SELECT file_blob, file_url FROM sop WHERE id=?", (row["id"],))
+                            r2 = cur.fetchone()
+                            if r2:
+                                file_url = None
+                                try:
+                                    file_url = r2["file_url"] if isinstance(r2, sqlite3.Row) else None
+                                except Exception:
+                                    file_url = None
+                                if file_url:
+                                    show_file_download(file_url, row["file_name"]) 
+                                elif r2[0]:
+                                    show_file_download(r2[0], row["file_name"]) 
                         except Exception:
                             pass
                         note = st.text_area("Catatan Director (opsional)", key=f"sop_note_{row['id']}")
@@ -4422,9 +4658,17 @@ def notulen_module():
                     st.warning("Judul dan file wajib diisi.")
                 else:
                     nid = gen_id("not")
-                    blob, fname, _ = upload_file_and_store(f)
+                    blob, fname, furl = upload_file_and_store(f)
                     cols = ["id", "judul", "file_blob", "file_name"]
-                    vals = [nid, judul, blob, fname]
+                    vals = [nid, judul, None if furl else blob, fname]
+                    # Drive columns when available
+                    try:
+                        cur.execute("PRAGMA table_info(notulen)")
+                        nt_cols_existing = {row[1] for row in cur.fetchall()}
+                    except Exception:
+                        nt_cols_existing = set()
+                    if 'file_url' in nt_cols_existing:
+                        cols.extend(["file_drive_id","file_url"]) ; vals.extend([_drive_id_from_url(furl) if furl else None, furl])
                     if nt_date_col == "tanggal_rapat":
                         cols.append("tanggal_rapat"); vals.append(tgl.isoformat())
                     elif nt_date_col == "tanggal_upload":
@@ -4508,8 +4752,10 @@ def notulen_module():
                     pilih = st.selectbox("Pilih notulen untuk diunduh", [""] + list(opsi.keys()))
                     if pilih:
                         nid = opsi[pilih]
-                        row = pd.read_sql_query("SELECT file_blob, file_name FROM notulen WHERE id=?", conn, params=(nid,)).iloc[0]
-                        if row["file_blob"] is not None and row["file_name"]:
+                        row = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=\?", conn, params=(nid,)).iloc[0]
+                        if ("file_url" in row.index) and row.get("file_url"):
+                            show_file_download(row["file_url"], row["file_name"]) 
+                        elif row["file_blob"] is not None and row["file_name"]:
                             show_file_download(row["file_blob"], row["file_name"])
 
             # Approval Director inline
@@ -4526,9 +4772,12 @@ def notulen_module():
                         title = f"{r['judul']}" + (f" | {r[nt_date_col]}" if nt_date_col and r.get(nt_date_col) else "")
                         with st.expander(title):
                             st.write(f"File: {r.get('file_name') or '-'}")
-                            rr = pd.read_sql_query("SELECT file_blob, file_name FROM notulen WHERE id=?", conn, params=(r['id'],))
-                            if not rr.empty and rr.iloc[0]["file_blob"] is not None and rr.iloc[0]["file_name"]:
-                                show_file_download(rr.iloc[0]["file_blob"], rr.iloc[0]["file_name"])
+                            rr = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=\?", conn, params=(r['id'],))
+                            if not rr.empty:
+                                if ("file_url" in rr.columns) and rr.iloc[0].get("file_url"):
+                                    show_file_download(rr.iloc[0]["file_url"], rr.iloc[0]["file_name"])
+                                elif rr.iloc[0].get("file_blob") is not None and rr.iloc[0].get("file_name"):
+                                    show_file_download(rr.iloc[0]["file_blob"], rr.iloc[0]["file_name"])
                             note = st.text_area("Catatan Director (opsional)", value=r.get("director_note") or "", key=f"nt_note_{r['id']}")
                             if st.button("Approve Notulen", key=f"nt_approve_{r['id']}"):
                                 if "director_note" in nt_cols:
