@@ -3537,7 +3537,6 @@ def pmr_module():
 def cuti_module():
     user = require_login()
     st.header("🌴 Pengajuan & Approval Cuti")
-    st.markdown("<div style='color:#2563eb;font-size:1.1rem;margin-bottom:1.2em'>Kelola pengajuan cuti, review finance, dan approval director secara terintegrasi.</div>", unsafe_allow_html=True)
     conn = get_db()
     cur = conn.cursor()
     tab1, tab2, tab3, tab4 = st.tabs(["📝 Ajukan Cuti", "💰 Review Finance", "✅ Approval Director", "📋 Rekap Cuti"])
