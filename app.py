@@ -10,6 +10,7 @@ import base64
 import pandas as pd
 import uuid
 import json
+import hashlib
 from typing import Optional, Tuple, Dict, List
 import smtplib
 from email.mime.text import MIMEText
@@ -1080,7 +1081,18 @@ def show_file_download(blob_or_url, filename):
         pass
     data = from_blob(blob_or_url)
     if data:
-        st.download_button(label=f"⬇️ Download {filename or 'file'}", data=data, file_name=filename or "file", mime="application/octet-stream")
+        # Use a deterministic unique key to avoid duplicate element IDs when multiple buttons share the same label
+        try:
+            key_suffix = hashlib.md5(data).hexdigest()[:8]
+        except Exception:
+            key_suffix = str(uuid.uuid4())
+        st.download_button(
+            label=f"⬇️ Download {filename or 'file'}",
+            data=data,
+            file_name=filename or "file",
+            mime="application/octet-stream",
+            key=f"dl_{key_suffix}_{(filename or 'file')}"
+        )
 
 # -------------------------
 # Modules Implementation (concise)
@@ -2435,20 +2447,22 @@ def inventory_module():
                     f"{row['name']} - {row['file_name']}" for idx, row in filtered_df.iterrows()
                     if row['file_blob'] is not None and row['file_name']
                 ]
+                # Include the unique record ID to build a stable unique key for the download button
                 lampiran_dict = {
-                    f"{row['name']} - {row['file_name']}": (row['file_name'], row['file_blob'])
+                    f"{row['name']} - {row['file_name']}": (row['id'], row['file_name'], row['file_blob'])
                     for idx, row in filtered_df.iterrows()
                     if row['file_blob'] is not None and row['file_name']
                 }
                 if lampiran_list:
                     selected = st.selectbox("Pilih lampiran untuk diunduh:", lampiran_list)
                     if selected:
-                        file_name, file_blob = lampiran_dict[selected]
+                        rec_id, file_name, file_blob = lampiran_dict[selected]
                         st.download_button(
                             label=f"⬇️ Download {file_name}",
                             data=file_blob,
                             file_name=file_name,
-                            mime="application/octet-stream"
+                            mime="application/octet-stream",
+                            key=f"inv_download_{rec_id}"
                         )
                 else:
                     st.info("Tidak ada lampiran yang tersedia untuk diunduh.")
