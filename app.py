@@ -754,9 +754,18 @@ def login_user(email, password):
         # Commit before calling audit_log to prevent cross-connection SQLite lock
         conn.commit()
         audit_log("auth", "login", target=email, details="Login sukses.", actor=email)
-        # Defer backup to after rerun to avoid blocking login button
+        # Defer backup to after rerun, but only if DB is fresh or this is the first login since app wake
         try:
-            st.session_state["__post_login_backup"] = True
+            cond_fresh = False
+            try:
+                cond_fresh = _is_probably_fresh_seed_db()
+            except Exception:
+                cond_fresh = False
+            cond_first_login_since_wake = not bool(st.session_state.get("__first_login_since_wake_done", False))
+            if cond_fresh or cond_first_login_since_wake:
+                st.session_state["__post_login_backup"] = True
+            # Mark that we've performed the first-login check for this process/session
+            st.session_state["__first_login_since_wake_done"] = True
         except Exception:
             pass
         conn.commit()
