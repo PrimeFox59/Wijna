@@ -1932,6 +1932,10 @@ def attempt_auto_restore_if_seed(service, folder_id: str) -> Tuple[bool, str]:
 
 def dunyim_security_module():
     user = require_login()
+    # Hanya Superuser yang bisa akses Dunyim Security
+    if user.get("role") != "superuser":
+        st.warning("⚠️ Anda tidak memiliki akses ke Dunyim Security. Hanya Superuser.")
+        return
     st.header("🛡️ Dunyim Security System")
     if not _drive_available():
         st.error("Paket Google API belum terpasang. Tambahkan 'google-api-python-client' dan 'google-auth' di requirements.")
@@ -2171,11 +2175,11 @@ def inventory_module():
         "📦 Daftar Inventaris",
     ]
 
-    # Tab 1: Tambah Barang (aksi hanya untuk Staff/Superuser)
+    # Tab 1: Tambah Barang (aksi untuk Staff, Finance, Director, Superuser)
     def staff_tab():
-        allowed = _role in ["staff", "superuser"]
+        allowed = _role in ["staff", "finance", "director", "superuser"]
         if not allowed:
-            st.info("Hanya Staff atau Superuser yang dapat menambah barang. Tab ini ditampilkan untuk transparansi alur kerja.")
+            st.info("Anda tidak memiliki akses untuk menambah barang. Tab ini ditampilkan untuk transparansi alur kerja.")
             return
         with st.form("inv_add"):
             name = st.text_input("Nama Barang")
@@ -2224,11 +2228,11 @@ def inventory_module():
                         pass
                     st.success("Item disimpan sebagai draft. Menunggu review Finance.")
 
-    # Tab 2: Review Finance (aksi hanya untuk Finance/Superuser; lainnya read-only)
+    # Tab 2: Review Finance (aksi untuk Finance, Director, Superuser)
     def finance_tab():
-        allowed = _role in ["finance", "superuser"]
+        allowed = _role in ["finance", "director", "superuser"]
         if not allowed:
-            st.info("Hanya Finance atau Superuser yang dapat melakukan review. Anda dapat melihat daftar yang menunggu review.")
+            st.info("Hanya Finance, Director, atau Superuser yang dapat melakukan review. Anda dapat melihat daftar yang menunggu review.")
         cur.execute("SELECT * FROM inventory WHERE finance_approved=0")
         rows = cur.fetchall()
         for idx, r in enumerate(rows):
@@ -2524,9 +2528,10 @@ def surat_masuk_module():
     user = get_current_user()
     # Normalize role to avoid casing/whitespace mismatches
     _role = ((user or {}).get("role") or "").strip().lower()
+    # Staff, Finance, Director, Superuser bisa akses modul ini
     allowed_roles = {"staff", "finance", "director", "superuser"}
     if not user or _role not in allowed_roles:
-        st.warning("Anda tidak memiliki akses untuk input Surat Masuk.")
+        st.warning("Anda tidak memiliki akses untuk modul Surat Masuk.")
         return
 
     tab1, tab2, tab3 = st.tabs([
@@ -2759,7 +2764,7 @@ def surat_keluar_module():
         "📋 Daftar & Rekap Surat Keluar"
     ])
 
-    # --- Tab 1: Input Draft oleh Staff ---
+    # --- Tab 1: Input Draft (Staff, Finance, Director, Superuser) ---
     with tab1:
         st.markdown("### Input Draft Surat Keluar ")
         draft_type = st.radio("Jenis Draft Surat", ["Upload File", "Link URL"], horizontal=True, key="draft_type_sk")
@@ -3216,7 +3221,7 @@ def cash_advance_module():
     # --- Tab 2: Review Finance ---
     with tab2:
         st.markdown("### Review & Approval Finance")
-        if user["role"] in ["finance", "superuser"]:
+        if user["role"] in ["finance", "director", "superuser"]:
             # Show only items that are still awaiting Finance review (not approved to director yet)
             df = pd.read_sql_query(
                 "SELECT id, divisi, items_json, totals, tanggal, finance_note, finance_approved, COALESCE(requested_by,'') as requested_by "
@@ -3447,8 +3452,8 @@ def pmr_module():
 
     with tab_finance:
         st.markdown("### Review & Approval Finance")
-        st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Superuser yang dapat mengakses.")
-        if _role in ["finance", "superuser"]:
+        st.caption("Finance melakukan review, memberi catatan, dan approval. Hanya Finance/Director/Superuser yang dapat mengakses.")
+        if _role in ["finance", "director", "superuser"]:
             df_fin = pd.read_sql_query("SELECT id, nama, bulan, file1_name, file2_name, finance_note, finance_approved FROM pmr ORDER BY tanggal_submit DESC", conn)
             for idx, row in df_fin.iterrows():
                 with st.expander(f"{row['nama']} | {row['bulan']}"):
@@ -3592,7 +3597,7 @@ def cuti_module():
     # Tab 2: Review Finance
     with tab2:
         st.markdown("### Review & Approval Finance")
-        if user["role"] in ["finance", "superuser"]:
+        if user["role"] in ["finance", "director", "superuser"]:
             df = pd.read_sql_query("SELECT * FROM cuti WHERE finance_approved=0 ORDER BY tgl_mulai DESC", conn)
             for _, row in df.iterrows():
                 with st.expander(f"{row['nama']} | {row['tgl_mulai']} s/d {row['tgl_selesai']}"):
@@ -4045,7 +4050,7 @@ def flex_module():
     # --- Tab 2: Review Finance ---
     with tabs[1]:
         st.subheader(":money_with_wings: Review Finance")
-        allowed_finance = user["role"] in ["finance", "superuser"]
+        allowed_finance = user["role"] in ["finance", "director", "superuser"]
         df_fin = pd.read_sql_query("SELECT * FROM flex WHERE approval_finance=0 ORDER BY tanggal DESC", conn)
         if df_fin.empty:
             st.info("Tidak ada pengajuan flex time yang perlu direview.")
@@ -4156,8 +4161,8 @@ def kalender_pemakaian_mobil_kantor():
 
     # Tab 1: Input/Edit/Hapus (Finance)
     with tab1:
-        st.markdown("### 📝 Input/Edit/Hapus Jadwal Mobil (Finance)")
-        if user["role"] in ["finance", "superuser"]:
+        st.markdown("### 📝 Input/Edit/Hapus Jadwal Mobil (Finance/Director/Superuser)")
+        if user["role"] in ["finance", "director", "superuser"]:
             with st.form("form_mobil"):  
                 nama_pengguna = st.text_input("Nama")
                 divisi = st.text_input("Divisi")
@@ -4531,10 +4536,10 @@ def sop_module():
 
     # --- Tab Upload SOP ---
     with tab_upload:
-        allowed = _role in ("staff", "superuser")
+        allowed = _role in ("staff", "finance", "director", "superuser")
         st.subheader("Upload SOP Baru")
         if not allowed:
-            st.info("Hanya Staff atau Superuser yang dapat mengunggah SOP.")
+            st.info("Anda tidak memiliki akses untuk mengunggah SOP.")
         else:
             with st.form("sop_upload_form"):
                 judul = st.text_input("Judul SOP")
@@ -5968,6 +5973,10 @@ def dashboard():
 
 def audit_trail_module():
     user = require_login()
+    # Hanya Director dan Superuser yang bisa akses Audit Trail
+    if user.get("role") not in ["director", "superuser"]:
+        st.warning("⚠️ Anda tidak memiliki akses ke Audit Trail. Hanya Director dan Superuser.")
+        return
     st.header("🕵️ Audit Trail / Log Aktivitas")
     conn = get_db()
     cur = conn.cursor()
@@ -6125,6 +6134,8 @@ def main():
             # Clear the flag even if it fails to avoid repeating
             st.session_state.pop("__post_login_backup", None)
 
+    # Filter menu berdasarkan role
+    user_role = (user.get("role") or "").strip().lower()
     menu = [
         ("Dashboard", "🏠 Dashboard"),
         ("Inventory", "📦 Inventory"),
@@ -6141,10 +6152,14 @@ def main():
         ("SOP", "📚 SOP"),
         ("Notulen", "🗒️ Notulen"),
         ("User Setting", "⚙️ User Setting"),
-        ("Audit Trail", "🕵️ Audit Trail"),
         ("User Guide", "📘 User Guide"),
-        ("Dunyim Security", "🛡️ Dunyim Security")
     ]
+    # Menu khusus untuk Director dan Superuser
+    if user_role in ["director", "superuser"]:
+        menu.append(("Audit Trail", "🕵️ Audit Trail"))
+    # Menu khusus untuk Superuser only
+    if user_role == "superuser":
+        menu.append(("Dunyim Security", "🛡️ Dunyim Security"))
     if "page" not in st.session_state:
         st.session_state["page"] = "Dashboard"
 
@@ -6219,20 +6234,28 @@ def main():
     elif choice == "User Setting":
         user_setting_module()
     elif choice == "Audit Trail":
-        audit_trail_module()
+        # Guard: only director/superuser
+        if (user.get("role") or "").strip().lower() in ["director", "superuser"]:
+            audit_trail_module()
+        else:
+            st.warning("⚠️ Akses ditolak. Menu ini hanya untuk Director dan Superuser.")
     elif choice == "User Guide":
         user_guide_module()
     elif choice == "Dunyim Security":
-        # Check scheduled backup once on module enter (non-blocking)
-        try:
-            if _drive_available():
-                folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
-                if folder_id:
-                    svc = _build_drive()
-                    check_scheduled_backup(svc, folder_id)
-        except Exception:
-            pass
-        dunyim_security_module()
+        # Guard: only superuser
+        if (user.get("role") or "").strip().lower() == "superuser":
+            # Check scheduled backup once on module enter (non-blocking)
+            try:
+                if _drive_available():
+                    folder_id = _setting_get('gdrive_folder_id', GDRIVE_DEFAULT_FOLDER_ID) or GDRIVE_DEFAULT_FOLDER_ID
+                    if folder_id:
+                        svc = _build_drive()
+                        check_scheduled_backup(svc, folder_id)
+            except Exception:
+                pass
+            dunyim_security_module()
+        else:
+            st.warning("⚠️ Akses ditolak. Menu ini hanya untuk Superuser.")
 
 
 if __name__ == "__main__":
