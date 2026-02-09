@@ -81,7 +81,9 @@ def format_datetime_wib(dtstr):
 # Timezone helpers: WIB (GMT+7)
 def now_wib() -> datetime:
     """Return current time in WIB (UTC+7) as a naive datetime."""
-    return datetime.utcnow() + timedelta(hours=7)
+    from datetime import timezone, timedelta as td
+    utc_now = datetime.now(timezone.utc)
+    return utc_now.replace(tzinfo=None) + timedelta(hours=7)
 
 def now_wib_iso() -> str:
     """ISO8601 string of WIB time (no microseconds)."""
@@ -4793,7 +4795,7 @@ def notulen_module():
                     pilih = st.selectbox("Pilih notulen untuk diunduh", [""] + list(opsi.keys()))
                     if pilih:
                         nid = opsi[pilih]
-                        row = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=\?", conn, params=(nid,)).iloc[0]
+                        row = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=?", conn, params=(nid,)).iloc[0]
                         if ("file_url" in row.index) and row.get("file_url"):
                             show_file_download(row["file_url"], row["file_name"]) 
                         elif row["file_blob"] is not None and row["file_name"]:
@@ -4813,7 +4815,7 @@ def notulen_module():
                         title = f"{r['judul']}" + (f" | {r[nt_date_col]}" if nt_date_col and r.get(nt_date_col) else "")
                         with st.expander(title):
                             st.write(f"File: {r.get('file_name') or '-'}")
-                            rr = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=\?", conn, params=(r['id'],))
+                            rr = pd.read_sql_query("SELECT file_blob, file_name, file_url FROM notulen WHERE id=?", conn, params=(r['id'],))
                             if not rr.empty:
                                 if ("file_url" in rr.columns) and rr.iloc[0].get("file_url"):
                                     show_file_download(rr.iloc[0]["file_url"], rr.iloc[0]["file_name"])
